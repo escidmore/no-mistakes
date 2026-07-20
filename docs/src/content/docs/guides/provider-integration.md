@@ -1,10 +1,10 @@
 ---
 title: Provider Integration
-description: Set up GitHub, GitLab, Bitbucket Cloud, or Azure DevOps for PR creation and CI monitoring.
+description: Set up GitHub, GitLab, Forgejo, Bitbucket Cloud, or Azure DevOps for PR creation and CI monitoring.
 ---
 
-The PR and CI steps need to talk to your git host. Four hosts are supported:
-GitHub, GitLab, Bitbucket Cloud (`bitbucket.org`), and Azure DevOps
+The PR and CI steps need to talk to your git host. Five hosts are supported:
+GitHub, GitLab, Forgejo, Bitbucket Cloud (`bitbucket.org`), and Azure DevOps
 (`dev.azure.com` and legacy `*.visualstudio.com`). Everything else
 short-circuits the PR and CI steps with `skipped`.
 
@@ -25,14 +25,14 @@ What you do not get is PR automation and CI monitoring.
 
 ## What each step needs
 
-| Step | GitHub | GitLab | Bitbucket Cloud | Azure DevOps |
-|---|---|---|---|---|
-| **PR** (create/update) | `gh` CLI, authenticated | `glab` CLI, authenticated | `NO_MISTAKES_BITBUCKET_EMAIL` + `NO_MISTAKES_BITBUCKET_API_TOKEN` | `az` CLI + `azure-devops` extension, authenticated |
-| **CI** (polling, auto-fix) | `gh` CLI | `glab` CLI | same env vars | `az` CLI |
-| **Merge conflict auto-fix** | `gh` CLI | `glab` CLI | not supported | `az` CLI |
-| **Mergeability polling** | `gh` CLI | `glab` CLI | not supported | `az` CLI |
-| **Failed check log fetching** | `gh` CLI | `glab` CLI | supported | not yet |
-| **[Cancelled-check rerun](/no-mistakes/reference/repo-config/#cirerun_transient)** | `gh` CLI | not supported | not supported | not supported |
+| Step | GitHub | GitLab | Forgejo | Bitbucket Cloud | Azure DevOps |
+| --- | --- | --- | --- | --- | --- |
+| **PR** (create/update) | `gh` CLI, authenticated | `glab` CLI, authenticated | `forgejo-axi`, authenticated | `NO_MISTAKES_BITBUCKET_EMAIL` + `NO_MISTAKES_BITBUCKET_API_TOKEN` | `az` CLI + `azure-devops` extension, authenticated |
+| **CI** (polling, auto-fix) | `gh` CLI | `glab` CLI | `forgejo-axi` | same env vars | `az` CLI |
+| **Merge conflict auto-fix** | `gh` CLI | `glab` CLI | `forgejo-axi` | not supported | `az` CLI |
+| **Mergeability polling** | `gh` CLI | `glab` CLI | `forgejo-axi` | not supported | `az` CLI |
+| **Failed check log fetching** | `gh` CLI | `glab` CLI | not yet | supported | not yet |
+| **[Cancelled-check rerun](/no-mistakes/reference/repo-config/#cirerun_transient)** | `gh` CLI | not supported | not supported | not supported | not supported |
 
 ## What changes when provider wiring is present
 
@@ -41,8 +41,8 @@ pushes to the configured target:
 
 - create or update the PR automatically
 - keep polling hosted CI until the PR is merged, closed, declined, or the configured `ci_timeout` idle window elapses
-- fetch failing job logs for the CI auto-fix loop
-- on GitHub, GitLab, and Azure DevOps, watch mergeability and fix merge conflicts when possible
+- fetch failing job logs for the CI auto-fix loop when the provider exposes them
+- on GitHub, GitLab, Forgejo, and Azure DevOps, watch mergeability and fix merge conflicts when possible
 
 ## GitHub
 
@@ -89,7 +89,7 @@ The GitHub PR step opens PRs with a fork-qualified head such as `your-user:featu
 Re-running `no-mistakes init` later preserves the stored fork URL unless you pass a new `--fork-url`.
 
 Fork routing currently requires both `origin` and `--fork-url` to be GitHub remotes with owner/repo paths.
-GitLab and Bitbucket fork MR/PR routing are not implemented yet; if a legacy or manually edited repo record has `fork_url` set for those providers, PR creation skips instead of opening an unsafe self PR.
+GitLab, Forgejo, Bitbucket, and Azure DevOps fork MR/PR routing are not implemented yet; if a legacy or manually edited repo record has `fork_url` set for those providers, PR creation skips instead of opening an unsafe self PR.
 
 ## GitLab
 
@@ -111,6 +111,22 @@ glab auth login
 - CI pipeline status polling until the merge request is merged, closed, or the configured `ci_timeout` idle window elapses
 - Failed job trace fetching (`glab ci trace`) for the CI auto-fix step
 - Merge-conflict polling and auto-fix, same as GitHub
+
+## Forgejo
+
+Install [`forgejo-axi`](https://github.com/escidmore/forgejo-axi) and make it available on `PATH`. It currently installs from source with Node.js 20 or newer; set [`forgejo_axi_path`](/no-mistakes/reference/global-config/#forgejo_axi_path) when the executable lives elsewhere.
+
+Give the daemon a Forgejo token through either the generic `FORGEJO_TOKEN` variable or forgejo-axi's host-scoped token variable. For an arbitrary self-hosted hostname, non-default port, or path prefix, also set `FORGEJO_BASE_URL` to the exact web base (for example `https://forge.example:3443/git`). The [environment reference](/no-mistakes/reference/environment/#forgejo_base_url) owns the variable and host-key details.
+
+Verify without mutating a deployed Forgejo instance:
+
+```sh
+FORGEJO_BASE_URL=https://forgejo.example forgejo-axi status --json
+```
+
+`no-mistakes` delegates PR identity, lifecycle, commit-status and required-context evaluation, mergeability, and merged proof to forgejo-axi's stable JSON commands. Capabilities are runtime-probed from the server instead of guessed from a major version: Forgejo 15.0.5 status gating remains supported even though Actions logs are unavailable, while 16.x reports log-route capability only when advertised. No stable high-level log command exists yet, so failed-check log fetching remains disabled independently of commit-status gating.
+
+Fork PR routing is not implemented for Forgejo; a configured `fork_url` makes the PR step skip rather than opening a self PR.
 
 ## Bitbucket Cloud
 
@@ -137,7 +153,7 @@ Get an API token from [Bitbucket account settings](https://bitbucket.org/account
 - PR mergeability polling
 - Merge-conflict auto-fix
 
-These are GitHub, GitLab, and Azure DevOps only right now.
+These are GitHub, GitLab, Forgejo, and Azure DevOps only right now.
 
 ## Azure DevOps
 
@@ -183,7 +199,7 @@ well as their SSH forms (`git@ssh.dev.azure.com:v3/...`).
 
 - Failed check log fetching for the CI auto-fix step (the `az` CLI has no
   first-class build-log command)
-- Fork PR routing (same as GitLab and Bitbucket)
+- Fork PR routing (same as GitLab, Forgejo, and Bitbucket)
 
 ## Self-hosted GitHub/GitLab
 
@@ -215,7 +231,7 @@ If `ssh -G` is unavailable or the alias does not resolve, detection falls back t
 
 ## Unsupported hosts
 
-If your upstream isn't GitHub, GitLab, Bitbucket Cloud, or Azure DevOps:
+If your upstream isn't GitHub, GitLab, Forgejo, Bitbucket Cloud, or Azure DevOps:
 
 - The **push** step still runs - `no-mistakes` pushes through git to the configured target like any other remote.
 - The **PR** step marks itself as `skipped`.
@@ -229,8 +245,8 @@ Everything before push (rebase, review, test, document, lint) still works regard
 no-mistakes doctor
 ```
 
-`doctor` checks `gh` and `az` availability. For GitLab, confirm `glab` is installed and authenticated. For Bitbucket Cloud, confirm the two env vars are set in the environment the daemon runs under. For Azure DevOps, confirm the `azure-devops` extension is installed (`az extension show --name azure-devops`) and a PAT is available.
+`doctor` checks `gh` and `az` availability. For GitLab, confirm `glab` is installed and authenticated. For Forgejo, run `FORGEJO_BASE_URL=<host> forgejo-axi status --json` from the daemon's environment. For Bitbucket Cloud, confirm the two env vars are set in that environment. For Azure DevOps, confirm the `azure-devops` extension is installed (`az extension show --name azure-devops`) and a PAT is available.
 
 :::note
-When the daemon runs through a managed service (launchd, systemd, Task Scheduler), it reloads environment from your login shell on macOS and Linux so `gh` auth and `NO_MISTAKES_BITBUCKET_*` vars are picked up, and it augments `PATH` with common binary directories. If credentials or PATH-derived tools are missing, check `~/.no-mistakes/logs/daemon.log` for a login-shell environment resolution warning. On Windows it reuses the current process environment.
+When the daemon runs through a managed service (launchd, systemd, Task Scheduler), it reloads environment from your login shell on macOS and Linux so CLI auth and provider token variables are picked up, and it augments `PATH` with common binary directories. If credentials or PATH-derived tools are missing, check `~/.no-mistakes/logs/daemon.log` for a login-shell environment resolution warning. On Windows it reuses the current process environment.
 :::

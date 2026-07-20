@@ -66,6 +66,7 @@ type GlobalConfig struct {
 	Agent                types.AgentName     `yaml:"agent"`
 	Agents               []types.AgentName   `yaml:"-"`
 	ACPXPath             string              `yaml:"acpx_path"`
+	ForgejoAXIPath       string              `yaml:"forgejo_axi_path"`
 	ACPRegistryOverrides map[string]string   `yaml:"acp_registry_overrides"`
 	AgentPathOverride    map[string]string   `yaml:"agent_path_override"`
 	AgentArgsOverride    map[string][]string `yaml:"agent_args_override"`
@@ -94,6 +95,7 @@ type GlobalConfig struct {
 type globalConfigRaw struct {
 	Agent                agentList           `yaml:"agent"`
 	ACPXPath             string              `yaml:"acpx_path"`
+	ForgejoAXIPath       string              `yaml:"forgejo_axi_path"`
 	ACPRegistryOverrides map[string]string   `yaml:"acp_registry_overrides"`
 	AgentPathOverride    map[string]string   `yaml:"agent_path_override"`
 	AgentArgsOverride    map[string][]string `yaml:"agent_args_override"`
@@ -382,6 +384,7 @@ type Config struct {
 	Agent                 types.AgentName
 	Agents                []types.AgentName
 	ACPXPath              string
+	ForgejoAXIPath        string
 	ACPRegistryOverrides  map[string]string
 	AgentPathOverride     map[string]string
 	AgentArgsOverride     map[string][]string
@@ -561,6 +564,9 @@ agent: auto
 
 # Optional path to the user-installed acpx binary for acp:<target> agents and ACP aliases
 # acpx_path: acpx
+
+# forgejo-axi executable used for Forgejo provider operations
+forgejo_axi_path: forgejo-axi
 
 # Optional ACP target command overrides for acp:<target> agents and ACP aliases
 # acp_registry_overrides:
@@ -1126,6 +1132,7 @@ func DefaultGlobalConfig() *GlobalConfig {
 	return &GlobalConfig{
 		Agent:                types.AgentAuto,
 		Agents:               []types.AgentName{types.AgentAuto},
+		ForgejoAXIPath:       "forgejo-axi",
 		CITimeout:            DefaultCITimeout,
 		StepQuietWarning:     DefaultStepQuietWarning,
 		DaemonConnectTimeout: DefaultDaemonConnectTimeout,
@@ -1170,6 +1177,9 @@ func LoadGlobalFromBytes(data []byte) (*GlobalConfig, error) {
 	}
 	if raw.ACPXPath != "" {
 		cfg.ACPXPath = raw.ACPXPath
+	}
+	if raw.ForgejoAXIPath != "" {
+		cfg.ForgejoAXIPath = raw.ForgejoAXIPath
 	}
 	if raw.ACPRegistryOverrides != nil {
 		cfg.ACPRegistryOverrides = raw.ACPRegistryOverrides
@@ -1663,6 +1673,7 @@ func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
 		Agent:                global.Agent,
 		Agents:               copyAgents(global.Agents),
 		ACPXPath:             global.ACPXPath,
+		ForgejoAXIPath:       global.ForgejoAXIPath,
 		ACPRegistryOverrides: global.ACPRegistryOverrides,
 		AgentPathOverride:    global.AgentPathOverride,
 		AgentArgsOverride:    global.AgentArgsOverride,
