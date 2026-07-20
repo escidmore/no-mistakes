@@ -26,6 +26,8 @@ func TestDetectProvider(t *testing.T) {
 		{"https://dev.azure.com/org/project/_git/repo", ProviderAzureDevOps},
 		{"git@ssh.dev.azure.com:v3/org/project/repo", ProviderAzureDevOps},
 		{"https://org.visualstudio.com/project/_git/repo", ProviderAzureDevOps},
+		{"https://codeberg.org/user/repo.git", ProviderForgejo},
+		{"https://forgejo.example/user/repo.git", ProviderForgejo},
 		{"https://example.com/user/repo.git", ProviderUnknown},
 	}
 
@@ -113,6 +115,73 @@ func TestResolveHost_SSHConfigLookup(t *testing.T) {
 			t.Fatalf("resolveHost() = %q, want c", got)
 		}
 	})
+}
+
+func TestDetectProvider_ConfiguredForgejoBaseResolvesSSHHostAlias(t *testing.T) {
+	t.Setenv("GLAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("GH_CONFIG_DIR", t.TempDir())
+
+	got := detectProviderWithForgejoBaseURL(
+		context.Background(),
+		"git@forgejo-work:scm/octo/widgets.git",
+		"https://code.example:3443/scm",
+		func(_ context.Context, alias string) (string, error) {
+			if alias != "forgejo-work" {
+				t.Fatalf("alias = %q, want forgejo-work", alias)
+			}
+			return "code.example", nil
+		},
+	)
+	if got != ProviderForgejo {
+		t.Fatalf("detectProviderWithForgejoBaseURL() = %q, want %q", got, ProviderForgejo)
+	}
+}
+
+func TestDetectProvider_ConfiguredForgejoBaseSupportsSelfHostedPrefixesAndPorts(t *testing.T) {
+	t.Setenv("GLAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("GH_CONFIG_DIR", t.TempDir())
+
+	base := "https://code.example:3443/scm"
+	for _, remote := range []string{
+		"https://code.example:3443/scm/octo/widgets.git",
+		"https://code.example:3443/scm/octo/widgets/pulls/42",
+		"ssh://git@code.example:2222/scm/octo/widgets.git",
+		"git@code.example:scm/octo/widgets.git",
+	} {
+		if got := DetectProviderWithForgejoBaseURL(remote, base); got != ProviderForgejo {
+			t.Errorf("DetectProviderWithForgejoBaseURL(%q) = %q, want %q", remote, got, ProviderForgejo)
+		}
+	}
+	if got := DetectProviderWithForgejoBaseURL("https://code.example:3443/other/octo/widgets.git", base); got != ProviderUnknown {
+		t.Errorf("mismatched path prefix detected as %q, want unknown", got)
+	}
+}
+
+func TestDetectProvider_ForgejoConfigDoesNotOverrideKnownProviders(t *testing.T) {
+	t.Setenv("GLAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("GH_CONFIG_DIR", t.TempDir())
+	for _, tt := range []struct {
+		remote string
+		want   Provider
+	}{
+		{"https://github.com/octo/widgets.git", ProviderGitHub},
+		{"https://gitlab.com/octo/widgets.git", ProviderGitLab},
+		{"https://bitbucket.org/octo/widgets.git", ProviderBitbucket},
+		{"https://dev.azure.com/octo/project/_git/widgets", ProviderAzureDevOps},
+	} {
+		if got := DetectProviderWithForgejoBaseURL(tt.remote, "https://"+ExtractHost(tt.remote)); got != tt.want {
+			t.Errorf("known provider %q detected as %q, want %q", tt.remote, got, tt.want)
+		}
+	}
+}
+
+func TestDetectProvider_UsesForgejoBaseEnvironment(t *testing.T) {
+	t.Setenv("GLAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("GH_CONFIG_DIR", t.TempDir())
+	t.Setenv("FORGEJO_BASE_URL", "https://code.example:3443/scm")
+	if got := DetectProvider("https://code.example:3443/scm/octo/widgets.git"); got != ProviderForgejo {
+		t.Fatalf("DetectProvider() = %q, want %q", got, ProviderForgejo)
+	}
 }
 
 // writeGlabConfig writes a synthetic glab config.yml into a temp dir and points

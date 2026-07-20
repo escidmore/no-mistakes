@@ -57,9 +57,9 @@ func (s *CIStep) ReconcileApprovalGate(sctx *pipeline.StepContext) (bool, error)
 	if err := sctx.Ctx.Err(); err != nil {
 		return false, err
 	}
-	provider := scm.DetectProviderContext(sctx.Ctx, sctx.Repo.UpstreamURL)
+	provider := detectProviderForStep(sctx, sctx.Repo.UpstreamURL)
 	if provider == scm.ProviderUnknown && sctx.Run.PRURL != nil {
-		provider = scm.DetectProviderContext(sctx.Ctx, *sctx.Run.PRURL)
+		provider = detectProviderForStep(sctx, *sctx.Run.PRURL)
 	}
 	host, skipReason := buildHost(sctx, provider)
 	if host == nil {
@@ -86,6 +86,9 @@ func (s *CIStep) ReconcileApprovalGate(sctx *pipeline.StepContext) (bool, error)
 	}
 	switch state {
 	case scm.PRStateMerged:
+		if err := validateMergedState(sctx.Ctx, host, &scm.PR{Number: prNumber, URL: prURL}, sctx.Run.HeadSHA); err != nil {
+			return false, err
+		}
 		if err := sctx.DB.UpdateRunPRState(sctx.Run.ID, "merged"); err != nil {
 			return false, err
 		}
@@ -111,6 +114,30 @@ func (s *CIStep) ReconcileApprovalGate(sctx *pipeline.StepContext) (bool, error)
 	}
 }
 
+func validateMergedState(ctx context.Context, host scm.Host, pr *scm.PR, expectedHead string) error {
+	if !host.Capabilities().MergedProof {
+		return nil
+	}
+	proofHost, ok := host.(scm.MergedProofHost)
+	if !ok {
+		return fmt.Errorf("SCM provider advertises merged proof but does not implement it")
+	}
+	proof, err := proofHost.GetMergedProof(ctx, pr, expectedHead)
+	if err != nil {
+		return fmt.Errorf("verify merged PR proof: %w", err)
+	}
+	if !proof.Merged {
+		return fmt.Errorf("verify merged PR proof: PR %s is not merged", pr.Number)
+	}
+	if proof.Number != pr.Number || proof.URL != pr.URL {
+		return fmt.Errorf("verify merged PR proof: proof identifies PR %s at %q, want PR %s at %q", proof.Number, proof.URL, pr.Number, pr.URL)
+	}
+	if expectedHead != "" && proof.HeadSHA != expectedHead {
+		return fmt.Errorf("verify merged PR proof: %w: expected %s, got %s", scm.ErrHeadChanged, expectedHead, proof.HeadSHA)
+	}
+	return nil
+}
+
 func (s *CIStep) gracePeriod() time.Duration {
 	if s.checksGracePeriod > 0 {
 		return s.checksGracePeriod
@@ -123,9 +150,9 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	provider := scm.DetectProviderContext(ctx, sctx.Repo.UpstreamURL)
+	provider := detectProviderForStep(sctx, sctx.Repo.UpstreamURL)
 	if provider == scm.ProviderUnknown && sctx.Run.PRURL != nil {
-		provider = scm.DetectProviderContext(ctx, *sctx.Run.PRURL)
+		provider = detectProviderForStep(sctx, *sctx.Run.PRURL)
 	}
 	host, skipReason := buildHost(sctx, provider)
 	if host == nil {
@@ -250,6 +277,9 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 			sctx.Log(fmt.Sprintf("warning: could not check PR state: %v", err))
 			prStateKnown = false
 		} else if state == scm.PRStateMerged {
+			if err := validateMergedState(ctx, host, pr, sctx.Run.HeadSHA); err != nil {
+				return nil, err
+			}
 			if err := sctx.DB.UpdateRunPRState(sctx.Run.ID, "merged"); err != nil {
 				return nil, err
 			}
