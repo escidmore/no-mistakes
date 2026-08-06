@@ -162,6 +162,10 @@ func TestDetectProvider_ConfiguredForgejoBaseSupportsSelfHostedPrefixesAndPorts(
 	if got := DetectProviderWithForgejoBaseURL("https://code.example:3443/other/octo/widgets.git", base); got != ProviderUnknown {
 		t.Errorf("mismatched path prefix detected as %q, want unknown", got)
 	}
+	base = "https://forgejo.gitlab.example:3443/scm"
+	if got := DetectProviderWithForgejoBaseURL(base+"/octo/widgets.git", base); got != ProviderForgejo {
+		t.Errorf("configured Forgejo host with provider substring detected as %q, want %q", got, ProviderForgejo)
+	}
 }
 
 func TestDetectProvider_ForgejoConfigDoesNotOverrideKnownProviders(t *testing.T) {
