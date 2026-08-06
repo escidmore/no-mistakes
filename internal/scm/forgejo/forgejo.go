@@ -362,7 +362,7 @@ func (h *Host) GetMergedProof(ctx context.Context, pr *scm.PR, expectedHead stri
 	return result, nil
 }
 
-func (h *Host) FetchFailedCheckLogs(ctx context.Context, pr *scm.PR, _ string, headSHA string, failingNames []string) (string, error) {
+func (h *Host) FetchFailedCheckLogs(ctx context.Context, pr *scm.PR, _ string, _ string, failingNames []string) (string, error) {
 	if !h.capabilities.FailedCheckLogs {
 		return "", scm.ErrUnsupported
 	}
@@ -381,10 +381,6 @@ func (h *Host) FetchFailedCheckLogs(ctx context.Context, pr *scm.PR, _ string, h
 
 	result, err := h.readChecks(ctx, pr)
 	if err != nil {
-		return "", err
-	}
-	headSHA = strings.TrimSpace(headSHA)
-	if err := h.validateExpectedHead(result.SHA, headSHA); err != nil {
 		return "", err
 	}
 
@@ -417,7 +413,7 @@ func (h *Host) FetchFailedCheckLogs(ctx context.Context, pr *scm.PR, _ string, h
 		if err := h.runJSONWithLimit(ctx, "run view", args, &response, maxForgejoLogOutputBytes); err != nil {
 			return "", err
 		}
-		if err := h.validateRunView(response, runID, headSHA); err != nil {
+		if err := h.validateRunView(response, runID, result.SHA); err != nil {
 			return "", err
 		}
 		for _, job := range response.Jobs {
@@ -455,11 +451,11 @@ func (h *Host) actionsRunFromTarget(raw string) (int, bool) {
 		return 0, false
 	}
 	runID, err := strconv.Atoi(parts[0])
-	if err != nil || runID <= 0 {
+	if err != nil || runID <= 0 || parts[0] != strconv.Itoa(runID) {
 		return 0, false
 	}
 	jobIndex, err := strconv.Atoi(parts[2])
-	if err != nil || jobIndex < 0 {
+	if err != nil || jobIndex < 0 || parts[2] != strconv.Itoa(jobIndex) {
 		return 0, false
 	}
 	return runID, true
