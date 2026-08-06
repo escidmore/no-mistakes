@@ -1,0 +1,946 @@
+package forgejo
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"reflect"
+	"runtime"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/kunchenguid/no-mistakes/internal/scm"
+)
+
+const (
+	testBaseURL = "https://forge.example:3443/git"
+	testRepo    = "octo/widgets"
+	testPRURL   = testBaseURL + "/octo/widgets/pulls/42"
+	testHeadSHA = "0123456789abcdef0123456789abcdef01234567"
+)
+
+func TestResolveRemoteSupportsPortsAndPathPrefixes(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name       string
+		remote     string
+		configured string
+		wantBase   string
+		wantRepo   string
+	}{
+		{
+			name:     "infer HTTPS base prefix",
+			remote:   "https://forgejo.example:3443/git/octo/widgets.git",
+			wantBase: "https://forgejo.example:3443/git",
+			wantRepo: "octo/widgets",
+		},
+		{
+			name:       "configured self-hosted base",
+			remote:     "https://code.example:3443/scm/octo/widgets.git",
+			configured: "https://code.example:3443/scm/",
+			wantBase:   "https://code.example:3443/scm",
+			wantRepo:   "octo/widgets",
+		},
+		{
+			name:       "SSH origin with HTTPS base",
+			remote:     "ssh://git@code.example:2222/scm/octo/widgets.git",
+			configured: "https://code.example:3443/scm",
+			wantBase:   "https://code.example:3443/scm",
+			wantRepo:   "octo/widgets",
+		},
+		{
+			name:       "scp origin with prefix",
+			remote:     "git@code.example:scm/octo/widgets.git",
+			configured: "https://code.example/scm",
+			wantBase:   "https://code.example/scm",
+			wantRepo:   "octo/widgets",
+		},
+		{
+			name:       "canonical pull URL",
+			remote:     testPRURL,
+			configured: testBaseURL,
+			wantBase:   testBaseURL,
+			wantRepo:   testRepo,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			base, repo, err := ResolveRemote(tt.remote, tt.configured)
+			if err != nil {
+				t.Fatalf("ResolveRemote() error = %v", err)
+			}
+			if base != tt.wantBase || repo != tt.wantRepo {
+				t.Fatalf("ResolveRemote() = (%q, %q), want (%q, %q)", base, repo, tt.wantBase, tt.wantRepo)
+			}
+		})
+	}
+}
+
+func TestResolveRemoteRejectsIdentityMismatch(t *testing.T) {
+	t.Parallel()
+	_, _, err := ResolveRemote("https://other.example/scm/octo/widgets.git", "https://code.example/scm")
+	if err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("ResolveRemote() error = %v, want identity mismatch", err)
+	}
+}
+
+func TestResolveRemoteRejectsUnsupportedURLScheme(t *testing.T) {
+	t.Parallel()
+	_, _, err := ResolveRemote("ftp://code.example/scm/octo/widgets.git", "https://code.example/scm")
+	if err == nil || !strings.Contains(err.Error(), "scheme") {
+		t.Fatalf("ResolveRemote() error = %v, want unsupported scheme", err)
+	}
+}
+
+func TestAvailableUsesConfiguredExecutableAndRuntimeCapabilities(t *testing.T) {
+	status := fixture(t, "status-forgejo-16.json")
+	recorder := &fakeRecorder{responses: []fakeResponse{{stdout: status}}}
+	host := newTestHost(recorder)
+
+	if err := host.Available(context.Background()); err != nil {
+		t.Fatalf("Available() error = %v", err)
+	}
+	wantArgs := []string{"status", "--base-url", testBaseURL, "--token-env", "FORGEJO_TEST_TOKEN", "--json"}
+	if got := recorder.calls[0]; got.name != "/opt/tools/forgejo-axi-custom" || !reflect.DeepEqual(got.args, wantArgs) {
+		t.Fatalf("command = %#v, want name custom and args %#v", got, wantArgs)
+	}
+	caps := host.Capabilities()
+	if !caps.MergeableState || !caps.MergedProof || !caps.ExpectedHeadMerge || !caps.ActionsJobLogs || !caps.ActionsRuns || !caps.ActionsRunJobs {
+		t.Fatalf("Capabilities() = %+v, want Forgejo 16 capabilities", caps)
+	}
+	if !caps.FailedCheckLogs {
+		t.Fatalf("Capabilities().FailedCheckLogs = false; released run view --log-failed routes are available")
+	}
+}
+
+func TestAvailableAcceptsHostScopedTokenSource(t *testing.T) {
+	status := strings.Replace(fixture(t, "status-forgejo-16.json"), "FORGEJO_TEST_TOKEN", "FORGEJO_TOKEN_FORGE_2E_EXAMPLE_3A_3443", 1)
+	recorder := &fakeRecorder{responses: []fakeResponse{{stdout: status}}}
+	host := New(Options{
+		CommandFactory: recorder.factory,
+		CLIAvailable:   func(string) bool { return true },
+		Executable:     "/opt/tools/forgejo-axi-custom",
+		BaseURL:        testBaseURL,
+		Repository:     testRepo,
+		ExpectedHead:   func() string { return testHeadSHA },
+	})
+	if err := host.Available(context.Background()); err != nil {
+		t.Fatalf("Available() error = %v", err)
+	}
+	wantArgs := []string{"status", "--base-url", testBaseURL, "--json"}
+	if gotArgs := recorder.calls[0].args; !reflect.DeepEqual(gotArgs, wantArgs) {
+		t.Fatalf("status args = %#v, want %#v", gotArgs, wantArgs)
+	}
+}
+
+func TestAvailableAcceptsConfiguredTokenWithoutUserReadScope(t *testing.T) {
+	status := strings.Replace(fixture(t, "status-forgejo-16.json"), `"authenticated":true`, `"authenticated":false`, 1)
+	recorder := &fakeRecorder{responses: []fakeResponse{{stdout: status}}}
+	host := newTestHost(recorder)
+
+	if err := host.Available(context.Background()); err != nil {
+		t.Fatalf("Available() error = %v, want configured repository token accepted without read:user", err)
+	}
+}
+
+func TestAvailableRejectsIncompleteStatusIdentity(t *testing.T) {
+	status := fixture(t, "status-forgejo-16.json")
+	tests := []struct {
+		name string
+		old  string
+		new  string
+		want string
+	}{
+		{name: "API URL", old: `"api_url":"https://forge.example:3443/git/api/v1"`, new: `"api_url":""`, want: "API identity"},
+		{name: "auth source", old: `"source":"FORGEJO_TEST_TOKEN"`, new: `"source":null`, want: "authentication source"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			response := strings.Replace(status, tt.old, tt.new, 1)
+			if response == status {
+				t.Fatalf("fixture does not contain %q", tt.old)
+			}
+			host := newTestHost(&fakeRecorder{responses: []fakeResponse{{stdout: response}}})
+			err := host.Available(context.Background())
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("Available() error = %v, want %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestForgejo15KeepsStatusGatingWithoutActionLogs(t *testing.T) {
+	recorder := &fakeRecorder{responses: []fakeResponse{
+		{stdout: fixture(t, "status-forgejo-15.json")},
+		{stdout: checksJSON("success", "not_required", true, `[{
+			"context":"test/linux","state":"success","description":"ok","target_url":null,"created_at":"2025-01-01T00:00:00Z","updated_at":"2025-01-01T00:01:00Z"
+		}]`, `[]`)},
+	}}
+	host := newTestHost(recorder)
+	if err := host.Available(context.Background()); err != nil {
+		t.Fatalf("Available() error = %v", err)
+	}
+	caps := host.Capabilities()
+	if !caps.ActionsRuns || caps.ActionsRunJobs || caps.ActionsJobLogs || caps.FailedCheckLogs || !caps.CommitStatuses {
+		t.Fatalf("Capabilities() = %+v, want statuses and run listing independent from unavailable run jobs/logs", caps)
+	}
+	checks, err := host.GetChecks(context.Background(), testPR())
+	if err != nil {
+		t.Fatalf("GetChecks() error = %v", err)
+	}
+	if len(checks) != 1 || checks[0].Bucket != scm.CheckBucketPass {
+		t.Fatalf("GetChecks() = %+v, want passing commit status", checks)
+	}
+	callsBeforeLogs := len(recorder.calls)
+	logs, err := host.FetchFailedCheckLogs(context.Background(), testPR(), "feature/forgejo", testHeadSHA, []string{"test/linux"})
+	if logs != "" || !errors.Is(err, scm.ErrUnsupported) {
+		t.Fatalf("FetchFailedCheckLogs() = (%q, %v), want independently unsupported", logs, err)
+	}
+	if len(recorder.calls) != callsBeforeLogs {
+		t.Fatal("unsupported Forgejo 15 logs issued a run command")
+	}
+}
+
+func TestPRLifecycleCommandsAndIdempotentCreate(t *testing.T) {
+	pr := pullJSON("open", false, testHeadSHA)
+	recorder := &fakeRecorder{responses: []fakeResponse{
+		{stdout: `{"found":true,"pull_request":` + pr + `,"search_info":{"complete":true,"pages":1,"fetched":1,"total":1}}`},
+		{stdout: `{"created":false,"pull_request":` + pr + `}`},
+		{stdout: `{"updated":true,"pull_request":` + pr + `}`},
+		{stdout: `{"pull_request":` + pr + `}`},
+	}}
+	host := newTestHost(recorder)
+
+	found, err := host.FindPR(context.Background(), "feature/forgejo", "main")
+	if err != nil || found == nil || found.Number != "42" || found.URL != testPRURL || found.HeadSHA != testHeadSHA {
+		t.Fatalf("FindPR() = (%+v, %v)", found, err)
+	}
+	created, err := host.CreatePR(context.Background(), "feature/forgejo", "main", scm.PRContent{Title: "Title", Body: "line one\nline two"})
+	if err != nil || created == nil || created.Number != "42" {
+		t.Fatalf("CreatePR() = (%+v, %v)", created, err)
+	}
+	if _, err := host.UpdatePR(context.Background(), created, scm.PRContent{Title: "New title", Body: "new body"}); err != nil {
+		t.Fatalf("UpdatePR() error = %v", err)
+	}
+	state, err := host.GetPRState(context.Background(), created)
+	if err != nil || state != scm.PRStateOpen {
+		t.Fatalf("GetPRState() = (%q, %v)", state, err)
+	}
+
+	want := [][]string{
+		{"pr", "find", "--repo", testRepo, "--head", "feature/forgejo", "--base", "main", "--state", "open", "--base-url", testBaseURL, "--token-env", "FORGEJO_TEST_TOKEN", "--json"},
+		{"pr", "create", "--repo", testRepo, "--head", "feature/forgejo", "--base", "main", "--title", "Title", "--body", "line one\nline two", "--base-url", testBaseURL, "--token-env", "FORGEJO_TEST_TOKEN", "--json"},
+		{"pr", "update", "--repo", testRepo, "42", "--title", "New title", "--body", "new body", "--base-url", testBaseURL, "--token-env", "FORGEJO_TEST_TOKEN", "--json"},
+		{"pr", "view", "--repo", testRepo, "42", "--base-url", testBaseURL, "--token-env", "FORGEJO_TEST_TOKEN", "--json"},
+	}
+	for i := range want {
+		if !reflect.DeepEqual(recorder.calls[i].args, want[i]) {
+			t.Errorf("call %d args = %#v, want %#v", i, recorder.calls[i].args, want[i])
+		}
+	}
+}
+
+func TestFindPRNoMatchIsExplicit(t *testing.T) {
+	host := newTestHost(&fakeRecorder{responses: []fakeResponse{{stdout: `{
+		"found":false,"pull_request":null,
+		"search_info":{"complete":true,"pages":1,"fetched":3,"total":3}
+	}`}}})
+	pr, err := host.FindPR(context.Background(), "missing", "main")
+	if err != nil || pr != nil {
+		t.Fatalf("FindPR() = (%+v, %v), want (nil, nil)", pr, err)
+	}
+}
+
+func TestChecksFailClosedAcrossStates(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name          string
+		overall       string
+		requiredState string
+		passes        bool
+		statuses      string
+		required      string
+		wantBuckets   []scm.CheckBucket
+	}{
+		{
+			name: "success", overall: "success", requiredState: "success", passes: true,
+			statuses: `[{"context":"test/linux","state":"success","description":"ok","target_url":null,"created_at":null,"updated_at":null}]`,
+			required: `[{"context":"test/linux","matched":["test/linux"],"state":"success"}]`, wantBuckets: []scm.CheckBucket{scm.CheckBucketPass},
+		},
+		{
+			name: "pending", overall: "pending", requiredState: "pending", passes: false,
+			statuses: `[{"context":"test/linux","state":"pending","description":null,"target_url":null,"created_at":null,"updated_at":null}]`,
+			required: `[{"context":"test/linux","matched":["test/linux"],"state":"pending"}]`, wantBuckets: []scm.CheckBucket{scm.CheckBucketPending},
+		},
+		{
+			name: "failure", overall: "failure", requiredState: "failure", passes: false,
+			statuses: `[{"context":"test/linux","state":"failure","description":"boom","target_url":null,"created_at":null,"updated_at":null}]`,
+			required: `[{"context":"test/linux","matched":["test/linux"],"state":"failure"}]`, wantBuckets: []scm.CheckBucket{scm.CheckBucketFail},
+		},
+		{
+			name: "none is pending rather than green", overall: "none", requiredState: "not_required", passes: false,
+			statuses: `[]`, required: `[]`, wantBuckets: []scm.CheckBucket{scm.CheckBucketPending},
+		},
+		{
+			name: "missing required context is failure", overall: "success", requiredState: "missing", passes: false,
+			statuses: `[{"context":"lint","state":"success","description":null,"target_url":null,"created_at":null,"updated_at":null}]`,
+			required: `[{"context":"test/*","matched":[],"state":"missing"}]`, wantBuckets: []scm.CheckBucket{scm.CheckBucketPass, scm.CheckBucketFail},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			host := newTestHost(&fakeRecorder{responses: []fakeResponse{{stdout: checksJSON(tt.overall, tt.requiredState, tt.passes, tt.statuses, tt.required)}}})
+			got, err := host.GetChecks(context.Background(), testPR())
+			if err != nil {
+				t.Fatalf("GetChecks() error = %v", err)
+			}
+			var buckets []scm.CheckBucket
+			for _, check := range got {
+				buckets = append(buckets, check.Bucket)
+			}
+			if !reflect.DeepEqual(buckets, tt.wantBuckets) {
+				t.Fatalf("buckets = %v, want %v (checks=%+v)", buckets, tt.wantBuckets, got)
+			}
+		})
+	}
+}
+
+func TestChecksPreserveProviderStateAndTargetLink(t *testing.T) {
+	target := testBaseURL + "/" + testRepo + "/actions/runs/91/jobs/0"
+	statuses := fmt.Sprintf(`[{"context":"CI / test (pull_request)","state":"failure","description":"boom","target_url":%q,"created_at":null,"updated_at":null}]`, target)
+	host := newTestHost(&fakeRecorder{responses: []fakeResponse{{stdout: checksJSON("failure", "not_required", false, statuses, `[]`)}}})
+
+	checks, err := host.GetChecks(context.Background(), testPR())
+	if err != nil {
+		t.Fatalf("GetChecks() error = %v", err)
+	}
+	if len(checks) != 1 || checks[0].State != "failure" || checks[0].Link != target {
+		t.Fatalf("GetChecks() = %+v, want provider failure state and exact target link", checks)
+	}
+}
+
+func TestFetchFailedCheckLogsUsesCanonicalCheckTargetAndExactRunHead(t *testing.T) {
+	target := testBaseURL + "/" + testRepo + "/actions/runs/91/jobs/0"
+	statuses := fmt.Sprintf(`[{"context":"CI / test (pull_request)","state":"failure","description":"boom","target_url":%q,"created_at":null,"updated_at":null}]`, target)
+	recorder := &fakeRecorder{responses: []fakeResponse{
+		{stdout: fixture(t, "status-forgejo-16.json")},
+		{stdout: checksJSON("failure", "not_required", false, statuses, `[]`)},
+		{stdout: runViewJSON(91, testHeadSHA, []string{`{"id":501,"run_id":91,"name":"test","status":"failure","log":"assertion failed"}`})},
+	}}
+	host := newTestHost(recorder)
+	if err := host.Available(context.Background()); err != nil {
+		t.Fatalf("Available() error = %v", err)
+	}
+
+	logs, err := host.FetchFailedCheckLogs(context.Background(), testPR(), "feature/forgejo", testHeadSHA, []string{"CI / test (pull_request)"})
+	if err != nil {
+		t.Fatalf("FetchFailedCheckLogs() error = %v", err)
+	}
+	if !strings.Contains(logs, "Forgejo Actions run 91, job test:") || !strings.Contains(logs, "assertion failed") {
+		t.Fatalf("FetchFailedCheckLogs() = %q, want identified failed-job log", logs)
+	}
+	want := []string{"run", "view", "--repo", testRepo, "91", "--log-failed", "--base-url", testBaseURL, "--token-env", "FORGEJO_TEST_TOKEN", "--json"}
+	if got := recorder.calls[2].args; !reflect.DeepEqual(got, want) {
+		t.Fatalf("run view args = %#v, want %#v", got, want)
+	}
+}
+
+func TestFetchFailedCheckLogsDeduplicatesAndSortsRunIDs(t *testing.T) {
+	target := func(runID int, job int) string {
+		return fmt.Sprintf("%s/%s/actions/runs/%d/jobs/%d", testBaseURL, testRepo, runID, job)
+	}
+	statuses := fmt.Sprintf(`[
+		{"context":"CI / second (pull_request)","state":"failure","target_url":%q},
+		{"context":"Lint / lint (pull_request)","state":"failure","target_url":%q},
+		{"context":"CI / first (pull_request)","state":"failure","target_url":%q}
+	]`, target(20, 1), target(10, 0), target(20, 0))
+	recorder := &fakeRecorder{responses: []fakeResponse{
+		{stdout: fixture(t, "status-forgejo-16.json")},
+		{stdout: checksJSON("failure", "not_required", false, statuses, `[]`)},
+		{stdout: runViewJSON(10, testHeadSHA, []string{`{"id":100,"run_id":10,"name":"lint","status":"failure","log":"lint failed"}`})},
+		{stdout: runViewJSON(20, testHeadSHA, []string{`{"id":200,"run_id":20,"name":"test","status":"failure","log":"test failed"}`})},
+	}}
+	host := newTestHost(recorder)
+	if err := host.Available(context.Background()); err != nil {
+		t.Fatalf("Available() error = %v", err)
+	}
+
+	logs, err := host.FetchFailedCheckLogs(context.Background(), testPR(), "feature/forgejo", testHeadSHA, []string{
+		"CI / first (pull_request)", "CI / second (pull_request)", "Lint / lint (pull_request)",
+	})
+	if err != nil {
+		t.Fatalf("FetchFailedCheckLogs() error = %v", err)
+	}
+	if strings.Count(logs, "Forgejo Actions run 20") != 1 || strings.Index(logs, "run 10") > strings.Index(logs, "run 20") {
+		t.Fatalf("FetchFailedCheckLogs() = %q, want deduplicated numeric run order", logs)
+	}
+	if len(recorder.calls) != 4 || recorder.calls[2].args[4] != "10" || recorder.calls[3].args[4] != "20" {
+		t.Fatalf("run view calls = %#v, want one call each in 10,20 order", recorder.calls)
+	}
+}
+
+func TestFetchFailedCheckLogsRejectsRunAndJobIdentityMismatches(t *testing.T) {
+	canonical := runViewJSON(91, testHeadSHA, []string{`{"id":501,"run_id":91,"name":"test","status":"failure","log":"failed"}`})
+	tests := []struct {
+		name string
+		view string
+		want string
+	}{
+		{name: "wrong run", view: runViewJSON(92, testHeadSHA, []string{`{"id":501,"run_id":92,"name":"test","status":"failure","log":"failed"}`}), want: "run 92, expected 91"},
+		{name: "wrong head", view: runViewJSON(91, strings.Repeat("b", 40), []string{`{"id":501,"run_id":91,"name":"test","status":"failure","log":"failed"}`}), want: "pull request head changed"},
+		{name: "wrong job run", view: strings.Replace(canonical, `"run_id":91`, `"run_id":92`, 1), want: "job 501 for run 92"},
+		{name: "failed job omitted log", view: runViewJSON(91, testHeadSHA, []string{`{"id":501,"run_id":91,"name":"test","status":"failure"}`}), want: "without a log"},
+		{name: "unsupported next", view: strings.TrimSuffix(canonical, "}") + `,"next":["Job logs are unsupported"]}`, want: "did not provide requested failed logs"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			target := testBaseURL + "/" + testRepo + "/actions/runs/91/jobs/0"
+			statuses := fmt.Sprintf(`[{"context":"CI / test (pull_request)","state":"failure","target_url":%q}]`, target)
+			recorder := &fakeRecorder{responses: []fakeResponse{
+				{stdout: fixture(t, "status-forgejo-16.json")},
+				{stdout: checksJSON("failure", "not_required", false, statuses, `[]`)},
+				{stdout: tt.view},
+			}}
+			host := newTestHost(recorder)
+			if err := host.Available(context.Background()); err != nil {
+				t.Fatalf("Available() error = %v", err)
+			}
+			logs, err := host.FetchFailedCheckLogs(context.Background(), testPR(), "feature/forgejo", testHeadSHA, []string{"CI / test (pull_request)"})
+			if logs != "" || err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("FetchFailedCheckLogs() = (%q, %v), want error containing %q", logs, err, tt.want)
+			}
+		})
+	}
+}
+
+func TestFetchFailedCheckLogsRejectsChangedCheckHeadBeforeRunLookup(t *testing.T) {
+	target := testBaseURL + "/" + testRepo + "/actions/runs/91/jobs/0"
+	statuses := fmt.Sprintf(`[{"context":"CI / test (pull_request)","state":"failure","target_url":%q}]`, target)
+	recorder := &fakeRecorder{responses: []fakeResponse{
+		{stdout: fixture(t, "status-forgejo-16.json")},
+		{stdout: checksJSON("failure", "not_required", false, statuses, `[]`)},
+	}}
+	host := newTestHost(recorder)
+	if err := host.Available(context.Background()); err != nil {
+		t.Fatalf("Available() error = %v", err)
+	}
+	_, err := host.FetchFailedCheckLogs(context.Background(), testPR(), "feature/forgejo", strings.Repeat("b", 40), []string{"CI / test (pull_request)"})
+	if !errors.Is(err, scm.ErrHeadChanged) || len(recorder.calls) != 2 {
+		t.Fatalf("FetchFailedCheckLogs() error/calls = (%v, %d), want head-changed before run view", err, len(recorder.calls))
+	}
+}
+
+func TestFetchFailedCheckLogsBoundsOutputAndHonorsCancellation(t *testing.T) {
+	target := testBaseURL + "/" + testRepo + "/actions/runs/91/jobs/0"
+	statuses := fmt.Sprintf(`[{"context":"CI / test (pull_request)","state":"failure","target_url":%q}]`, target)
+
+	t.Run("stdout limit", func(t *testing.T) {
+		recorder := &fakeRecorder{responses: []fakeResponse{
+			{stdout: fixture(t, "status-forgejo-16.json")},
+			{stdout: checksJSON("failure", "not_required", false, statuses, `[]`)},
+			{stdoutBytes: maxForgejoLogOutputBytes + 128*1024},
+		}}
+		host := newTestHost(recorder)
+		if err := host.Available(context.Background()); err != nil {
+			t.Fatalf("Available() error = %v", err)
+		}
+		logs, err := host.FetchFailedCheckLogs(context.Background(), testPR(), "feature/forgejo", testHeadSHA, []string{"CI / test (pull_request)"})
+		if logs != "" || err == nil || !strings.Contains(err.Error(), "exceeded 1048576 bytes") {
+			t.Fatalf("FetchFailedCheckLogs() = (%q, %v), want bounded-output error", logs, err)
+		}
+	})
+
+	t.Run("context cancellation", func(t *testing.T) {
+		recorder := &fakeRecorder{responses: []fakeResponse{
+			{stdout: fixture(t, "status-forgejo-16.json")},
+			{stdout: checksJSON("failure", "not_required", false, statuses, `[]`)},
+			{sleep: 2 * time.Second},
+		}}
+		host := newTestHost(recorder)
+		if err := host.Available(context.Background()); err != nil {
+			t.Fatalf("Available() error = %v", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+		_, err := host.FetchFailedCheckLogs(ctx, testPR(), "feature/forgejo", testHeadSHA, []string{"CI / test (pull_request)"})
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("FetchFailedCheckLogs() error = %v, want deadline exceeded", err)
+		}
+	})
+}
+
+func TestFetchFailedCheckLogsRedactsCommandErrors(t *testing.T) {
+	target := testBaseURL + "/" + testRepo + "/actions/runs/91/jobs/0"
+	statuses := fmt.Sprintf(`[{"context":"CI / test (pull_request)","state":"failure","target_url":%q}]`, target)
+	recorder := &fakeRecorder{responses: []fakeResponse{
+		{stdout: fixture(t, "status-forgejo-16.json")},
+		{stdout: checksJSON("failure", "not_required", false, statuses, `[]`)},
+		{stdout: `{"error":"log failed with secret-token","code":"LOG_ERROR","details":{"url":"https://user:pass@forge.example/log?token=secret-token"}}`, code: 1},
+	}}
+	host := newTestHost(recorder)
+	if err := host.Available(context.Background()); err != nil {
+		t.Fatalf("Available() error = %v", err)
+	}
+	_, err := host.FetchFailedCheckLogs(context.Background(), testPR(), "feature/forgejo", testHeadSHA, []string{"CI / test (pull_request)"})
+	if err == nil || !strings.Contains(err.Error(), "LOG_ERROR") || strings.Contains(err.Error(), "secret-token") || strings.Contains(err.Error(), "user:pass") {
+		t.Fatalf("FetchFailedCheckLogs() error = %v, want code with secrets redacted", err)
+	}
+}
+
+func TestFetchFailedCheckLogsRejectsNonCanonicalTargetsWithoutGuessing(t *testing.T) {
+	tests := []struct {
+		name   string
+		target string
+	}{
+		{name: "external host", target: "https://ci.example/actions/runs/91/jobs/0"},
+		{name: "wrong repository", target: testBaseURL + "/other/widgets/actions/runs/91/jobs/0"},
+		{name: "wrong base prefix", target: "https://forge.example:3443/other/octo/widgets/actions/runs/91/jobs/0"},
+		{name: "missing target", target: ""},
+		{name: "zero run", target: testBaseURL + "/" + testRepo + "/actions/runs/0/jobs/0"},
+		{name: "malformed job index", target: testBaseURL + "/" + testRepo + "/actions/runs/91/jobs/latest"},
+		{name: "query ambiguity", target: testBaseURL + "/" + testRepo + "/actions/runs/91/jobs/0?attempt=2"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var target any
+			if tt.target != "" {
+				target = tt.target
+			}
+			statuses, err := json.Marshal([]map[string]any{{
+				"context": "CI / test (pull_request)", "state": "failure", "target_url": target,
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			recorder := &fakeRecorder{responses: []fakeResponse{
+				{stdout: fixture(t, "status-forgejo-16.json")},
+				{stdout: checksJSON("failure", "not_required", false, string(statuses), `[]`)},
+			}}
+			host := newTestHost(recorder)
+			if err := host.Available(context.Background()); err != nil {
+				t.Fatalf("Available() error = %v", err)
+			}
+			logs, err := host.FetchFailedCheckLogs(context.Background(), testPR(), "feature/forgejo", testHeadSHA, []string{"CI / test (pull_request)"})
+			if err != nil || logs != "" {
+				t.Fatalf("FetchFailedCheckLogs() = (%q, %v), want unavailable without error", logs, err)
+			}
+			if len(recorder.calls) != 2 {
+				t.Fatalf("calls = %d, want status + checks only; target must not trigger run guessing", len(recorder.calls))
+			}
+		})
+	}
+}
+
+func TestChecksRejectMissingProtectionOutput(t *testing.T) {
+	response := checksJSON(
+		"success",
+		"not_required",
+		true,
+		`[{"context":"test/linux","state":"success","updated_at":null}]`,
+		`[]`,
+	)
+	withoutProtection := strings.Replace(response, ",\n\t\t\"protection\":{\"protected\":true,\"rule\":\"main\",\"status_checks_enabled\":true}", "", 1)
+	if withoutProtection == response {
+		t.Fatal("checks fixture did not contain protection output")
+	}
+	host := newTestHost(&fakeRecorder{responses: []fakeResponse{{stdout: withoutProtection}}})
+	_, err := host.GetChecks(context.Background(), testPR())
+	if err == nil || !strings.Contains(err.Error(), "protection") {
+		t.Fatalf("GetChecks() error = %v, want missing protection error", err)
+	}
+}
+
+func TestChecksRejectRequiredMatchesAbsentFromStatuses(t *testing.T) {
+	host := newTestHost(&fakeRecorder{responses: []fakeResponse{{stdout: checksJSON(
+		"success",
+		"success",
+		true,
+		`[{"context":"test/linux","state":"success","updated_at":null}]`,
+		`[{"context":"required/*","state":"success","matched":["required/linux"]}]`,
+	)}}})
+	_, err := host.GetChecks(context.Background(), testPR())
+	if err == nil || !strings.Contains(err.Error(), "required/linux") {
+		t.Fatalf("GetChecks() error = %v, want unknown matched context error", err)
+	}
+}
+
+func TestChecksRejectInconsistentRequiredSummary(t *testing.T) {
+	tests := []struct {
+		name          string
+		requiredState string
+		required      string
+		want          string
+	}{
+		{
+			name: "unknown required item state", requiredState: "success",
+			required: `[{"context":"test/*","matched":["test/linux"],"state":"unknown"}]`,
+			want:     "unknown required status state",
+		},
+		{
+			name: "aggregate does not match items", requiredState: "success",
+			required: `[{"context":"test/*","matched":[],"state":"missing"}]`,
+			want:     "inconsistent required status summary",
+		},
+		{
+			name: "matched required context has no matches", requiredState: "success",
+			required: `[{"context":"test/*","matched":[],"state":"success"}]`,
+			want:     "has no matches",
+		},
+	}
+	statuses := `[{"context":"test/linux","state":"success","description":"ok","target_url":null,"created_at":null,"updated_at":null}]`
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			host := newTestHost(&fakeRecorder{responses: []fakeResponse{{stdout: checksJSON("success", tt.requiredState, true, statuses, tt.required)}}})
+			_, err := host.GetChecks(context.Background(), testPR())
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("GetChecks() error = %v, want %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestChecksRejectExpectedHeadRace(t *testing.T) {
+	host := newTestHost(&fakeRecorder{responses: []fakeResponse{{stdout: strings.ReplaceAll(
+		checksJSON("success", "success", true, `[]`, `[]`), testHeadSHA, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+	}}})
+	_, err := host.GetChecks(context.Background(), testPR())
+	if !errors.Is(err, scm.ErrHeadChanged) {
+		t.Fatalf("GetChecks() error = %v, want ErrHeadChanged", err)
+	}
+}
+
+func TestMergeabilityCommandDecodingAndExpectedHead(t *testing.T) {
+	recorder := &fakeRecorder{responses: []fakeResponse{
+		{stdout: fixture(t, "status-forgejo-16.json")},
+		{stdout: `{"mergeability":{"number":42,"url":"` + testPRURL + `","head_sha":"` + testHeadSHA + `","forgejo_mergeable":false,"checks_pass":false,"mergeable":false,"reasons":["forgejo_not_mergeable"]}}`},
+	}}
+	host := newTestHost(recorder)
+	if err := host.Available(context.Background()); err != nil {
+		t.Fatalf("Available() error = %v", err)
+	}
+	got, err := host.GetMergeableState(context.Background(), testPR())
+	if err != nil || got != scm.MergeableConflict {
+		t.Fatalf("GetMergeableState() = (%q, %v), want conflict", got, err)
+	}
+	wantArgs := []string{"pr", "mergeability", "--repo", testRepo, "42", "--base-url", testBaseURL, "--token-env", "FORGEJO_TEST_TOKEN", "--json"}
+	if gotArgs := recorder.calls[1].args; !reflect.DeepEqual(gotArgs, wantArgs) {
+		t.Fatalf("mergeability args = %#v, want %#v", gotArgs, wantArgs)
+	}
+}
+
+func TestMergeabilityRejectsExpectedHeadRace(t *testing.T) {
+	recorder := &fakeRecorder{responses: []fakeResponse{
+		{stdout: fixture(t, "status-forgejo-16.json")},
+		{stdout: `{"mergeability":{"number":42,"url":"` + testPRURL + `","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","forgejo_mergeable":true,"checks_pass":true,"mergeable":true,"reasons":[]}}`},
+	}}
+	host := newTestHost(recorder)
+	if err := host.Available(context.Background()); err != nil {
+		t.Fatalf("Available() error = %v", err)
+	}
+	_, err := host.GetMergeableState(context.Background(), testPR())
+	if !errors.Is(err, scm.ErrHeadChanged) {
+		t.Fatalf("GetMergeableState() error = %v, want ErrHeadChanged", err)
+	}
+}
+
+func TestMergedProofRequiresExpectedHeadAndCanonicalIdentity(t *testing.T) {
+	proof := `{"merged":true,"number":42,"url":"` + testPRURL + `","head_sha":"` + testHeadSHA + `","merge_commit_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","merged_at":"2025-01-02T00:00:00Z","merged_by":"alice"}`
+	recorder := &fakeRecorder{responses: []fakeResponse{{stdout: `{"proof":` + proof + `}`}}}
+	host := newTestHost(recorder)
+	got, err := host.GetMergedProof(context.Background(), testPR(), testHeadSHA)
+	if err != nil || !got.Merged || got.HeadSHA != testHeadSHA || got.MergeCommitSHA == "" {
+		t.Fatalf("GetMergedProof() = (%+v, %v)", got, err)
+	}
+	wantArgs := []string{"pr", "merged", "--repo", testRepo, "42", "--base-url", testBaseURL, "--token-env", "FORGEJO_TEST_TOKEN", "--json"}
+	if gotArgs := recorder.calls[0].args; !reflect.DeepEqual(gotArgs, wantArgs) {
+		t.Fatalf("merged proof args = %#v, want %#v", gotArgs, wantArgs)
+	}
+}
+
+func TestMergedProofRejectsEmptyExpectedHead(t *testing.T) {
+	proof := `{"merged":true,"number":42,"url":"` + testPRURL + `","head_sha":"` + testHeadSHA + `","merge_commit_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","merged_at":"2025-01-02T00:00:00Z","merged_by":"alice"}`
+	host := newTestHost(&fakeRecorder{responses: []fakeResponse{{stdout: `{"proof":` + proof + `}`}}})
+	_, err := host.GetMergedProof(context.Background(), testPR(), "")
+	if err == nil || !strings.Contains(err.Error(), "expected head") {
+		t.Fatalf("GetMergedProof() error = %v, want missing expected head", err)
+	}
+}
+
+func TestMergedProofRejectsAlreadyMergedHeadRace(t *testing.T) {
+	proof := `{"merged":true,"number":42,"url":"` + testPRURL + `","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","merge_commit_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","merged_at":"2025-01-02T00:00:00Z","merged_by":"alice"}`
+	host := newTestHost(&fakeRecorder{responses: []fakeResponse{{stdout: `{"proof":` + proof + `}`}}})
+	_, err := host.GetMergedProof(context.Background(), testPR(), testHeadSHA)
+	if !errors.Is(err, scm.ErrHeadChanged) {
+		t.Fatalf("GetMergedProof() error = %v, want ErrHeadChanged", err)
+	}
+}
+
+func TestRejectsMismatchedPRIdentityAndIncompleteSearch(t *testing.T) {
+	t.Run("input URL", func(t *testing.T) {
+		host := newTestHost(&fakeRecorder{})
+		_, err := host.GetPRState(context.Background(), &scm.PR{Number: "42", URL: "https://evil.example/octo/widgets/pulls/42"})
+		if err == nil || !strings.Contains(err.Error(), "identity") {
+			t.Fatalf("GetPRState() error = %v, want identity error", err)
+		}
+	})
+	t.Run("output URL", func(t *testing.T) {
+		bad := strings.ReplaceAll(pullJSON("open", false, testHeadSHA), testPRURL, "https://evil.example/octo/widgets/pulls/42")
+		host := newTestHost(&fakeRecorder{responses: []fakeResponse{{stdout: `{"found":true,"pull_request":` + bad + `,"search_info":{"complete":true,"pages":1,"fetched":1,"total":1}}`}}})
+		_, err := host.FindPR(context.Background(), "feature/forgejo", "main")
+		if err == nil || !strings.Contains(err.Error(), "identity") {
+			t.Fatalf("FindPR() error = %v, want identity error", err)
+		}
+	})
+	t.Run("output number", func(t *testing.T) {
+		bad := strings.ReplaceAll(pullJSON("open", false, testHeadSHA), `"number":42`, `"number":43`)
+		bad = strings.ReplaceAll(bad, "/pulls/42", "/pulls/43")
+		host := newTestHost(&fakeRecorder{responses: []fakeResponse{{stdout: `{"pull_request":` + bad + `}`}}})
+		_, err := host.GetPRState(context.Background(), &scm.PR{Number: "42", URL: testPRURL})
+		if err == nil || !strings.Contains(err.Error(), "number") {
+			t.Fatalf("GetPRState() error = %v, want number identity error", err)
+		}
+	})
+	t.Run("update output number", func(t *testing.T) {
+		bad := strings.ReplaceAll(pullJSON("open", false, testHeadSHA), `"number":42`, `"number":43`)
+		bad = strings.ReplaceAll(bad, "/pulls/42", "/pulls/43")
+		host := newTestHost(&fakeRecorder{responses: []fakeResponse{{stdout: `{"updated":true,"pull_request":` + bad + `}`}}})
+		_, err := host.UpdatePR(context.Background(), testPR(), scm.PRContent{Title: "title", Body: "body"})
+		if err == nil || !strings.Contains(err.Error(), "number") {
+			t.Fatalf("UpdatePR() error = %v, want number identity error", err)
+		}
+	})
+	t.Run("mergeability output number", func(t *testing.T) {
+		recorder := &fakeRecorder{responses: []fakeResponse{
+			{stdout: fixture(t, "status-forgejo-16.json")},
+			{stdout: `{"mergeability":{"number":43,"url":"` + testBaseURL + `/octo/widgets/pulls/43","head_sha":"` + testHeadSHA + `","forgejo_mergeable":true,"checks_pass":true,"mergeable":true,"reasons":[]}}`},
+		}}
+		host := newTestHost(recorder)
+		if err := host.Available(context.Background()); err != nil {
+			t.Fatalf("Available() error = %v", err)
+		}
+		_, err := host.GetMergeableState(context.Background(), testPR())
+		if err == nil || !strings.Contains(err.Error(), "number") {
+			t.Fatalf("GetMergeableState() error = %v, want number identity error", err)
+		}
+	})
+	t.Run("merged proof output number", func(t *testing.T) {
+		proof := `{"merged":true,"number":43,"url":"` + testBaseURL + `/octo/widgets/pulls/43","head_sha":"` + testHeadSHA + `","merge_commit_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","merged_at":"2025-01-02T00:00:00Z","merged_by":"alice"}`
+		host := newTestHost(&fakeRecorder{responses: []fakeResponse{{stdout: `{"proof":` + proof + `}`}}})
+		_, err := host.GetMergedProof(context.Background(), testPR(), testHeadSHA)
+		if err == nil || !strings.Contains(err.Error(), "number") {
+			t.Fatalf("GetMergedProof() error = %v, want number identity error", err)
+		}
+	})
+	t.Run("incomplete search", func(t *testing.T) {
+		host := newTestHost(&fakeRecorder{responses: []fakeResponse{{stdout: `{"found":false,"pull_request":null,"search_info":{"complete":false,"pages":10,"fetched":0,"total":null}}`}}})
+		_, err := host.FindPR(context.Background(), "feature/forgejo", "main")
+		if err == nil || !strings.Contains(err.Error(), "incomplete") {
+			t.Fatalf("FindPR() error = %v, want incomplete search error", err)
+		}
+	})
+}
+
+func TestCommandFailuresAreActionableAndRedacted(t *testing.T) {
+	t.Run("executable not found", func(t *testing.T) {
+		host := newTestHostWithOptions(&fakeRecorder{}, func(string) bool { return false })
+		err := host.Available(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "forgejo_axi_path") || !strings.Contains(err.Error(), "not found") {
+			t.Fatalf("Available() error = %v, want actionable missing executable", err)
+		}
+	})
+	t.Run("nonzero JSON error redacts token", func(t *testing.T) {
+		recorder := &fakeRecorder{responses: []fakeResponse{{
+			stdout: `{"error":"request failed with secret-token","code":"HTTP_ERROR","details":{"url":"https://user:pass@forge.example/path?token=secret-token"},"help":["check secret-token"]}`,
+			code:   1,
+		}}}
+		host := newTestHost(recorder)
+		_, err := host.FindPR(context.Background(), "feature/forgejo", "main")
+		if err == nil || !strings.Contains(err.Error(), "HTTP_ERROR") || strings.Contains(err.Error(), "secret-token") || strings.Contains(err.Error(), "user:pass") {
+			t.Fatalf("FindPR() error = %v, want code with secrets redacted", err)
+		}
+	})
+	t.Run("malformed output", func(t *testing.T) {
+		host := newTestHost(&fakeRecorder{responses: []fakeResponse{{stdout: `{not-json`}}})
+		_, err := host.FindPR(context.Background(), "feature/forgejo", "main")
+		if err == nil || !strings.Contains(err.Error(), "invalid JSON") {
+			t.Fatalf("FindPR() error = %v, want invalid JSON", err)
+		}
+	})
+}
+
+func TestCommandHonorsCancellationAndTimeout(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		context func() (context.Context, context.CancelFunc)
+		want    error
+	}{
+		{
+			name: "cancel",
+			context: func() (context.Context, context.CancelFunc) {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx, cancel
+			},
+			want: context.Canceled,
+		},
+		{
+			name: "deadline",
+			context: func() (context.Context, context.CancelFunc) {
+				return context.WithTimeout(context.Background(), 20*time.Millisecond)
+			},
+			want: context.DeadlineExceeded,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := &fakeRecorder{responses: []fakeResponse{{sleep: 2 * time.Second}}}
+			host := newTestHost(recorder)
+			ctx, cancel := tt.context()
+			defer cancel()
+			_, err := host.FindPR(ctx, "feature/forgejo", "main")
+			if !errors.Is(err, tt.want) {
+				t.Fatalf("FindPR() error = %v, want %v", err, tt.want)
+			}
+		})
+	}
+}
+
+func testPR() *scm.PR {
+	return &scm.PR{Number: "42", URL: testPRURL, HeadSHA: testHeadSHA}
+}
+
+func pullJSON(state string, merged bool, sha string) string {
+	return fmt.Sprintf(`{
+		"number":42,"url":%q,"api_url":%q,"state":%q,"draft":false,"title":"Forgejo support",
+		"head":"feature/forgejo","base":"main","head_sha":%q,"mergeable":true,"merged":%t,
+		"merge_commit_sha":null,"merged_at":null,"merged_by":null
+	}`, testPRURL, testBaseURL+"/api/v1/repos/octo/widgets/pulls/42", state, sha, merged)
+}
+
+func runViewJSON(runID int, headSHA string, jobs []string) string {
+	return fmt.Sprintf(`{
+		"run":{"id":%d,"url":%q,"api_url":%q,"title":"CI","event":"pull_request","branch":"feature/forgejo","head_sha":%q,"run_number":7,"status":"failure","started_at":null,"completed_at":"2026-08-06T00:01:00Z"},
+		"jobs":[%s]
+	}`, runID, testBaseURL+"/"+testRepo+"/actions/runs/"+strconv.Itoa(runID), testBaseURL+"/api/v1/repos/"+testRepo+"/actions/runs/"+strconv.Itoa(runID), headSHA, strings.Join(jobs, ","))
+}
+
+func checksJSON(overall, requiredState string, passes bool, statuses, required string) string {
+	var decoded []json.RawMessage
+	if err := json.Unmarshal([]byte(statuses), &decoded); err != nil {
+		panic(fmt.Sprintf("invalid test statuses: %v", err))
+	}
+	reported := len(decoded)
+	return fmt.Sprintf(`{
+		"checks":{"sha":%q,"reported":%d,"state":%q,"statuses":%s,
+		"required":%s,"required_state":%q,"passes":%t,
+		"protection":{"protected":true,"rule":"main","status_checks_enabled":true}}
+	}`, testHeadSHA, reported, overall, statuses, required, requiredState, passes)
+}
+
+func fixture(t *testing.T, name string) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("testdata", name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
+type fakeResponse struct {
+	stdout      string
+	stdoutBytes int
+	stderr      string
+	code        int
+	sleep       time.Duration
+}
+
+type fakeCall struct {
+	name string
+	args []string
+}
+
+type fakeRecorder struct {
+	calls     []fakeCall
+	responses []fakeResponse
+}
+
+func (r *fakeRecorder) factory(ctx context.Context, name string, args ...string) *exec.Cmd {
+	r.calls = append(r.calls, fakeCall{name: name, args: append([]string(nil), args...)})
+	response := fakeResponse{stderr: "unexpected forgejo-axi command", code: 1}
+	if len(r.responses) > 0 {
+		response = r.responses[0]
+		r.responses = r.responses[1:]
+	}
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=TestForgejoAXIHelperProcess", "--")
+	cmd.Env = append(os.Environ(),
+		"FORGEJO_TEST_HELPER=1",
+		"FORGEJO_TEST_STDOUT="+response.stdout,
+		fmt.Sprintf("FORGEJO_TEST_STDOUT_BYTES=%d", response.stdoutBytes),
+		"FORGEJO_TEST_STDERR="+response.stderr,
+		fmt.Sprintf("FORGEJO_TEST_EXIT_CODE=%d", response.code),
+		fmt.Sprintf("FORGEJO_TEST_SLEEP=%d", response.sleep.Milliseconds()),
+	)
+	return cmd
+}
+
+func TestForgejoAXIHelperProcess(t *testing.T) {
+	if os.Getenv("FORGEJO_TEST_HELPER") != "1" {
+		return
+	}
+	if raw := os.Getenv("FORGEJO_TEST_SLEEP"); raw != "" && raw != "0" {
+		var millis int
+		_, _ = fmt.Sscanf(raw, "%d", &millis)
+		time.Sleep(time.Duration(millis) * time.Millisecond)
+	}
+	if raw := os.Getenv("FORGEJO_TEST_STDOUT_BYTES"); raw != "" && raw != "0" {
+		var count int
+		_, _ = fmt.Sscanf(raw, "%d", &count)
+		chunk := []byte(strings.Repeat("x", 4*1024))
+		for count > 0 {
+			write := len(chunk)
+			if count < write {
+				write = count
+			}
+			if _, err := os.Stdout.Write(chunk[:write]); err != nil {
+				break
+			}
+			count -= write
+		}
+	} else {
+		_, _ = fmt.Fprint(os.Stdout, os.Getenv("FORGEJO_TEST_STDOUT"))
+	}
+	_, _ = fmt.Fprint(os.Stderr, os.Getenv("FORGEJO_TEST_STDERR"))
+	if os.Getenv("FORGEJO_TEST_EXIT_CODE") != "0" {
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+
+func newTestHost(recorder *fakeRecorder) *Host {
+	return newTestHostWithOptions(recorder, func(string) bool { return true })
+}
+
+func newTestHostWithOptions(recorder *fakeRecorder, available func(string) bool) *Host {
+	return New(Options{
+		CommandFactory: recorder.factory,
+		CLIAvailable:   available,
+		Executable:     "/opt/tools/forgejo-axi-custom",
+		BaseURL:        testBaseURL,
+		Repository:     testRepo,
+		TokenEnv:       "FORGEJO_TEST_TOKEN",
+		ExpectedHead:   func() string { return testHeadSHA },
+		Secrets:        []string{"secret-token", "pass"},
+	})
+}
+
+func TestMain(m *testing.M) {
+	if runtime.GOOS == "windows" {
+		// The helper-process fake remains portable; this branch documents that
+		// no shell executable is involved in these contract tests.
+	}
+	os.Exit(m.Run())
+}

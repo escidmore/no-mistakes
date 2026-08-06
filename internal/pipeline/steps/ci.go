@@ -65,9 +65,9 @@ func (s *CIStep) ReconcileApprovalGate(sctx *pipeline.StepContext) (bool, error)
 	if err := sctx.Ctx.Err(); err != nil {
 		return false, err
 	}
-	provider := scm.DetectProviderContext(sctx.Ctx, sctx.Repo.UpstreamURL)
+	provider := detectProviderForStep(sctx, sctx.Repo.UpstreamURL)
 	if provider == scm.ProviderUnknown && sctx.Run.PRURL != nil {
-		provider = scm.DetectProviderContext(sctx.Ctx, *sctx.Run.PRURL)
+		provider = detectProviderForStep(sctx, *sctx.Run.PRURL)
 	}
 	host, skipReason := buildHost(sctx, provider)
 	if host == nil {
@@ -94,6 +94,9 @@ func (s *CIStep) ReconcileApprovalGate(sctx *pipeline.StepContext) (bool, error)
 	}
 	switch state {
 	case scm.PRStateMerged:
+		if err := validateMergedState(sctx.Ctx, host, &scm.PR{Number: prNumber, URL: prURL}, sctx.Run.HeadSHA); err != nil {
+			return false, err
+		}
 		if err := sctx.DB.UpdateRunPRState(sctx.Run.ID, "merged"); err != nil {
 			return false, err
 		}
@@ -131,9 +134,9 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	provider := scm.DetectProviderContext(ctx, sctx.Repo.UpstreamURL)
+	provider := detectProviderForStep(sctx, sctx.Repo.UpstreamURL)
 	if provider == scm.ProviderUnknown && sctx.Run.PRURL != nil {
-		provider = scm.DetectProviderContext(ctx, *sctx.Run.PRURL)
+		provider = detectProviderForStep(sctx, *sctx.Run.PRURL)
 	}
 	host, skipReason := buildHost(sctx, provider)
 	if host == nil {
@@ -257,6 +260,9 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 			sctx.Log(fmt.Sprintf("warning: could not check PR state: %v", err))
 			prStateKnown = false
 		} else if state == scm.PRStateMerged {
+			if err := validateMergedState(ctx, host, pr, sctx.Run.HeadSHA); err != nil {
+				return nil, err
+			}
 			if err := sctx.DB.UpdateRunPRState(sctx.Run.ID, "merged"); err != nil {
 				return nil, err
 			}

@@ -12,6 +12,8 @@ agent: auto
 
 acpx_path: acpx
 
+forgejo_axi_path: forgejo-axi
+
 acp_registry_overrides:
   local-gemini: node /opt/mock-acp-agent.mjs
 
@@ -109,6 +111,17 @@ Path to the user-installed `acpx` binary used for `agent: acp:<target>` and ACP 
 | ------- | -------- |
 | Type    | `string` |
 | Default | `acpx`   |
+
+### forgejo_axi_path
+
+Executable used for Forgejo PR and CI operations.
+
+|         |               |
+| ------- | ------------- |
+| Type    | `string`      |
+| Default | `forgejo-axi` |
+
+A bare name is resolved from the daemon's effective `PATH`; an explicit path is executed directly. See [Provider Integration](/no-mistakes/guides/provider-integration/#forgejo) for setup and the [environment reference](/no-mistakes/reference/environment/#forgejo_base_url) for host and token configuration.
 
 ### acp_registry_overrides
 
