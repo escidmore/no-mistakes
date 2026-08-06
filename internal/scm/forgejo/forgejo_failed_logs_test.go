@@ -244,6 +244,7 @@ func TestFetchFailedCheckLogsRejectsNonCanonicalTargetsWithoutGuessing(t *testin
 		{name: "leading-zero job", target: testBaseURL + "/" + testRepo + "/actions/runs/91/jobs/00"},
 		{name: "signed job", target: testBaseURL + "/" + testRepo + "/actions/runs/91/jobs/+0"},
 		{name: "malformed job index", target: testBaseURL + "/" + testRepo + "/actions/runs/91/jobs/latest"},
+		{name: "empty query ambiguity", target: testBaseURL + "/" + testRepo + "/actions/runs/91/jobs/0?"},
 		{name: "query ambiguity", target: testBaseURL + "/" + testRepo + "/actions/runs/91/jobs/0?attempt=2"},
 	}
 	for _, tt := range tests {
