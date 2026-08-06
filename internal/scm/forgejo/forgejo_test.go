@@ -48,6 +48,33 @@ func TestResolveRemoteSupportsPortsAndPathPrefixes(t *testing.T) {
 			wantRepo:   "octo/widgets",
 		},
 		{
+			name:       "canonical configured base",
+			remote:     "https://code.example/octo/widgets.git",
+			configured: "HTTPS://CODE.EXAMPLE:443/",
+			wantBase:   "https://code.example",
+			wantRepo:   "octo/widgets",
+		},
+		{
+			name:       "canonical remote authority",
+			remote:     "https://CODE.EXAMPLE:443/octo/widgets.git",
+			configured: "https://code.example",
+			wantBase:   "https://code.example",
+			wantRepo:   "octo/widgets",
+		},
+		{
+			name:       "canonical HTTP default port",
+			remote:     "http://code.example/octo/widgets.git",
+			configured: "HTTP://CODE.EXAMPLE:80",
+			wantBase:   "http://code.example",
+			wantRepo:   "octo/widgets",
+		},
+		{
+			name:     "canonical inferred base",
+			remote:   "https://FORGEJO.EXAMPLE:443/octo/widgets.git",
+			wantBase: "https://forgejo.example",
+			wantRepo: "octo/widgets",
+		},
+		{
 			name:       "SSH origin with HTTPS base",
 			remote:     "ssh://git@code.example:2222/scm/octo/widgets.git",
 			configured: "https://code.example:3443/scm",
