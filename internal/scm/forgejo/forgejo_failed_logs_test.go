@@ -148,6 +148,24 @@ func TestFetchFailedCheckLogsUsesLiveCheckHeadForRunLookup(t *testing.T) {
 	}
 }
 
+func TestFetchFailedCheckLogsRejectsInvalidFreshChecksBeforeRunLookup(t *testing.T) {
+	target := testBaseURL + "/" + testRepo + "/actions/runs/91/jobs/0"
+	statuses := fmt.Sprintf(`[{"context":"CI / test (pull_request)","state":"failure","target_url":%q}]`, target)
+	checks := strings.Replace(checksJSON("failure", "not_required", false, statuses, `[]`), testHeadSHA, "", 1)
+	recorder := &fakeRecorder{responses: []fakeResponse{
+		{stdout: fixture(t, "status-forgejo-16.json")},
+		{stdout: checks},
+	}}
+	host := newTestHost(recorder)
+	if err := host.Available(context.Background()); err != nil {
+		t.Fatalf("Available() error = %v", err)
+	}
+	logs, err := host.FetchFailedCheckLogs(context.Background(), testPR(), "feature/forgejo", testHeadSHA, []string{"CI / test (pull_request)"})
+	if logs != "" || err == nil || !strings.Contains(err.Error(), "checks without a head SHA") || len(recorder.calls) != 2 {
+		t.Fatalf("FetchFailedCheckLogs() = (%q, %v) with %d calls, want fresh-check validation error", logs, err, len(recorder.calls))
+	}
+}
+
 func TestFetchFailedCheckLogsBoundsOutputAndHonorsCancellation(t *testing.T) {
 	target := testBaseURL + "/" + testRepo + "/actions/runs/91/jobs/0"
 	statuses := fmt.Sprintf(`[{"context":"CI / test (pull_request)","state":"failure","target_url":%q}]`, target)
