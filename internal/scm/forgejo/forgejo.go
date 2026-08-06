@@ -388,7 +388,7 @@ func (h *Host) FetchFailedCheckLogs(ctx context.Context, pr *scm.PR, _ string, _
 		return "", err
 	}
 
-	runSet := make(map[int]struct{})
+	jobIndicesByRun := make(map[int]map[int]struct{})
 	for _, check := range checks {
 		if check.State != "failure" {
 			continue
@@ -396,16 +396,19 @@ func (h *Host) FetchFailedCheckLogs(ctx context.Context, pr *scm.PR, _ string, _
 		if _, ok := targets[check.Name]; !ok {
 			continue
 		}
-		runID, ok := h.actionsRunFromTarget(check.Link)
+		runID, jobIndex, ok := h.actionsRunJobFromTarget(check.Link)
 		if ok {
-			runSet[runID] = struct{}{}
+			if jobIndicesByRun[runID] == nil {
+				jobIndicesByRun[runID] = make(map[int]struct{})
+			}
+			jobIndicesByRun[runID][jobIndex] = struct{}{}
 		}
 	}
-	if len(runSet) == 0 {
+	if len(jobIndicesByRun) == 0 {
 		return "", nil
 	}
-	runIDs := make([]int, 0, len(runSet))
-	for runID := range runSet {
+	runIDs := make([]int, 0, len(jobIndicesByRun))
+	for runID := range jobIndicesByRun {
 		runIDs = append(runIDs, runID)
 	}
 	sort.Ints(runIDs)
@@ -421,11 +424,27 @@ func (h *Host) FetchFailedCheckLogs(ctx context.Context, pr *scm.PR, _ string, _
 		if err := h.validateRunView(response, runID, result.SHA); err != nil {
 			return "", err
 		}
+		jobIndices := make([]int, 0, len(jobIndicesByRun[runID]))
+		for jobIndex := range jobIndicesByRun[runID] {
+			jobIndices = append(jobIndices, jobIndex)
+		}
+		sort.Ints(jobIndices)
+		selectedJobIDs := make(map[int]struct{}, len(jobIndices))
+		for _, jobIndex := range jobIndices {
+			if jobIndex >= len(response.Jobs) {
+				return "", fmt.Errorf("Forgejo Actions run %d target job index %d is absent from %d returned jobs", runID, jobIndex, len(response.Jobs))
+			}
+			job := response.Jobs[jobIndex]
+			if job.Status != "failure" {
+				return "", fmt.Errorf("Forgejo Actions run %d target job %d has status %q, expected failure", runID, job.ID, job.Status)
+			}
+			selectedJobIDs[job.ID] = struct{}{}
+		}
 		sort.Slice(response.Jobs, func(i, j int) bool {
 			return response.Jobs[i].ID < response.Jobs[j].ID
 		})
 		for _, job := range response.Jobs {
-			if job.Status != "failure" {
+			if _, ok := selectedJobIDs[job.ID]; !ok {
 				continue
 			}
 			if job.Log == nil {
@@ -451,36 +470,36 @@ func (h *Host) FetchFailedCheckLogs(ctx context.Context, pr *scm.PR, _ string, _
 	return logs.String(), nil
 }
 
-func (h *Host) actionsRunFromTarget(raw string) (int, bool) {
+func (h *Host) actionsRunJobFromTarget(raw string) (int, int, bool) {
 	target, err := url.Parse(raw)
 	if err != nil || target.User != nil || target.ForceQuery || target.RawQuery != "" || target.Fragment != "" || target.RawPath != "" {
-		return 0, false
+		return 0, 0, false
 	}
 	base, err := url.Parse(h.baseURL)
 	if err != nil || !strings.EqualFold(target.Scheme, base.Scheme) || !strings.EqualFold(target.Host, base.Host) {
-		return 0, false
+		return 0, 0, false
 	}
 	prefix := strings.TrimRight(base.Path, "/") + "/" + h.repository + "/actions/runs/"
 	if !strings.HasPrefix(target.Path, prefix) {
-		return 0, false
+		return 0, 0, false
 	}
 	parts := strings.Split(strings.TrimPrefix(target.Path, prefix), "/")
 	if len(parts) != 3 || parts[1] != "jobs" {
-		return 0, false
+		return 0, 0, false
 	}
 	runID, err := strconv.Atoi(parts[0])
 	if err != nil || runID <= 0 || parts[0] != strconv.Itoa(runID) {
-		return 0, false
+		return 0, 0, false
 	}
 	jobIndex, err := strconv.Atoi(parts[2])
 	if err != nil || jobIndex < 0 || parts[2] != strconv.Itoa(jobIndex) {
-		return 0, false
+		return 0, 0, false
 	}
 	canonical := h.baseURL + "/" + h.repository + "/actions/runs/" + strconv.Itoa(runID) + "/jobs/" + strconv.Itoa(jobIndex)
 	if raw != canonical {
-		return 0, false
+		return 0, 0, false
 	}
-	return runID, true
+	return runID, jobIndex, true
 }
 
 func (h *Host) validateRunView(response runViewResponse, expectedRunID int, expectedHead string) error {
