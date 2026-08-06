@@ -91,6 +91,14 @@ func detectHostedProvider(host string) Provider {
 }
 
 func detectProviderWithoutSSH(remoteURL, forgejoBaseURL string) Provider {
+	host := ExtractHost(remoteURL)
+	if provider := detectHostedProvider(host); provider != ProviderUnknown {
+		return provider
+	}
+	if forgejoBaseMatchesRemote(forgejoBaseURL, remoteURL) {
+		return ProviderForgejo
+	}
+
 	lower := strings.ToLower(remoteURL)
 	switch {
 	case strings.Contains(lower, "github.com"):
@@ -105,10 +113,7 @@ func detectProviderWithoutSSH(remoteURL, forgejoBaseURL string) Provider {
 		return ProviderAzureDevOps
 	}
 
-	if forgejoBaseMatchesRemote(forgejoBaseURL, remoteURL) {
-		return ProviderForgejo
-	}
-	if host := ExtractHost(remoteURL); host == "codeberg.org" || strings.Contains(host, "forgejo") {
+	if host == "codeberg.org" || strings.Contains(host, "forgejo") {
 		return ProviderForgejo
 	}
 
@@ -121,7 +126,7 @@ func detectProviderWithoutSSH(remoteURL, forgejoBaseURL string) Provider {
 	// Fallback for GitHub Enterprise Server instances: consult the gh CLI's
 	// configured hosts (hosts.yml). If the remote's host is one gh is
 	// authenticated with, treat it as GitHub.
-	if host := ExtractHost(remoteURL); host != "" {
+	if host != "" {
 		if glabKnowsHost(host) {
 			return ProviderGitLab
 		}
