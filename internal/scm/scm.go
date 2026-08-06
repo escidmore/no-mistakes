@@ -61,23 +61,15 @@ func detectProvider(ctx context.Context, remoteURL string, lookup sshHostnameLoo
 func detectProviderWithForgejoBaseURL(ctx context.Context, remoteURL, forgejoBaseURL string, lookup sshHostnameLookup) Provider {
 	host := resolveHost(ctx, remoteURL, lookup)
 	resolved := host != "" && !strings.EqualFold(host, ExtractHost(remoteURL))
-	resolvedProvider := ProviderUnknown
 	if resolved {
-		resolvedProvider = detectProviderWithoutSSH(host, "")
-		if resolvedProvider != ProviderUnknown && resolvedProvider != ProviderForgejo {
-			return resolvedProvider
+		if provider := detectProviderWithoutSSH(host, ""); provider != ProviderUnknown {
+			return provider
+		}
+		if forgejoBaseMatchesResolvedRemote(forgejoBaseURL, remoteURL, host) {
+			return ProviderForgejo
 		}
 	}
-	if provider := detectProviderWithoutSSH(remoteURL, forgejoBaseURL); provider != ProviderUnknown {
-		return provider
-	}
-	if !resolved {
-		return ProviderUnknown
-	}
-	if forgejoBaseMatchesResolvedRemote(forgejoBaseURL, remoteURL, host) {
-		return ProviderForgejo
-	}
-	return resolvedProvider
+	return detectProviderWithoutSSH(remoteURL, forgejoBaseURL)
 }
 
 func detectProviderWithoutSSH(remoteURL, forgejoBaseURL string) Provider {
