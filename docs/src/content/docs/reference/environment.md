@@ -43,7 +43,7 @@ Canonical Forgejo web base URL used for provider discovery and forgejo-axi comma
 | Type    | `URL`    |
 | Default | (none)   |
 
-Set this for arbitrary self-hosted hostnames and whenever the origin uses a non-default web port or path prefix, for example `https://forge.example:3443/git`. The host and prefix must match the repository's upstream origin; credentials, query strings, and fragments are rejected. `codeberg.org` and hostnames containing `forgejo` are detected without this variable when no path prefix needs disambiguation.
+Set this for every SSH origin, because an SSH remote does not identify the canonical Forgejo web scheme, port, or path prefix. Also set it when an HTTPS origin uses a self-hosted hostname other than `codeberg.org` or one containing `forgejo`. Recognized HTTPS origins are detected automatically, including non-default ports and path prefixes inferred from the origin. When set, the host and prefix must match the repository's upstream origin; credentials, query strings, and fragments are rejected.
 
 ## `FORGEJO_TOKEN_<HOST_KEY>`
 
