@@ -10,8 +10,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/kunchenguid/no-mistakes/internal/scm"
 )
 
 func TestChecksPreserveProviderStateAndTargetLink(t *testing.T) {
@@ -122,20 +120,21 @@ func TestFetchFailedCheckLogsRejectsRunHeadAndJobMismatches(t *testing.T) {
 	}
 }
 
-func TestFetchFailedCheckLogsRejectsChangedCheckHeadBeforeRunLookup(t *testing.T) {
+func TestFetchFailedCheckLogsUsesLiveCheckHeadForRunLookup(t *testing.T) {
 	target := testBaseURL + "/" + testRepo + "/actions/runs/91/jobs/0"
 	statuses := fmt.Sprintf(`[{"context":"CI / test (pull_request)","state":"failure","target_url":%q}]`, target)
 	recorder := &fakeRecorder{responses: []fakeResponse{
 		{stdout: fixture(t, "status-forgejo-16.json")},
 		{stdout: checksJSON("failure", "not_required", false, statuses, `[]`)},
+		{stdout: failedLogRunViewJSON(91, testHeadSHA, []string{`{"id":501,"run_id":91,"name":"test","status":"failure","log":"failed"}`})},
 	}}
 	host := newTestHost(recorder)
 	if err := host.Available(context.Background()); err != nil {
 		t.Fatalf("Available() error = %v", err)
 	}
-	_, err := host.FetchFailedCheckLogs(context.Background(), testPR(), "feature/forgejo", strings.Repeat("b", 40), []string{"CI / test (pull_request)"})
-	if !errors.Is(err, scm.ErrHeadChanged) || len(recorder.calls) != 2 {
-		t.Fatalf("FetchFailedCheckLogs() error/calls = (%v, %d), want head-changed before run view", err, len(recorder.calls))
+	logs, err := host.FetchFailedCheckLogs(context.Background(), testPR(), "feature/forgejo", strings.Repeat("b", 40), []string{"CI / test (pull_request)"})
+	if err != nil || !strings.Contains(logs, "failed") || len(recorder.calls) != 3 {
+		t.Fatalf("FetchFailedCheckLogs() = (%q, %v) with %d calls, want live-head log lookup", logs, err, len(recorder.calls))
 	}
 }
 
@@ -206,6 +205,10 @@ func TestFetchFailedCheckLogsRejectsNonCanonicalTargetsWithoutGuessing(t *testin
 		{name: "wrong base prefix", target: "https://forge.example:3443/other/octo/widgets/actions/runs/91/jobs/0"},
 		{name: "missing target", target: ""},
 		{name: "zero run", target: testBaseURL + "/" + testRepo + "/actions/runs/0/jobs/0"},
+		{name: "leading-zero run", target: testBaseURL + "/" + testRepo + "/actions/runs/091/jobs/0"},
+		{name: "signed run", target: testBaseURL + "/" + testRepo + "/actions/runs/+91/jobs/0"},
+		{name: "leading-zero job", target: testBaseURL + "/" + testRepo + "/actions/runs/91/jobs/00"},
+		{name: "signed job", target: testBaseURL + "/" + testRepo + "/actions/runs/91/jobs/+0"},
 		{name: "malformed job index", target: testBaseURL + "/" + testRepo + "/actions/runs/91/jobs/latest"},
 		{name: "query ambiguity", target: testBaseURL + "/" + testRepo + "/actions/runs/91/jobs/0?attempt=2"},
 	}
