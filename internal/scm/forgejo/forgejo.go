@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"os/exec"
 	"path"
@@ -388,7 +389,7 @@ func (h *Host) FetchFailedCheckLogs(ctx context.Context, pr *scm.PR, _ string, _
 		return "", err
 	}
 
-	jobIndicesByRun := make(map[int]map[int]struct{})
+	jobIndicesByRunNumber := make(map[int]map[int]struct{})
 	for _, check := range checks {
 		if check.State != "failure" {
 			continue
@@ -396,36 +397,71 @@ func (h *Host) FetchFailedCheckLogs(ctx context.Context, pr *scm.PR, _ string, _
 		if _, ok := targets[check.Name]; !ok {
 			continue
 		}
-		runID, jobIndex, ok := h.actionsRunJobFromTarget(check.Link)
+		runNumber, jobIndex, ok := h.actionsRunJobFromTarget(check.Link)
 		if ok {
-			if jobIndicesByRun[runID] == nil {
-				jobIndicesByRun[runID] = make(map[int]struct{})
+			if jobIndicesByRunNumber[runNumber] == nil {
+				jobIndicesByRunNumber[runNumber] = make(map[int]struct{})
 			}
-			jobIndicesByRun[runID][jobIndex] = struct{}{}
+			jobIndicesByRunNumber[runNumber][jobIndex] = struct{}{}
 		}
 	}
-	if len(jobIndicesByRun) == 0 {
+	if len(jobIndicesByRunNumber) == 0 {
 		return "", nil
 	}
-	runIDs := make([]int, 0, len(jobIndicesByRun))
-	for runID := range jobIndicesByRun {
-		runIDs = append(runIDs, runID)
+	runNumbers := make([]int, 0, len(jobIndicesByRunNumber))
+	for runNumber := range jobIndicesByRunNumber {
+		runNumbers = append(runNumbers, runNumber)
 	}
-	sort.Ints(runIDs)
+	sort.Ints(runNumbers)
+
+	var listed runListResponse
+	if err := h.runJSONWithLimit(ctx, "run list", []string{"--repo", h.repository, "--fields", "all"}, &listed, maxForgejoLogOutputBytes); err != nil {
+		return "", err
+	}
+	if !listed.PageInfo.Complete {
+		return "", errors.New("forgejo-axi run list did not return a complete run identity set")
+	}
+	runIDsByNumber := make(map[int]int, len(runNumbers))
+	seenRunIDs := make(map[int]struct{}, len(runNumbers))
+	for _, runNumber := range runNumbers {
+		matched := -1
+		for i, run := range listed.Runs {
+			if run.RunNumber != runNumber || run.HeadSHA != result.SHA {
+				continue
+			}
+			if matched >= 0 {
+				return "", fmt.Errorf("forgejo-axi run list returned multiple runs numbered %d at pull request head %s", runNumber, result.SHA)
+			}
+			matched = i
+		}
+		if matched < 0 {
+			return "", fmt.Errorf("forgejo-axi run list did not return run number %d at pull request head %s", runNumber, result.SHA)
+		}
+		run := listed.Runs[matched]
+		if err := h.validateRunIdentity(run, run.ID, runNumber, result.SHA); err != nil {
+			return "", err
+		}
+		if _, duplicate := seenRunIDs[run.ID]; duplicate {
+			return "", fmt.Errorf("forgejo-axi run list mapped multiple run numbers to run %d", run.ID)
+		}
+		seenRunIDs[run.ID] = struct{}{}
+		runIDsByNumber[runNumber] = run.ID
+	}
 
 	var logs strings.Builder
 	remaining := maxForgejoLogOutputBytes
-	for _, runID := range runIDs {
+	for _, runNumber := range runNumbers {
+		runID := runIDsByNumber[runNumber]
 		var response runViewResponse
 		args := []string{"--repo", h.repository, strconv.Itoa(runID), "--log-failed"}
 		if err := h.runJSONWithLimit(ctx, "run view", args, &response, maxForgejoLogOutputBytes); err != nil {
 			return "", err
 		}
-		if err := h.validateRunView(response, runID, result.SHA); err != nil {
+		if err := h.validateRunView(response, runID, runNumber, result.SHA); err != nil {
 			return "", err
 		}
-		jobIndices := make([]int, 0, len(jobIndicesByRun[runID]))
-		for jobIndex := range jobIndicesByRun[runID] {
+		jobIndices := make([]int, 0, len(jobIndicesByRunNumber[runNumber]))
+		for jobIndex := range jobIndicesByRunNumber[runNumber] {
 			jobIndices = append(jobIndices, jobIndex)
 		}
 		sort.Ints(jobIndices)
@@ -454,7 +490,7 @@ func (h *Host) FetchFailedCheckLogs(ctx context.Context, pr *scm.PR, _ string, _
 			if logText == "" {
 				continue
 			}
-			block := fmt.Sprintf("Forgejo Actions run %d, job %s:\n%s", runID, job.Name, logText)
+			block := fmt.Sprintf("Forgejo Actions run %d, job %s:\n%s", runNumber, job.Name, logText)
 			separator := ""
 			if logs.Len() > 0 {
 				separator = "\n\n"
@@ -472,14 +508,10 @@ func (h *Host) FetchFailedCheckLogs(ctx context.Context, pr *scm.PR, _ string, _
 
 func (h *Host) actionsRunJobFromTarget(raw string) (int, int, bool) {
 	target, err := url.Parse(raw)
-	if err != nil || target.User != nil || target.ForceQuery || target.RawQuery != "" || target.Fragment != "" || target.RawPath != "" {
+	if err != nil || target.Scheme != "" || target.Host != "" || target.User != nil || target.ForceQuery || target.RawQuery != "" || target.Fragment != "" || target.RawPath != "" {
 		return 0, 0, false
 	}
-	base, err := url.Parse(h.baseURL)
-	if err != nil || !strings.EqualFold(target.Scheme, base.Scheme) || !strings.EqualFold(target.Host, base.Host) {
-		return 0, 0, false
-	}
-	prefix := strings.TrimRight(base.Path, "/") + "/" + h.repository + "/actions/runs/"
+	prefix := "/" + h.repository + "/actions/runs/"
 	if !strings.HasPrefix(target.Path, prefix) {
 		return 0, 0, false
 	}
@@ -487,32 +519,42 @@ func (h *Host) actionsRunJobFromTarget(raw string) (int, int, bool) {
 	if len(parts) != 3 || parts[1] != "jobs" {
 		return 0, 0, false
 	}
-	runID, err := strconv.Atoi(parts[0])
-	if err != nil || runID <= 0 || parts[0] != strconv.Itoa(runID) {
+	runNumber, err := strconv.Atoi(parts[0])
+	if err != nil || runNumber <= 0 || parts[0] != strconv.Itoa(runNumber) {
 		return 0, 0, false
 	}
 	jobIndex, err := strconv.Atoi(parts[2])
 	if err != nil || jobIndex < 0 || parts[2] != strconv.Itoa(jobIndex) {
 		return 0, 0, false
 	}
-	canonical := h.baseURL + "/" + h.repository + "/actions/runs/" + strconv.Itoa(runID) + "/jobs/" + strconv.Itoa(jobIndex)
+	canonical := prefix + strconv.Itoa(runNumber) + "/jobs/" + strconv.Itoa(jobIndex)
 	if raw != canonical {
 		return 0, 0, false
 	}
-	return runID, jobIndex, true
+	return runNumber, jobIndex, true
 }
 
-func (h *Host) validateRunView(response runViewResponse, expectedRunID int, expectedHead string) error {
-	if response.Run.ID != expectedRunID {
-		return fmt.Errorf("forgejo-axi run view returned run %d, expected %d", response.Run.ID, expectedRunID)
+func (h *Host) validateRunIdentity(run actionRun, expectedRunID, expectedRunNumber int, expectedHead string) error {
+	if run.ID <= 0 || run.ID != expectedRunID {
+		return fmt.Errorf("forgejo-axi returned run %d, expected %d", run.ID, expectedRunID)
 	}
-	if err := h.validateExpectedHead(response.Run.HeadSHA, expectedHead); err != nil {
+	if run.RunNumber != expectedRunNumber {
+		return fmt.Errorf("forgejo-axi returned run %d with number %d, expected %d", run.ID, run.RunNumber, expectedRunNumber)
+	}
+	if err := h.validateExpectedHead(run.HeadSHA, expectedHead); err != nil {
 		return err
 	}
 	wantURL := h.baseURL + "/" + h.repository + "/actions/runs/" + strconv.Itoa(expectedRunID)
 	wantAPIURL := h.baseURL + "/api/v1/repos/" + h.repository + "/actions/runs/" + strconv.Itoa(expectedRunID)
-	if response.Run.URL != wantURL || response.Run.APIURL != wantAPIURL {
-		return fmt.Errorf("forgejo-axi run view identity mismatch: got %q and %q", response.Run.URL, response.Run.APIURL)
+	if run.URL != wantURL || run.APIURL != wantAPIURL {
+		return fmt.Errorf("forgejo-axi run identity mismatch: got %q and %q", run.URL, run.APIURL)
+	}
+	return nil
+}
+
+func (h *Host) validateRunView(response runViewResponse, expectedRunID, expectedRunNumber int, expectedHead string) error {
+	if err := h.validateRunIdentity(response.Run, expectedRunID, expectedRunNumber, expectedHead); err != nil {
+		return err
 	}
 	if len(response.Next) != 0 {
 		return fmt.Errorf("forgejo-axi run view did not provide requested failed logs: %s", strings.Join(response.Next, "; "))
@@ -943,11 +985,19 @@ type runViewResponse struct {
 	Next []string    `json:"next"`
 }
 
+type runListResponse struct {
+	Runs     []actionRun `json:"runs"`
+	PageInfo struct {
+		Complete bool `json:"complete"`
+	} `json:"page_info"`
+}
+
 type actionRun struct {
-	ID      int    `json:"id"`
-	URL     string `json:"url"`
-	APIURL  string `json:"api_url"`
-	HeadSHA string `json:"head_sha"`
+	ID        int    `json:"id"`
+	URL       string `json:"url"`
+	APIURL    string `json:"api_url"`
+	HeadSHA   string `json:"head_sha"`
+	RunNumber int    `json:"run_number"`
 }
 
 type actionJob struct {
@@ -998,7 +1048,10 @@ func ResolveRemote(remote, configuredBase, resolvedSSHHost string) (string, stri
 		}
 		if remoteScheme == "http" || remoteScheme == "https" {
 			remoteURL, parseErr := url.Parse(strings.TrimSpace(remote))
-			if parseErr != nil || !strings.EqualFold(remoteURL.Host, baseURL.Host) {
+			if parseErr == nil {
+				_, remoteURL, parseErr = normalizeBaseURL((&url.URL{Scheme: remoteURL.Scheme, Host: remoteURL.Host}).String())
+			}
+			if parseErr != nil || remoteURL.Host != baseURL.Host {
 				return "", "", fmt.Errorf("remote host %q does not match configured Forgejo host %q", remoteHost, baseURL.Host)
 			}
 		} else {
@@ -1037,17 +1090,36 @@ func ResolveRemote(remote, configuredBase, resolvedSSHHost string) (string, stri
 	remoteURL.Fragment = ""
 	remoteURL.Path = "/" + strings.Join(parts[:len(parts)-2], "/")
 	remoteURL.RawPath = ""
-	base := strings.TrimRight(remoteURL.String(), "/")
+	base, _, err := normalizeBaseURL(remoteURL.String())
+	if err != nil {
+		return "", "", err
+	}
 	return base, repo, nil
 }
 
 func normalizeBaseURL(raw string) (string, *url.URL, error) {
 	parsed, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+	if err != nil {
+		return "", nil, fmt.Errorf("invalid Forgejo base URL %q", raw)
+	}
+	parsed.Scheme = strings.ToLower(parsed.Scheme)
+	hostname := strings.ToLower(parsed.Hostname())
+	if (parsed.Scheme != "http" && parsed.Scheme != "https") || hostname == "" {
 		return "", nil, fmt.Errorf("invalid Forgejo base URL %q", raw)
 	}
 	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return "", nil, errors.New("Forgejo base URL must not contain credentials, a query, or a fragment")
+	}
+	port := parsed.Port()
+	if (parsed.Scheme == "http" && port == "80") || (parsed.Scheme == "https" && port == "443") {
+		port = ""
+	}
+	if port != "" {
+		parsed.Host = net.JoinHostPort(hostname, port)
+	} else if strings.Contains(hostname, ":") {
+		parsed.Host = "[" + hostname + "]"
+	} else {
+		parsed.Host = hostname
 	}
 	parsed.Path = strings.TrimRight(path.Clean("/"+strings.Trim(parsed.Path, "/")), "/")
 	if parsed.Path == "." || parsed.Path == "/" {
