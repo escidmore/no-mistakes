@@ -383,16 +383,20 @@ func (h *Host) FetchFailedCheckLogs(ctx context.Context, pr *scm.PR, _ string, _
 	if err != nil {
 		return "", err
 	}
+	checks, err := h.normalizeChecks(result)
+	if err != nil {
+		return "", err
+	}
 
 	runSet := make(map[int]struct{})
-	for _, status := range result.Statuses {
-		if status.State != "failure" {
+	for _, check := range checks {
+		if check.State != "failure" {
 			continue
 		}
-		if _, ok := targets[status.Context]; !ok {
+		if _, ok := targets[check.Name]; !ok {
 			continue
 		}
-		runID, ok := h.actionsRunFromTarget(stringValue(status.TargetURL))
+		runID, ok := h.actionsRunFromTarget(check.Link)
 		if ok {
 			runSet[runID] = struct{}{}
 		}

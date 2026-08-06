@@ -131,12 +131,12 @@ func TestDetectProvider_ConfiguredForgejoBaseResolvesSSHHostAlias(t *testing.T) 
 	got := detectProviderWithForgejoBaseURL(
 		context.Background(),
 		"git@github.com-work:scm/octo/widgets.git",
-		"https://code.example:3443/scm",
+		"https://forgejo.gitlab.example:3443/scm",
 		func(_ context.Context, alias string) (string, error) {
 			if alias != "github.com-work" {
 				t.Fatalf("alias = %q, want github.com-work", alias)
 			}
-			return "code.example", nil
+			return "forgejo.gitlab.example", nil
 		},
 	)
 	if got != ProviderForgejo {
