@@ -59,20 +59,31 @@ func detectProvider(ctx context.Context, remoteURL string, lookup sshHostnameLoo
 }
 
 func detectProviderWithForgejoBaseURL(ctx context.Context, remoteURL, forgejoBaseURL string, lookup sshHostnameLookup) Provider {
+	originalHost := ExtractHost(remoteURL)
 	host := resolveHost(ctx, remoteURL, lookup)
-	resolved := host != "" && !strings.EqualFold(host, ExtractHost(remoteURL))
-	if resolved {
-		if provider := detectHostedProvider(host); provider != ProviderUnknown {
-			return provider
-		}
-		if forgejoBaseMatchesResolvedRemote(forgejoBaseURL, remoteURL, host) {
+	if host == "" {
+		return ProviderUnknown
+	}
+	if provider := detectHostedProvider(host); provider != ProviderUnknown {
+		return provider
+	}
+	if glabKnowsHost(host) {
+		return ProviderGitLab
+	}
+	if ghKnowsHost(host) {
+		return ProviderGitHub
+	}
+	if strings.EqualFold(host, originalHost) {
+		if forgejoBaseMatchesRemote(forgejoBaseURL, remoteURL) {
 			return ProviderForgejo
 		}
-		if provider := detectProviderWithoutSSH(host, ""); provider != ProviderUnknown {
-			return provider
-		}
+	} else if forgejoBaseMatchesResolvedRemote(forgejoBaseURL, remoteURL, host) {
+		return ProviderForgejo
 	}
-	return detectProviderWithoutSSH(remoteURL, forgejoBaseURL)
+	if host == "codeberg.org" || strings.Contains(host, "forgejo") {
+		return ProviderForgejo
+	}
+	return detectLegacyProviderHost(host)
 }
 
 func detectHostedProvider(host string) Provider {
@@ -90,52 +101,19 @@ func detectHostedProvider(host string) Provider {
 	}
 }
 
-func detectProviderWithoutSSH(remoteURL, forgejoBaseURL string) Provider {
-	host := ExtractHost(remoteURL)
-	if provider := detectHostedProvider(host); provider != ProviderUnknown {
-		return provider
-	}
-	if forgejoBaseMatchesRemote(forgejoBaseURL, remoteURL) {
-		return ProviderForgejo
-	}
-
-	lower := strings.ToLower(remoteURL)
+func detectLegacyProviderHost(host string) Provider {
 	switch {
-	case strings.Contains(lower, "github.com"):
+	case strings.Contains(host, "github.com"):
 		return ProviderGitHub
-	case strings.Contains(lower, "gitlab.com") || strings.Contains(lower, "gitlab."):
+	case strings.Contains(host, "gitlab.com") || strings.Contains(host, "gitlab."):
 		return ProviderGitLab
-	case strings.Contains(lower, "bitbucket.org"):
+	case strings.Contains(host, "bitbucket.org"):
 		return ProviderBitbucket
-	case strings.Contains(lower, "dev.azure.com") || strings.Contains(lower, "visualstudio.com"):
-		// Covers dev.azure.com, ssh.dev.azure.com, {org}.visualstudio.com, and
-		// the legacy vs-ssh.visualstudio.com SSH host.
+	case strings.Contains(host, "dev.azure.com") || strings.Contains(host, "visualstudio.com"):
 		return ProviderAzureDevOps
+	default:
+		return ProviderUnknown
 	}
-
-	if host == "codeberg.org" || strings.Contains(host, "forgejo") {
-		return ProviderForgejo
-	}
-
-	// Fallback for self-hosted GitLab instances whose hostname carries no
-	// "gitlab" marker: consult the glab CLI's configured hosts. If the remote's
-	// host (or a host's api_host) is one glab is configured to talk to, treat it
-	// as GitLab. This reads whatever the user configured at runtime; no host is
-	// hardcoded.
-	//
-	// Fallback for GitHub Enterprise Server instances: consult the gh CLI's
-	// configured hosts (hosts.yml). If the remote's host is one gh is
-	// authenticated with, treat it as GitHub.
-	if host != "" {
-		if glabKnowsHost(host) {
-			return ProviderGitLab
-		}
-		if ghKnowsHost(host) {
-			return ProviderGitHub
-		}
-	}
-
-	return ProviderUnknown
 }
 
 // ResolveHost returns the canonical host for a remote. For SSH remotes it

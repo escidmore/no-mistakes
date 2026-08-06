@@ -27,7 +27,10 @@ func TestDetectProvider(t *testing.T) {
 		{"git@ssh.dev.azure.com:v3/org/project/repo", ProviderAzureDevOps},
 		{"https://org.visualstudio.com/project/_git/repo", ProviderAzureDevOps},
 		{"https://codeberg.org/user/repo.git", ProviderForgejo},
+		{"https://codeberg.org/user/github.com.git", ProviderForgejo},
 		{"https://forgejo.example/user/repo.git", ProviderForgejo},
+		{"https://forgejo.gitlab.example/user/repo.git", ProviderForgejo},
+		{"https://forgejo.github.com.example/user/repo.git", ProviderForgejo},
 		{"https://example.com/user/repo.git", ProviderUnknown},
 	}
 
@@ -208,6 +211,7 @@ func writeGlabConfig(t *testing.T, body string) {
 
 func TestDetectProvider_SelfHostedGitLabViaGlabConfig(t *testing.T) {
 	t.Setenv("GH_CONFIG_DIR", t.TempDir())
+	t.Setenv("FORGEJO_BASE_URL", "https://gitlab.example.com")
 	writeGlabConfig(t, `hosts:
     gitlab.example.com:
         token: xxx
@@ -279,6 +283,7 @@ func writeGhConfig(t *testing.T, body string) {
 
 func TestDetectProvider_GHEViaGhConfig(t *testing.T) {
 	t.Setenv("GLAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("FORGEJO_BASE_URL", "https://bbgithub.dev.bloomberg.com")
 	writeGhConfig(t, `bbgithub.dev.bloomberg.com:
     user: someuser
     oauth_token: xxx
