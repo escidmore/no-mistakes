@@ -52,7 +52,7 @@ func TestFetchFailedCheckLogsUsesCanonicalTargetAndExactIdentities(t *testing.T)
 	}
 }
 
-func TestFetchFailedCheckLogsDeduplicatesAndSortsRunIDs(t *testing.T) {
+func TestFetchFailedCheckLogsDeduplicatesAndSortsRunAndJobIDs(t *testing.T) {
 	target := func(runID, job int) string {
 		return fmt.Sprintf("%s/%s/actions/runs/%d/jobs/%d", testBaseURL, testRepo, runID, job)
 	}
@@ -65,7 +65,10 @@ func TestFetchFailedCheckLogsDeduplicatesAndSortsRunIDs(t *testing.T) {
 		{stdout: fixture(t, "status-forgejo-16.json")},
 		{stdout: checksJSON("failure", "not_required", false, statuses, `[]`)},
 		{stdout: failedLogRunViewJSON(10, testHeadSHA, []string{`{"id":100,"run_id":10,"name":"lint","status":"failure","log":"lint failed"}`})},
-		{stdout: failedLogRunViewJSON(20, testHeadSHA, []string{`{"id":200,"run_id":20,"name":"test","status":"failure","log":"test failed"}`})},
+		{stdout: failedLogRunViewJSON(20, testHeadSHA, []string{
+			`{"id":201,"run_id":20,"name":"test-second","status":"failure","log":"second failed"}`,
+			`{"id":200,"run_id":20,"name":"test-first","status":"failure","log":"first failed"}`,
+		})},
 	}}
 	host := newTestHost(recorder)
 	if err := host.Available(context.Background()); err != nil {
@@ -78,8 +81,10 @@ func TestFetchFailedCheckLogsDeduplicatesAndSortsRunIDs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FetchFailedCheckLogs() error = %v", err)
 	}
-	if strings.Count(logs, "Forgejo Actions run 20") != 1 || strings.Index(logs, "run 10") > strings.Index(logs, "run 20") {
-		t.Fatalf("FetchFailedCheckLogs() = %q, want deduplicated numeric run order", logs)
+	run10, run20 := strings.Index(logs, "run 10"), strings.Index(logs, "run 20")
+	firstJob, secondJob := strings.Index(logs, "job test-first:"), strings.Index(logs, "job test-second:")
+	if run10 < 0 || run20 < 0 || run10 > run20 || firstJob < 0 || secondJob < 0 || firstJob > secondJob {
+		t.Fatalf("FetchFailedCheckLogs() = %q, want numeric run and job order", logs)
 	}
 	if len(recorder.calls) != 4 || recorder.calls[2].args[4] != "10" || recorder.calls[3].args[4] != "20" {
 		t.Fatalf("run view calls = %#v, want one call each in 10,20 order", recorder.calls)
@@ -96,6 +101,11 @@ func TestFetchFailedCheckLogsRejectsRunHeadAndJobMismatches(t *testing.T) {
 		{name: "wrong run", view: failedLogRunViewJSON(92, testHeadSHA, []string{`{"id":501,"run_id":92,"name":"test","status":"failure","log":"failed"}`}), want: "run 92, expected 91"},
 		{name: "wrong head", view: failedLogRunViewJSON(91, strings.Repeat("b", 40), []string{`{"id":501,"run_id":91,"name":"test","status":"failure","log":"failed"}`}), want: "pull request head changed"},
 		{name: "wrong job run", view: strings.Replace(canonical, `"run_id":91`, `"run_id":92`, 1), want: "job 501 for run 92"},
+		{name: "empty job name", view: strings.Replace(canonical, `"name":"test"`, `"name":" "`, 1), want: "job 501 without a name"},
+		{name: "duplicate job ID", view: failedLogRunViewJSON(91, testHeadSHA, []string{
+			`{"id":501,"run_id":91,"name":"first","status":"failure","log":"failed"}`,
+			`{"id":501,"run_id":91,"name":"second","status":"failure","log":"failed"}`,
+		}), want: "duplicate job 501"},
 		{name: "failed job omitted log", view: failedLogRunViewJSON(91, testHeadSHA, []string{`{"id":501,"run_id":91,"name":"test","status":"failure"}`}), want: "without a log"},
 		{name: "unsupported next", view: strings.TrimSuffix(canonical, "}") + `,"next":["Job logs are unsupported"]}`, want: "did not provide requested failed logs"},
 	}
@@ -155,6 +165,30 @@ func TestFetchFailedCheckLogsBoundsOutputAndHonorsCancellation(t *testing.T) {
 		logs, err := host.FetchFailedCheckLogs(context.Background(), testPR(), "feature/forgejo", testHeadSHA, []string{"CI / test (pull_request)"})
 		if logs != "" || err == nil || !strings.Contains(err.Error(), "exceeded 1048576 bytes") {
 			t.Fatalf("FetchFailedCheckLogs() = (%q, %v), want bounded-output error", logs, err)
+		}
+	})
+
+	t.Run("aggregate log limit", func(t *testing.T) {
+		largeLog := strings.Repeat("x", maxForgejoLogOutputBytes/2)
+		statuses := fmt.Sprintf(`[
+			{"context":"CI / first (pull_request)","state":"failure","target_url":%q},
+			{"context":"CI / second (pull_request)","state":"failure","target_url":%q}
+		]`, testBaseURL+"/"+testRepo+"/actions/runs/91/jobs/0", testBaseURL+"/"+testRepo+"/actions/runs/92/jobs/0")
+		recorder := &fakeRecorder{responses: []fakeResponse{
+			{stdout: fixture(t, "status-forgejo-16.json")},
+			{stdout: checksJSON("failure", "not_required", false, statuses, `[]`)},
+			{stdout: failedLogRunViewJSON(91, testHeadSHA, []string{fmt.Sprintf(`{"id":501,"run_id":91,"name":"first","status":"failure","log":%q}`, largeLog)})},
+			{stdout: failedLogRunViewJSON(92, testHeadSHA, []string{fmt.Sprintf(`{"id":502,"run_id":92,"name":"second","status":"failure","log":%q}`, largeLog)})},
+		}}
+		host := newTestHost(recorder)
+		if err := host.Available(context.Background()); err != nil {
+			t.Fatalf("Available() error = %v", err)
+		}
+		logs, err := host.FetchFailedCheckLogs(context.Background(), testPR(), "feature/forgejo", testHeadSHA, []string{
+			"CI / first (pull_request)", "CI / second (pull_request)",
+		})
+		if logs != "" || err == nil || !strings.Contains(err.Error(), "failed check logs exceeded 1048576 bytes") {
+			t.Fatalf("FetchFailedCheckLogs() = (%d bytes, %v), want aggregate-limit error", len(logs), err)
 		}
 	})
 
