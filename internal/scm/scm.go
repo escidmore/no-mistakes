@@ -62,14 +62,32 @@ func detectProviderWithForgejoBaseURL(ctx context.Context, remoteURL, forgejoBas
 	host := resolveHost(ctx, remoteURL, lookup)
 	resolved := host != "" && !strings.EqualFold(host, ExtractHost(remoteURL))
 	if resolved {
-		if provider := detectProviderWithoutSSH(host, ""); provider != ProviderUnknown {
+		if provider := detectHostedProvider(host); provider != ProviderUnknown {
 			return provider
 		}
 		if forgejoBaseMatchesResolvedRemote(forgejoBaseURL, remoteURL, host) {
 			return ProviderForgejo
 		}
+		if provider := detectProviderWithoutSSH(host, ""); provider != ProviderUnknown {
+			return provider
+		}
 	}
 	return detectProviderWithoutSSH(remoteURL, forgejoBaseURL)
+}
+
+func detectHostedProvider(host string) Provider {
+	switch {
+	case host == "github.com" || strings.HasSuffix(host, ".github.com"):
+		return ProviderGitHub
+	case host == "gitlab.com" || strings.HasSuffix(host, ".gitlab.com"):
+		return ProviderGitLab
+	case host == "bitbucket.org" || strings.HasSuffix(host, ".bitbucket.org"):
+		return ProviderBitbucket
+	case host == "dev.azure.com" || strings.HasSuffix(host, ".dev.azure.com") || strings.HasSuffix(host, ".visualstudio.com"):
+		return ProviderAzureDevOps
+	default:
+		return ProviderUnknown
+	}
 }
 
 func detectProviderWithoutSSH(remoteURL, forgejoBaseURL string) Provider {
