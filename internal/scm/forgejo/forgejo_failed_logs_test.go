@@ -27,12 +27,15 @@ func TestChecksPreserveProviderStateAndTargetLink(t *testing.T) {
 }
 
 func TestFetchFailedCheckLogsUsesCanonicalTargetAndExactIdentities(t *testing.T) {
-	target := testBaseURL + "/" + testRepo + "/actions/runs/91/jobs/0"
+	target := testBaseURL + "/" + testRepo + "/actions/runs/91/jobs/1"
 	statuses := fmt.Sprintf(`[{"context":"CI / test (pull_request)","state":"failure","target_url":%q}]`, target)
 	recorder := &fakeRecorder{responses: []fakeResponse{
 		{stdout: fixture(t, "status-forgejo-16.json")},
 		{stdout: checksJSON("failure", "not_required", false, statuses, `[]`)},
-		{stdout: failedLogRunViewJSON(91, testHeadSHA, []string{`{"id":501,"run_id":91,"name":"test","status":"failure","log":"assertion failed"}`})},
+		{stdout: failedLogRunViewJSON(91, testHeadSHA, []string{
+			`{"id":900,"run_id":91,"name":"unrelated","status":"failure","log":"unrelated failed"}`,
+			`{"id":501,"run_id":91,"name":"test","status":"failure","log":"assertion failed"}`,
+		})},
 	}}
 	host := newTestHost(recorder)
 	if err := host.Available(context.Background()); err != nil {
@@ -43,8 +46,8 @@ func TestFetchFailedCheckLogsUsesCanonicalTargetAndExactIdentities(t *testing.T)
 	if err != nil {
 		t.Fatalf("FetchFailedCheckLogs() error = %v", err)
 	}
-	if !strings.Contains(logs, "Forgejo Actions run 91, job test:") || !strings.Contains(logs, "assertion failed") {
-		t.Fatalf("FetchFailedCheckLogs() = %q, want identified failed-job log", logs)
+	if !strings.Contains(logs, "Forgejo Actions run 91, job test:") || !strings.Contains(logs, "assertion failed") || strings.Contains(logs, "unrelated") {
+		t.Fatalf("FetchFailedCheckLogs() = %q, want only the targeted failed-job log", logs)
 	}
 	want := []string{"run", "view", "--repo", testRepo, "91", "--log-failed", "--base-url", testBaseURL, "--token-env", "FORGEJO_TEST_TOKEN", "--json"}
 	if got := recorder.calls[2].args; !reflect.DeepEqual(got, want) {
@@ -94,9 +97,10 @@ func TestFetchFailedCheckLogsDeduplicatesAndSortsRunAndJobIDs(t *testing.T) {
 func TestFetchFailedCheckLogsRejectsRunHeadAndJobMismatches(t *testing.T) {
 	canonical := failedLogRunViewJSON(91, testHeadSHA, []string{`{"id":501,"run_id":91,"name":"test","status":"failure","log":"failed"}`})
 	tests := []struct {
-		name string
-		view string
-		want string
+		name     string
+		jobIndex int
+		view     string
+		want     string
 	}{
 		{name: "wrong run", view: failedLogRunViewJSON(92, testHeadSHA, []string{`{"id":501,"run_id":92,"name":"test","status":"failure","log":"failed"}`}), want: "run 92, expected 91"},
 		{name: "wrong head", view: failedLogRunViewJSON(91, strings.Repeat("b", 40), []string{`{"id":501,"run_id":91,"name":"test","status":"failure","log":"failed"}`}), want: "pull request head changed"},
@@ -106,12 +110,14 @@ func TestFetchFailedCheckLogsRejectsRunHeadAndJobMismatches(t *testing.T) {
 			`{"id":501,"run_id":91,"name":"first","status":"failure","log":"failed"}`,
 			`{"id":501,"run_id":91,"name":"second","status":"failure","log":"failed"}`,
 		}), want: "duplicate job 501"},
+		{name: "missing target job", jobIndex: 999, view: canonical, want: "target job index 999 is absent"},
+		{name: "target job did not fail", view: failedLogRunViewJSON(91, testHeadSHA, []string{`{"id":501,"run_id":91,"name":"test","status":"success"}`}), want: `status "success", expected failure`},
 		{name: "failed job omitted log", view: failedLogRunViewJSON(91, testHeadSHA, []string{`{"id":501,"run_id":91,"name":"test","status":"failure"}`}), want: "without a log"},
 		{name: "unsupported next", view: strings.TrimSuffix(canonical, "}") + `,"next":["Job logs are unsupported"]}`, want: "did not provide requested failed logs"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			target := testBaseURL + "/" + testRepo + "/actions/runs/91/jobs/0"
+			target := fmt.Sprintf("%s/%s/actions/runs/91/jobs/%d", testBaseURL, testRepo, tt.jobIndex)
 			statuses := fmt.Sprintf(`[{"context":"CI / test (pull_request)","state":"failure","target_url":%q}]`, target)
 			recorder := &fakeRecorder{responses: []fakeResponse{
 				{stdout: fixture(t, "status-forgejo-16.json")},
