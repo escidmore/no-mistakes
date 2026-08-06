@@ -406,7 +406,8 @@ func (h *Host) FetchFailedCheckLogs(ctx context.Context, pr *scm.PR, _ string, _
 	}
 	sort.Ints(runIDs)
 
-	var blocks []string
+	var logs strings.Builder
+	remaining := maxForgejoLogOutputBytes
 	for _, runID := range runIDs {
 		var response runViewResponse
 		args := []string{"--repo", h.repository, strconv.Itoa(runID), "--log-failed"}
@@ -416,6 +417,9 @@ func (h *Host) FetchFailedCheckLogs(ctx context.Context, pr *scm.PR, _ string, _
 		if err := h.validateRunView(response, runID, result.SHA); err != nil {
 			return "", err
 		}
+		sort.Slice(response.Jobs, func(i, j int) bool {
+			return response.Jobs[i].ID < response.Jobs[j].ID
+		})
 		for _, job := range response.Jobs {
 			if job.Status != "failure" {
 				continue
@@ -427,10 +431,20 @@ func (h *Host) FetchFailedCheckLogs(ctx context.Context, pr *scm.PR, _ string, _
 			if logText == "" {
 				continue
 			}
-			blocks = append(blocks, fmt.Sprintf("Forgejo Actions run %d, job %s:\n%s", runID, job.Name, logText))
+			block := fmt.Sprintf("Forgejo Actions run %d, job %s:\n%s", runID, job.Name, logText)
+			separator := ""
+			if logs.Len() > 0 {
+				separator = "\n\n"
+			}
+			if len(separator)+len(block) > remaining {
+				return "", fmt.Errorf("Forgejo failed check logs exceeded %d bytes: %w", maxForgejoLogOutputBytes, errForgejoOutputLimit)
+			}
+			logs.WriteString(separator)
+			logs.WriteString(block)
+			remaining -= len(separator) + len(block)
 		}
 	}
-	return strings.Join(blocks, "\n\n"), nil
+	return logs.String(), nil
 }
 
 func (h *Host) actionsRunFromTarget(raw string) (int, bool) {
@@ -476,10 +490,18 @@ func (h *Host) validateRunView(response runViewResponse, expectedRunID int, expe
 	if len(response.Next) != 0 {
 		return fmt.Errorf("forgejo-axi run view did not provide requested failed logs: %s", strings.Join(response.Next, "; "))
 	}
+	jobIDs := make(map[int]struct{}, len(response.Jobs))
 	for _, job := range response.Jobs {
 		if job.ID <= 0 || job.RunID != expectedRunID {
 			return fmt.Errorf("forgejo-axi run view returned job %d for run %d, expected run %d", job.ID, job.RunID, expectedRunID)
 		}
+		if strings.TrimSpace(job.Name) == "" {
+			return fmt.Errorf("forgejo-axi run view returned job %d without a name", job.ID)
+		}
+		if _, duplicate := jobIDs[job.ID]; duplicate {
+			return fmt.Errorf("forgejo-axi run view returned duplicate job %d", job.ID)
+		}
+		jobIDs[job.ID] = struct{}{}
 	}
 	return nil
 }
