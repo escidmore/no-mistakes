@@ -452,7 +452,7 @@ func (h *Host) FetchFailedCheckLogs(ctx context.Context, pr *scm.PR, _ string, _
 }
 
 func (h *Host) actionsRunFromTarget(raw string) (int, bool) {
-	target, err := url.Parse(strings.TrimSpace(raw))
+	target, err := url.Parse(raw)
 	if err != nil || target.User != nil || target.ForceQuery || target.RawQuery != "" || target.Fragment != "" || target.RawPath != "" {
 		return 0, false
 	}
@@ -474,6 +474,10 @@ func (h *Host) actionsRunFromTarget(raw string) (int, bool) {
 	}
 	jobIndex, err := strconv.Atoi(parts[2])
 	if err != nil || jobIndex < 0 || parts[2] != strconv.Itoa(jobIndex) {
+		return 0, false
+	}
+	canonical := h.baseURL + "/" + h.repository + "/actions/runs/" + strconv.Itoa(runID) + "/jobs/" + strconv.Itoa(jobIndex)
+	if raw != canonical {
 		return 0, false
 	}
 	return runID, true
