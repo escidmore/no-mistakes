@@ -449,7 +449,7 @@ func (h *Host) FetchFailedCheckLogs(ctx context.Context, pr *scm.PR, _ string, _
 
 func (h *Host) actionsRunFromTarget(raw string) (int, bool) {
 	target, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil || target.User != nil || target.RawQuery != "" || target.Fragment != "" || target.RawPath != "" {
+	if err != nil || target.User != nil || target.ForceQuery || target.RawQuery != "" || target.Fragment != "" || target.RawPath != "" {
 		return 0, false
 	}
 	base, err := url.Parse(h.baseURL)
