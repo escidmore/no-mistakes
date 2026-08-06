@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os/exec"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -20,7 +21,12 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/shellenv"
 )
 
-const defaultExecutable = "forgejo-axi"
+const (
+	defaultExecutable        = "forgejo-axi"
+	maxForgejoLogOutputBytes = 1 << 20
+)
+
+var errForgejoOutputLimit = errors.New("forgejo-axi output exceeded limit")
 
 // CmdFactory creates one non-shell forgejo-axi invocation.
 type CmdFactory func(ctx context.Context, name string, args ...string) *exec.Cmd
@@ -122,9 +128,14 @@ func (h *Host) Available(ctx context.Context) error {
 		BranchProtection:  response.Capabilities.BranchProtection,
 		ExpectedHeadMerge: response.Capabilities.ExpectedHeadMerge,
 		ActionsJobLogs:    response.Capabilities.ActionsJobLogs,
-		// forgejo-axi intentionally has no stable high-level log command yet.
-		// Keep this independent from the server's Actions route capability.
-		FailedCheckLogs: false,
+		ActionsRuns:       response.Capabilities.Runs,
+		ActionsRunJobs:    response.Capabilities.RunJobs,
+		// Check gating depends only on commit statuses. Failed logs are optional
+		// and require every released run-view route independently.
+		FailedCheckLogs: response.Capabilities.CommitStatuses &&
+			response.Capabilities.Runs &&
+			response.Capabilities.RunJobs &&
+			response.Capabilities.ActionsJobLogs,
 	}
 	return nil
 }
@@ -242,20 +253,28 @@ func (h *Host) GetPRState(ctx context.Context, pr *scm.PR) (scm.PRState, error) 
 }
 
 func (h *Host) GetChecks(ctx context.Context, pr *scm.PR) ([]scm.Check, error) {
-	number, err := h.validateInputPR(pr)
+	result, err := h.readChecks(ctx, pr)
 	if err != nil {
 		return nil, err
 	}
+	return h.normalizeChecks(result)
+}
+
+func (h *Host) readChecks(ctx context.Context, pr *scm.PR) (checksResult, error) {
+	number, err := h.validateInputPR(pr)
+	if err != nil {
+		return checksResult{}, err
+	}
 	if h.capabilities.PullRequests && !h.capabilities.CommitStatuses {
-		return nil, fmt.Errorf("Forgejo commit-status capability unavailable: %w", scm.ErrUnsupported)
+		return checksResult{}, fmt.Errorf("Forgejo commit-status capability unavailable: %w", scm.ErrUnsupported)
 	}
 	var response struct {
 		Checks checksResult `json:"checks"`
 	}
 	if err := h.runJSON(ctx, "pr checks", []string{"--repo", h.repository, number}, &response); err != nil {
-		return nil, err
+		return checksResult{}, err
 	}
-	return h.normalizeChecks(response.Checks)
+	return response.Checks, nil
 }
 
 func (h *Host) GetMergeableState(ctx context.Context, pr *scm.PR) (scm.MergeableState, error) {
@@ -343,8 +362,130 @@ func (h *Host) GetMergedProof(ctx context.Context, pr *scm.PR, expectedHead stri
 	return result, nil
 }
 
-func (h *Host) FetchFailedCheckLogs(context.Context, *scm.PR, string, string, []string) (string, error) {
-	return "", scm.ErrUnsupported
+func (h *Host) FetchFailedCheckLogs(ctx context.Context, pr *scm.PR, _ string, headSHA string, failingNames []string) (string, error) {
+	if !h.capabilities.FailedCheckLogs {
+		return "", scm.ErrUnsupported
+	}
+	if len(failingNames) == 0 {
+		return "", nil
+	}
+	targets := make(map[string]struct{}, len(failingNames))
+	for _, name := range failingNames {
+		if name = strings.TrimSpace(name); name != "" {
+			targets[name] = struct{}{}
+		}
+	}
+	if len(targets) == 0 {
+		return "", nil
+	}
+
+	result, err := h.readChecks(ctx, pr)
+	if err != nil {
+		return "", err
+	}
+	headSHA = strings.TrimSpace(headSHA)
+	if err := h.validateExpectedHead(result.SHA, headSHA); err != nil {
+		return "", err
+	}
+
+	runSet := make(map[int]struct{})
+	for _, status := range result.Statuses {
+		if status.State != "failure" {
+			continue
+		}
+		if _, ok := targets[status.Context]; !ok {
+			continue
+		}
+		runID, ok := h.actionsRunFromTarget(stringValue(status.TargetURL))
+		if ok {
+			runSet[runID] = struct{}{}
+		}
+	}
+	if len(runSet) == 0 {
+		return "", nil
+	}
+	runIDs := make([]int, 0, len(runSet))
+	for runID := range runSet {
+		runIDs = append(runIDs, runID)
+	}
+	sort.Ints(runIDs)
+
+	var blocks []string
+	for _, runID := range runIDs {
+		var response runViewResponse
+		args := []string{"--repo", h.repository, strconv.Itoa(runID), "--log-failed"}
+		if err := h.runJSONWithLimit(ctx, "run view", args, &response, maxForgejoLogOutputBytes); err != nil {
+			return "", err
+		}
+		if err := h.validateRunView(response, runID, headSHA); err != nil {
+			return "", err
+		}
+		for _, job := range response.Jobs {
+			if job.Status != "failure" {
+				continue
+			}
+			if job.Log == nil {
+				return "", fmt.Errorf("forgejo-axi run view returned failed job %d without a log", job.ID)
+			}
+			logText := strings.TrimSpace(*job.Log)
+			if logText == "" {
+				continue
+			}
+			blocks = append(blocks, fmt.Sprintf("Forgejo Actions run %d, job %s:\n%s", runID, job.Name, logText))
+		}
+	}
+	return strings.Join(blocks, "\n\n"), nil
+}
+
+func (h *Host) actionsRunFromTarget(raw string) (int, bool) {
+	target, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || target.User != nil || target.RawQuery != "" || target.Fragment != "" || target.RawPath != "" {
+		return 0, false
+	}
+	base, err := url.Parse(h.baseURL)
+	if err != nil || !strings.EqualFold(target.Scheme, base.Scheme) || !strings.EqualFold(target.Host, base.Host) {
+		return 0, false
+	}
+	prefix := strings.TrimRight(base.Path, "/") + "/" + h.repository + "/actions/runs/"
+	if !strings.HasPrefix(target.Path, prefix) {
+		return 0, false
+	}
+	parts := strings.Split(strings.TrimPrefix(target.Path, prefix), "/")
+	if len(parts) != 3 || parts[1] != "jobs" {
+		return 0, false
+	}
+	runID, err := strconv.Atoi(parts[0])
+	if err != nil || runID <= 0 {
+		return 0, false
+	}
+	jobIndex, err := strconv.Atoi(parts[2])
+	if err != nil || jobIndex < 0 {
+		return 0, false
+	}
+	return runID, true
+}
+
+func (h *Host) validateRunView(response runViewResponse, expectedRunID int, expectedHead string) error {
+	if response.Run.ID != expectedRunID {
+		return fmt.Errorf("forgejo-axi run view returned run %d, expected %d", response.Run.ID, expectedRunID)
+	}
+	if err := h.validateExpectedHead(response.Run.HeadSHA, expectedHead); err != nil {
+		return err
+	}
+	wantURL := h.baseURL + "/" + h.repository + "/actions/runs/" + strconv.Itoa(expectedRunID)
+	wantAPIURL := h.baseURL + "/api/v1/repos/" + h.repository + "/actions/runs/" + strconv.Itoa(expectedRunID)
+	if response.Run.URL != wantURL || response.Run.APIURL != wantAPIURL {
+		return fmt.Errorf("forgejo-axi run view identity mismatch: got %q and %q", response.Run.URL, response.Run.APIURL)
+	}
+	if len(response.Next) != 0 {
+		return fmt.Errorf("forgejo-axi run view did not provide requested failed logs: %s", strings.Join(response.Next, "; "))
+	}
+	for _, job := range response.Jobs {
+		if job.ID <= 0 || job.RunID != expectedRunID {
+			return fmt.Errorf("forgejo-axi run view returned job %d for run %d, expected run %d", job.ID, job.RunID, expectedRunID)
+		}
+	}
+	return nil
 }
 
 func (h *Host) normalizePull(pull pullRequest) (*scm.PR, error) {
@@ -389,7 +530,12 @@ func (h *Host) normalizeChecks(result checksResult) ([]scm.Check, error) {
 		if err != nil {
 			return nil, err
 		}
-		check := scm.Check{Name: status.Context, Bucket: bucket}
+		check := scm.Check{
+			Name:   status.Context,
+			Bucket: bucket,
+			State:  status.State,
+			Link:   stringValue(status.TargetURL),
+		}
 		if status.UpdatedAt != nil {
 			check.CompletedAt, err = time.Parse(time.RFC3339, *status.UpdatedAt)
 			if err != nil {
@@ -563,6 +709,10 @@ func (h *Host) canonicalPRURL(number int) string {
 }
 
 func (h *Host) runJSON(ctx context.Context, operation string, operationArgs []string, dst any) error {
+	return h.runJSONWithLimit(ctx, operation, operationArgs, dst, 0)
+}
+
+func (h *Host) runJSONWithLimit(ctx context.Context, operation string, operationArgs []string, dst any, maxStdoutBytes int) error {
 	args := append(strings.Fields(operation), operationArgs...)
 	args = append(args, "--base-url", h.baseURL)
 	if h.tokenEnv != "" {
@@ -574,12 +724,17 @@ func (h *Host) runJSON(ctx context.Context, operation string, operationArgs []st
 		return errors.New("Forgejo command runner returned a nil command")
 	}
 	shellenv.ConfigureShellCommand(cmd)
-	var stdout, stderr bytes.Buffer
+	var stdout cappedBuffer
+	stdout.limit = maxStdoutBytes
+	var stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	err := shellenv.RunShellCommand(cmd)
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return ctxErr
+	}
+	if stdout.exceeded {
+		return fmt.Errorf("forgejo-axi %s output exceeded %d bytes: %w", operation, maxStdoutBytes, errForgejoOutputLimit)
 	}
 	if err != nil {
 		return h.commandError(operation, err, stdout.String(), stderr.String())
@@ -589,6 +744,32 @@ func (h *Host) runJSON(ctx context.Context, operation string, operationArgs []st
 	}
 	return nil
 }
+
+type cappedBuffer struct {
+	buf      bytes.Buffer
+	limit    int
+	exceeded bool
+}
+
+func (b *cappedBuffer) Write(p []byte) (int, error) {
+	if b.limit <= 0 {
+		return b.buf.Write(p)
+	}
+	remaining := b.limit - b.buf.Len()
+	if remaining <= 0 {
+		b.exceeded = true
+		return 0, errForgejoOutputLimit
+	}
+	if len(p) <= remaining {
+		return b.buf.Write(p)
+	}
+	n, _ := b.buf.Write(p[:remaining])
+	b.exceeded = true
+	return n, errForgejoOutputLimit
+}
+
+func (b *cappedBuffer) Bytes() []byte  { return b.buf.Bytes() }
+func (b *cappedBuffer) String() string { return b.buf.String() }
 
 func (h *Host) commandError(operation string, commandErr error, stdout, stderr string) error {
 	message := strings.TrimSpace(stdout)
@@ -659,6 +840,10 @@ type statusResponse struct {
 		BranchProtection  bool `json:"branch_protection"`
 		ExpectedHeadMerge bool `json:"expected_head_merge"`
 		ActionsJobLogs    bool `json:"actions_job_logs"`
+		Runs              bool `json:"runs"`
+		RunJobs           bool `json:"run_jobs"`
+		RunCancel         bool `json:"run_cancel"`
+		RunArtifacts      bool `json:"run_artifacts"`
 		Probe             struct {
 			Source   string `json:"source"`
 			Complete bool   `json:"complete"`
@@ -703,7 +888,29 @@ type checkProtection struct {
 type commitStatus struct {
 	Context   string  `json:"context"`
 	State     string  `json:"state"`
+	TargetURL *string `json:"target_url"`
 	UpdatedAt *string `json:"updated_at"`
+}
+
+type runViewResponse struct {
+	Run  actionRun   `json:"run"`
+	Jobs []actionJob `json:"jobs"`
+	Next []string    `json:"next"`
+}
+
+type actionRun struct {
+	ID      int    `json:"id"`
+	URL     string `json:"url"`
+	APIURL  string `json:"api_url"`
+	HeadSHA string `json:"head_sha"`
+}
+
+type actionJob struct {
+	ID     int     `json:"id"`
+	RunID  int     `json:"run_id"`
+	Name   string  `json:"name"`
+	Status string  `json:"status"`
+	Log    *string `json:"log"`
 }
 
 type requiredStatus struct {
