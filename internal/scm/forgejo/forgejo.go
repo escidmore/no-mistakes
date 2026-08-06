@@ -33,7 +33,6 @@ type Options struct {
 	BaseURL        string
 	Repository     string
 	TokenEnv       string
-	ExpectedHead   func() string
 	Secrets        []string
 }
 
@@ -45,7 +44,6 @@ type Host struct {
 	baseURL      string
 	repository   string
 	tokenEnv     string
-	expected     func() string
 	secrets      []string
 	capabilities scm.Capabilities
 }
@@ -71,7 +69,6 @@ func New(opts Options) *Host {
 		baseURL:    strings.TrimRight(strings.TrimSpace(opts.BaseURL), "/"),
 		repository: strings.Trim(strings.TrimSpace(opts.Repository), "/"),
 		tokenEnv:   strings.TrimSpace(opts.TokenEnv),
-		expected:   opts.ExpectedHead,
 		secrets:    append([]string(nil), opts.Secrets...),
 	}
 }
@@ -87,7 +84,7 @@ func (h *Host) Available(ctx context.Context) error {
 	if h.cmdFactory == nil {
 		return errors.New("Forgejo command runner is not configured")
 	}
-	if _, _, err := ResolveRemote(h.baseURL+"/"+h.repository+".git", h.baseURL); err != nil {
+	if _, _, err := ResolveRemote(h.baseURL+"/"+h.repository+".git", h.baseURL, ""); err != nil {
 		return fmt.Errorf("invalid Forgejo host configuration: %w", err)
 	}
 
@@ -273,7 +270,6 @@ func (h *Host) GetMergeableState(ctx context.Context, pr *scm.PR) (scm.Mergeable
 		Mergeability struct {
 			Number           int      `json:"number"`
 			URL              string   `json:"url"`
-			HeadSHA          string   `json:"head_sha"`
 			ForgejoMergeable *bool    `json:"forgejo_mergeable"`
 			Reasons          []string `json:"reasons"`
 		} `json:"mergeability"`
@@ -285,9 +281,6 @@ func (h *Host) GetMergeableState(ctx context.Context, pr *scm.PR) (scm.Mergeable
 		return scm.MergeableUnknown, err
 	}
 	if err := h.validateOutputPRNumber(number, response.Mergeability.Number); err != nil {
-		return scm.MergeableUnknown, err
-	}
-	if err := h.validateExpectedHead(response.Mergeability.HeadSHA, h.currentExpectedHead()); err != nil {
 		return scm.MergeableUnknown, err
 	}
 	for _, reason := range response.Mergeability.Reasons {
@@ -374,9 +367,6 @@ func (h *Host) normalizePull(pull pullRequest) (*scm.PR, error) {
 func (h *Host) normalizeChecks(result checksResult) ([]scm.Check, error) {
 	if result.SHA == "" {
 		return nil, errors.New("forgejo-axi returned checks without a head SHA")
-	}
-	if err := h.validateExpectedHead(result.SHA, h.currentExpectedHead()); err != nil {
-		return nil, err
 	}
 	if result.Reported != len(result.Statuses) {
 		return nil, fmt.Errorf("forgejo-axi reported %d statuses but returned %d", result.Reported, len(result.Statuses))
@@ -568,13 +558,6 @@ func (h *Host) validateExpectedHead(got, expected string) error {
 	return nil
 }
 
-func (h *Host) currentExpectedHead() string {
-	if h.expected == nil {
-		return ""
-	}
-	return strings.TrimSpace(h.expected())
-}
-
 func (h *Host) canonicalPRURL(number int) string {
 	return h.baseURL + "/" + h.repository + "/pulls/" + strconv.Itoa(number)
 }
@@ -750,7 +733,7 @@ func stringValue(value *string) string {
 // remote. configuredBase is required for arbitrary self-hosted names and SSH
 // origins; recognizable HTTPS Forgejo origins can infer a path prefix from all
 // path segments before OWNER/REPO.
-func ResolveRemote(remote, configuredBase string) (string, string, error) {
+func ResolveRemote(remote, configuredBase, resolvedSSHHost string) (string, string, error) {
 	remoteHost, remotePath, remoteScheme, err := parseRemote(remote)
 	if err != nil {
 		return "", "", err
@@ -766,8 +749,14 @@ func ResolveRemote(remote, configuredBase string) (string, string, error) {
 			if parseErr != nil || !strings.EqualFold(remoteURL.Host, baseURL.Host) {
 				return "", "", fmt.Errorf("remote host %q does not match configured Forgejo host %q", remoteHost, baseURL.Host)
 			}
-		} else if !strings.EqualFold(remoteHost, baseURL.Hostname()) {
-			return "", "", fmt.Errorf("remote host %q does not match configured Forgejo host %q", remoteHost, baseURL.Hostname())
+		} else {
+			resolvedSSHHost = strings.TrimSpace(resolvedSSHHost)
+			if resolvedSSHHost == "" {
+				resolvedSSHHost = remoteHost
+			}
+			if !strings.EqualFold(resolvedSSHHost, baseURL.Hostname()) {
+				return "", "", fmt.Errorf("remote host %q does not match configured Forgejo host %q", resolvedSSHHost, baseURL.Hostname())
+			}
 		}
 		prefix := strings.Trim(baseURL.Path, "/")
 		repo, err := repositoryAfterPrefix(remotePath, prefix)

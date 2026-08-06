@@ -29,6 +29,7 @@ func TestResolveRemoteSupportsPortsAndPathPrefixes(t *testing.T) {
 		name       string
 		remote     string
 		configured string
+		resolved   string
 		wantBase   string
 		wantRepo   string
 	}{
@@ -60,6 +61,14 @@ func TestResolveRemoteSupportsPortsAndPathPrefixes(t *testing.T) {
 			wantRepo:   "octo/widgets",
 		},
 		{
+			name:       "SSH alias with resolved host",
+			remote:     "git@forgejo-work:scm/octo/widgets.git",
+			configured: "https://code.example/scm",
+			resolved:   "code.example",
+			wantBase:   "https://code.example/scm",
+			wantRepo:   "octo/widgets",
+		},
+		{
 			name:       "canonical pull URL",
 			remote:     testPRURL,
 			configured: testBaseURL,
@@ -68,7 +77,7 @@ func TestResolveRemoteSupportsPortsAndPathPrefixes(t *testing.T) {
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			base, repo, err := ResolveRemote(tt.remote, tt.configured)
+			base, repo, err := ResolveRemote(tt.remote, tt.configured, tt.resolved)
 			if err != nil {
 				t.Fatalf("ResolveRemote() error = %v", err)
 			}
@@ -81,7 +90,7 @@ func TestResolveRemoteSupportsPortsAndPathPrefixes(t *testing.T) {
 
 func TestResolveRemoteRejectsIdentityMismatch(t *testing.T) {
 	t.Parallel()
-	_, _, err := ResolveRemote("https://other.example/scm/octo/widgets.git", "https://code.example/scm")
+	_, _, err := ResolveRemote("https://other.example/scm/octo/widgets.git", "https://code.example/scm", "")
 	if err == nil || !strings.Contains(err.Error(), "does not match") {
 		t.Fatalf("ResolveRemote() error = %v, want identity mismatch", err)
 	}
@@ -89,7 +98,7 @@ func TestResolveRemoteRejectsIdentityMismatch(t *testing.T) {
 
 func TestResolveRemoteRejectsUnsupportedURLScheme(t *testing.T) {
 	t.Parallel()
-	_, _, err := ResolveRemote("ftp://code.example/scm/octo/widgets.git", "https://code.example/scm")
+	_, _, err := ResolveRemote("ftp://code.example/scm/octo/widgets.git", "https://code.example/scm", "")
 	if err == nil || !strings.Contains(err.Error(), "scheme") {
 		t.Fatalf("ResolveRemote() error = %v, want unsupported scheme", err)
 	}
@@ -125,7 +134,6 @@ func TestAvailableAcceptsHostScopedTokenSource(t *testing.T) {
 		Executable:     "/opt/tools/forgejo-axi-custom",
 		BaseURL:        testBaseURL,
 		Repository:     testRepo,
-		ExpectedHead:   func() string { return testHeadSHA },
 	})
 	if err := host.Available(context.Background()); err != nil {
 		t.Fatalf("Available() error = %v", err)
@@ -358,17 +366,18 @@ func TestChecksRejectInconsistentRequiredSummary(t *testing.T) {
 	}
 }
 
-func TestChecksRejectExpectedHeadRace(t *testing.T) {
+func TestChecksAcceptsAdvancedHead(t *testing.T) {
+	statuses := `[{"context":"test/linux","state":"success","description":"ok","target_url":null,"created_at":null,"updated_at":null}]`
 	host := newTestHost(&fakeRecorder{responses: []fakeResponse{{stdout: strings.ReplaceAll(
-		checksJSON("success", "success", true, `[]`, `[]`), testHeadSHA, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+		checksJSON("success", "not_required", true, statuses, `[]`), testHeadSHA, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
 	}}})
-	_, err := host.GetChecks(context.Background(), testPR())
-	if !errors.Is(err, scm.ErrHeadChanged) {
-		t.Fatalf("GetChecks() error = %v, want ErrHeadChanged", err)
+	checks, err := host.GetChecks(context.Background(), testPR())
+	if err != nil || len(checks) != 1 || checks[0].Bucket != scm.CheckBucketPass {
+		t.Fatalf("GetChecks() = (%+v, %v), want passing advanced head", checks, err)
 	}
 }
 
-func TestMergeabilityCommandDecodingAndExpectedHead(t *testing.T) {
+func TestMergeabilityCommandDecoding(t *testing.T) {
 	recorder := &fakeRecorder{responses: []fakeResponse{
 		{stdout: fixture(t, "status-forgejo-16.json")},
 		{stdout: `{"mergeability":{"number":42,"url":"` + testPRURL + `","head_sha":"` + testHeadSHA + `","forgejo_mergeable":false,"checks_pass":false,"mergeable":false,"reasons":["forgejo_not_mergeable"]}}`},
@@ -387,7 +396,7 @@ func TestMergeabilityCommandDecodingAndExpectedHead(t *testing.T) {
 	}
 }
 
-func TestMergeabilityRejectsExpectedHeadRace(t *testing.T) {
+func TestMergeabilityAcceptsAdvancedHead(t *testing.T) {
 	recorder := &fakeRecorder{responses: []fakeResponse{
 		{stdout: fixture(t, "status-forgejo-16.json")},
 		{stdout: `{"mergeability":{"number":42,"url":"` + testPRURL + `","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","forgejo_mergeable":true,"checks_pass":true,"mergeable":true,"reasons":[]}}`},
@@ -396,9 +405,9 @@ func TestMergeabilityRejectsExpectedHeadRace(t *testing.T) {
 	if err := host.Available(context.Background()); err != nil {
 		t.Fatalf("Available() error = %v", err)
 	}
-	_, err := host.GetMergeableState(context.Background(), testPR())
-	if !errors.Is(err, scm.ErrHeadChanged) {
-		t.Fatalf("GetMergeableState() error = %v, want ErrHeadChanged", err)
+	got, err := host.GetMergeableState(context.Background(), testPR())
+	if err != nil || got != scm.MergeableOK {
+		t.Fatalf("GetMergeableState() = (%q, %v), want mergeable advanced head", got, err)
 	}
 }
 
@@ -660,7 +669,6 @@ func newTestHostWithOptions(recorder *fakeRecorder, available func(string) bool)
 		BaseURL:        testBaseURL,
 		Repository:     testRepo,
 		TokenEnv:       "FORGEJO_TEST_TOKEN",
-		ExpectedHead:   func() string { return testHeadSHA },
 		Secrets:        []string{"secret-token", "pass"},
 	})
 }
