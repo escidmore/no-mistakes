@@ -104,7 +104,7 @@ func buildHost(sctx *pipeline.StepContext, provider scm.Provider) (scm.Host, str
 		if strings.TrimSpace(remote) == "" && sctx.Run.PRURL != nil {
 			remote = *sctx.Run.PRURL
 		}
-		resolvedBase, repo, err := forgejo.ResolveRemote(remote, baseURL)
+		resolvedBase, repo, err := forgejo.ResolveRemote(remote, baseURL, scm.ResolveHost(sctx.Ctx, remote))
 		if err != nil {
 			return nil, fmt.Sprintf("could not resolve Forgejo host and repository: %v", err)
 		}
@@ -120,7 +120,6 @@ func buildHost(sctx *pipeline.StepContext, provider scm.Provider) (scm.Host, str
 			BaseURL:        resolvedBase,
 			Repository:     repo,
 			TokenEnv:       tokenEnv,
-			ExpectedHead:   func() string { return sctx.Run.HeadSHA },
 			Secrets:        forgejoTokenValuesForStep(sctx),
 		}), ""
 	default:
