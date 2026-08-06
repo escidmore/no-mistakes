@@ -262,6 +262,9 @@ func TestFetchFailedCheckLogsRejectsNonCanonicalTargetsWithoutGuessing(t *testin
 		{name: "leading-zero job", target: testBaseURL + "/" + testRepo + "/actions/runs/91/jobs/00"},
 		{name: "signed job", target: testBaseURL + "/" + testRepo + "/actions/runs/91/jobs/+0"},
 		{name: "malformed job index", target: testBaseURL + "/" + testRepo + "/actions/runs/91/jobs/latest"},
+		{name: "whitespace padded", target: " " + testBaseURL + "/" + testRepo + "/actions/runs/91/jobs/0 "},
+		{name: "empty fragment ambiguity", target: testBaseURL + "/" + testRepo + "/actions/runs/91/jobs/0#"},
+		{name: "host case variation", target: strings.Replace(testBaseURL, "forge.example", "FORGE.EXAMPLE", 1) + "/" + testRepo + "/actions/runs/91/jobs/0"},
 		{name: "empty query ambiguity", target: testBaseURL + "/" + testRepo + "/actions/runs/91/jobs/0?"},
 		{name: "query ambiguity", target: testBaseURL + "/" + testRepo + "/actions/runs/91/jobs/0?attempt=2"},
 	}
