@@ -41,6 +41,7 @@ func TestDetectProvider(t *testing.T) {
 func TestDetectProvider_SSHHostAlias(t *testing.T) {
 	t.Setenv("GLAB_CONFIG_DIR", t.TempDir())
 	t.Setenv("GH_CONFIG_DIR", t.TempDir())
+	t.Setenv("FORGEJO_BASE_URL", "https://github.com")
 
 	tests := []struct {
 		name     string
@@ -59,6 +60,12 @@ func TestDetectProvider_SSHHostAlias(t *testing.T) {
 			url:      "ssh://git@gitlab-work/group/repo.git",
 			hostname: "gitlab.com",
 			want:     ProviderGitLab,
+		},
+		{
+			name:     "Forgejo-named GitHub alias",
+			url:      "git@forgejo-github:owner/repo.git",
+			hostname: "github.com",
+			want:     ProviderGitHub,
 		},
 	}
 
