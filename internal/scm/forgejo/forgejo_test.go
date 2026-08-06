@@ -2,6 +2,7 @@ package forgejo
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -117,11 +118,8 @@ func TestAvailableUsesConfiguredExecutableAndRuntimeCapabilities(t *testing.T) {
 		t.Fatalf("command = %#v, want name custom and args %#v", got, wantArgs)
 	}
 	caps := host.Capabilities()
-	if !caps.MergeableState || !caps.MergedProof || !caps.ExpectedHeadMerge || !caps.ActionsJobLogs {
-		t.Fatalf("Capabilities() = %+v, want Forgejo 16 capabilities", caps)
-	}
-	if caps.FailedCheckLogs {
-		t.Fatalf("Capabilities().FailedCheckLogs = true; no stable forgejo-axi log command exists")
+	if !caps.MergeableState || !caps.MergedProof || !caps.ExpectedHeadMerge || !caps.ActionsJobLogs || !caps.ActionsRuns || !caps.ActionsRunJobs || !caps.FailedCheckLogs {
+		t.Fatalf("Capabilities() = %+v, want Forgejo 16 capabilities including failed logs", caps)
 	}
 }
 
@@ -182,8 +180,8 @@ func TestForgejo15KeepsStatusGatingWithoutActionLogs(t *testing.T) {
 		t.Fatalf("Available() error = %v", err)
 	}
 	caps := host.Capabilities()
-	if caps.ActionsJobLogs || caps.FailedCheckLogs || !caps.CommitStatuses {
-		t.Fatalf("Capabilities() = %+v, want statuses independent from unavailable logs", caps)
+	if !caps.ActionsRuns || caps.ActionsRunJobs || caps.ActionsJobLogs || caps.FailedCheckLogs || !caps.CommitStatuses {
+		t.Fatalf("Capabilities() = %+v, want statuses and run listing independent from unavailable run jobs/logs", caps)
 	}
 	checks, err := host.GetChecks(context.Background(), testPR())
 	if err != nil {
@@ -191,6 +189,14 @@ func TestForgejo15KeepsStatusGatingWithoutActionLogs(t *testing.T) {
 	}
 	if len(checks) != 1 || checks[0].Bucket != scm.CheckBucketPass {
 		t.Fatalf("GetChecks() = %+v, want passing commit status", checks)
+	}
+	callsBeforeLogs := len(recorder.calls)
+	logs, err := host.FetchFailedCheckLogs(context.Background(), testPR(), "feature/forgejo", testHeadSHA, []string{"test/linux"})
+	if logs != "" || !errors.Is(err, scm.ErrUnsupported) {
+		t.Fatalf("FetchFailedCheckLogs() = (%q, %v), want independently unsupported", logs, err)
+	}
+	if len(recorder.calls) != callsBeforeLogs {
+		t.Fatal("unsupported Forgejo 15 logs issued a run command")
 	}
 }
 
@@ -585,10 +591,11 @@ func pullJSON(state string, merged bool, sha string) string {
 }
 
 func checksJSON(overall, requiredState string, passes bool, statuses, required string) string {
-	reported := 0
-	if statuses != `[]` {
-		reported = 1
+	var decoded []json.RawMessage
+	if err := json.Unmarshal([]byte(statuses), &decoded); err != nil {
+		panic(fmt.Sprintf("invalid test statuses: %v", err))
 	}
+	reported := len(decoded)
 	return fmt.Sprintf(`{
 		"checks":{"sha":%q,"reported":%d,"state":%q,"statuses":%s,
 		"required":%s,"required_state":%q,"passes":%t,
@@ -606,10 +613,11 @@ func fixture(t *testing.T, name string) string {
 }
 
 type fakeResponse struct {
-	stdout string
-	stderr string
-	code   int
-	sleep  time.Duration
+	stdout      string
+	stdoutBytes int
+	stderr      string
+	code        int
+	sleep       time.Duration
 }
 
 type fakeCall struct {
@@ -633,6 +641,7 @@ func (r *fakeRecorder) factory(ctx context.Context, name string, args ...string)
 	cmd.Env = append(os.Environ(),
 		"FORGEJO_TEST_HELPER=1",
 		"FORGEJO_TEST_STDOUT="+response.stdout,
+		fmt.Sprintf("FORGEJO_TEST_STDOUT_BYTES=%d", response.stdoutBytes),
 		"FORGEJO_TEST_STDERR="+response.stderr,
 		fmt.Sprintf("FORGEJO_TEST_EXIT_CODE=%d", response.code),
 		fmt.Sprintf("FORGEJO_TEST_SLEEP=%d", response.sleep.Milliseconds()),
@@ -649,7 +658,23 @@ func TestForgejoAXIHelperProcess(t *testing.T) {
 		_, _ = fmt.Sscanf(raw, "%d", &millis)
 		time.Sleep(time.Duration(millis) * time.Millisecond)
 	}
-	_, _ = fmt.Fprint(os.Stdout, os.Getenv("FORGEJO_TEST_STDOUT"))
+	if raw := os.Getenv("FORGEJO_TEST_STDOUT_BYTES"); raw != "" && raw != "0" {
+		var count int
+		_, _ = fmt.Sscanf(raw, "%d", &count)
+		chunk := []byte(strings.Repeat("x", 4*1024))
+		for count > 0 {
+			write := len(chunk)
+			if count < write {
+				write = count
+			}
+			if _, err := os.Stdout.Write(chunk[:write]); err != nil {
+				break
+			}
+			count -= write
+		}
+	} else {
+		_, _ = fmt.Fprint(os.Stdout, os.Getenv("FORGEJO_TEST_STDOUT"))
+	}
 	_, _ = fmt.Fprint(os.Stderr, os.Getenv("FORGEJO_TEST_STDERR"))
 	if os.Getenv("FORGEJO_TEST_EXIT_CODE") != "0" {
 		os.Exit(1)

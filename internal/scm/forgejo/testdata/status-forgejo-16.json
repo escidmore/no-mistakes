@@ -8,6 +8,10 @@
     "branch_protection":true,
     "expected_head_merge":true,
     "actions_job_logs":true,
+    "runs":true,
+    "run_jobs":true,
+    "run_cancel":true,
+    "run_artifacts":true,
     "probe":{"source":"swagger","complete":true}
   }
 }

@@ -170,6 +170,8 @@ type Capabilities struct {
 	BranchProtection  bool
 	ExpectedHeadMerge bool
 	ActionsJobLogs    bool
+	ActionsRuns       bool
+	ActionsRunJobs    bool
 }
 
 var (

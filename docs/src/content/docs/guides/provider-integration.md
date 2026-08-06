@@ -31,7 +31,7 @@ What you do not get is PR automation and CI monitoring.
 | **CI** (polling, auto-fix) | `gh` CLI | `glab` CLI | `forgejo-axi` | same env vars | `az` CLI |
 | **Merge conflict auto-fix** | `gh` CLI | `glab` CLI | `forgejo-axi` | not supported | `az` CLI |
 | **Mergeability polling** | `gh` CLI | `glab` CLI | `forgejo-axi` | not supported | `az` CLI |
-| **Failed check log fetching** | `gh` CLI | `glab` CLI | not supported | supported | not yet |
+| **Failed check log fetching** | `gh` CLI | `glab` CLI | Forgejo 16 when runtime routes are available | supported | not yet |
 | **[Cancelled-check rerun](/no-mistakes/reference/repo-config/#cirerun_transient)** | `gh` CLI | not supported | not supported | not supported | not supported |
 
 ## What changes when provider wiring is present
@@ -124,7 +124,9 @@ Verify without mutating a deployed Forgejo instance:
 FORGEJO_BASE_URL=https://forgejo.example forgejo-axi status --json
 ```
 
-`no-mistakes` delegates PR identity, lifecycle, commit-status and required-context evaluation, mergeability, and merged proof to forgejo-axi's stable JSON commands. Capabilities are runtime-probed from the server instead of guessed from a major version: Forgejo 15.0.5 status gating remains supported even though Actions logs are unavailable, while 16.x reports log-route capability only when advertised. No stable high-level log command exists yet, so failed-check log fetching remains disabled independently of commit-status gating.
+`no-mistakes` delegates PR identity, lifecycle, commit-status and required-context evaluation, mergeability, and merged proof to forgejo-axi's stable JSON commands. Capabilities are runtime-probed from the server instead of guessed from a major version.
+
+Failed-log retrieval uses forgejo-axi's stable `run view --log-failed --json` command only when the runtime probe advertises the run, run-jobs, and job-log routes. `no-mistakes` accepts only a failing status's canonical native Actions target, verifies the exact run and PR head, validates every returned job against that run, and limits command output to 1 MiB before giving failed-job logs to the repair agent. Live testing against Forgejo 16.0.1 proves identity-matched retrieval through those routes. Forgejo 15.0.5 status gating stays independent: commit statuses remain supported when job and log routes are unavailable.
 
 Fork PR routing is not implemented for Forgejo; a configured `fork_url` makes the PR step skip rather than opening a self PR.
 
