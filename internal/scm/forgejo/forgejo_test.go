@@ -549,14 +549,14 @@ func TestCommandFailuresAreActionableAndRedacted(t *testing.T) {
 			t.Fatalf("Available() error = %v, want actionable missing executable", err)
 		}
 	})
-	t.Run("nonzero JSON error redacts token", func(t *testing.T) {
+	t.Run("nonzero JSON error redacts overlapping tokens", func(t *testing.T) {
 		recorder := &fakeRecorder{responses: []fakeResponse{{
 			stdout: `{"error":"request failed with secret-token","code":"HTTP_ERROR","details":{"url":"https://user:pass@forge.example/path?token=secret-token"},"help":["check secret-token"]}`,
 			code:   1,
 		}}}
 		host := newTestHost(recorder)
 		_, err := host.FindPR(context.Background(), "feature/forgejo", "main")
-		if err == nil || !strings.Contains(err.Error(), "HTTP_ERROR") || strings.Contains(err.Error(), "secret-token") || strings.Contains(err.Error(), "user:pass") {
+		if err == nil || !strings.Contains(err.Error(), "HTTP_ERROR") || strings.Contains(err.Error(), "secret-token") || strings.Contains(err.Error(), "-token") || strings.Contains(err.Error(), "user:pass") {
 			t.Fatalf("FindPR() error = %v, want code with secrets redacted", err)
 		}
 	})
@@ -765,7 +765,7 @@ func newTestHostWithOptions(recorder *fakeRecorder, available func(string) bool)
 		BaseURL:        testBaseURL,
 		Repository:     testRepo,
 		TokenEnv:       "FORGEJO_TEST_TOKEN",
-		Secrets:        []string{"secret-token", "pass"},
+		Secrets:        []string{"secret", "secret-token", "pass"},
 	})
 }
 
