@@ -828,7 +828,7 @@ func (h *Host) runJSONWithLimit(ctx context.Context, operation string, operation
 		return fmt.Errorf("forgejo-axi %s output exceeded %d bytes: %w", operation, maxStdoutBytes, errForgejoOutputLimit)
 	}
 	if err != nil {
-		return h.commandError(operation, err, stdout.String(), stderr.String())
+		return h.commandError(operation, err, stdout.String(), stderr.String(h.secrets))
 	}
 	if err := decodeSingleJSON(stdout.Bytes(), dst); err != nil {
 		return fmt.Errorf("forgejo-axi %s returned invalid JSON: %w", operation, err)
@@ -863,8 +863,9 @@ func (b *cappedBuffer) Bytes() []byte  { return b.buf.Bytes() }
 func (b *cappedBuffer) String() string { return b.buf.String() }
 
 type prefixBuffer struct {
-	buf   bytes.Buffer
-	limit int
+	buf       bytes.Buffer
+	limit     int
+	truncated bool
 }
 
 func (b *prefixBuffer) Write(p []byte) (int, error) {
@@ -872,13 +873,35 @@ func (b *prefixBuffer) Write(p []byte) (int, error) {
 	if remaining := b.limit - b.buf.Len(); remaining > 0 {
 		if len(p) > remaining {
 			p = p[:remaining]
+			b.truncated = true
 		}
 		_, _ = b.buf.Write(p)
+	} else if len(p) > 0 {
+		b.truncated = true
 	}
 	return written, nil
 }
 
-func (b *prefixBuffer) String() string { return b.buf.String() }
+func (b *prefixBuffer) String(secrets []string) string {
+	value := b.buf.String()
+	if !b.truncated {
+		return value
+	}
+	trim := 0
+	for _, secret := range secrets {
+		maxPrefix := len(secret) - 1
+		if maxPrefix > len(value) {
+			maxPrefix = len(value)
+		}
+		for length := maxPrefix; length > trim; length-- {
+			if strings.HasSuffix(value, secret[:length]) {
+				trim = length
+				break
+			}
+		}
+	}
+	return value[:len(value)-trim]
+}
 
 func (h *Host) commandError(operation string, commandErr error, stdout, stderr string) error {
 	message := strings.TrimSpace(stdout)

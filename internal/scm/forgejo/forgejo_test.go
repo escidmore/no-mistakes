@@ -575,12 +575,19 @@ func TestCommandFailuresAreActionableAndRedacted(t *testing.T) {
 		}
 	})
 	t.Run("oversized stderr", func(t *testing.T) {
-		host := newTestHost(&fakeRecorder{responses: []fakeResponse{{stderr: "useful prefix: ", stderrBytes: maxForgejoErrorOutputBytes + 1, code: 1}}})
+		const prefix = "useful prefix: "
+		const partialSecret = "secret"
+		stderr := prefix + strings.Repeat("x", maxForgejoErrorOutputBytes-len(prefix)-len(partialSecret)) + "secret-token"
+		stderrFile := filepath.Join(t.TempDir(), "stderr.txt")
+		if err := os.WriteFile(stderrFile, []byte(stderr), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		host := newTestHost(&fakeRecorder{responses: []fakeResponse{{stderrFile: stderrFile, code: 1}}})
 		_, err := host.FindPR(context.Background(), "feature/forgejo", "main")
 		if err == nil {
 			t.Fatal("FindPR() error = nil, want bounded stderr prefix")
 		}
-		if message := err.Error(); !strings.Contains(message, "useful prefix") || len(message) > maxForgejoErrorOutputBytes+256 {
+		if message := err.Error(); !strings.Contains(message, prefix) || strings.Contains(message, partialSecret) || len(message) > maxForgejoErrorOutputBytes+256 {
 			t.Fatalf("FindPR() error length = %d, want bounded stderr prefix", len(message))
 		}
 	})
@@ -661,7 +668,7 @@ type fakeResponse struct {
 	stdoutFile  string
 	stdoutBytes int
 	stderr      string
-	stderrBytes int
+	stderrFile  string
 	code        int
 	sleep       time.Duration
 }
@@ -690,7 +697,7 @@ func (r *fakeRecorder) factory(ctx context.Context, name string, args ...string)
 		"FORGEJO_TEST_STDOUT_FILE="+response.stdoutFile,
 		fmt.Sprintf("FORGEJO_TEST_STDOUT_BYTES=%d", response.stdoutBytes),
 		"FORGEJO_TEST_STDERR="+response.stderr,
-		fmt.Sprintf("FORGEJO_TEST_STDERR_BYTES=%d", response.stderrBytes),
+		"FORGEJO_TEST_STDERR_FILE="+response.stderrFile,
 		fmt.Sprintf("FORGEJO_TEST_EXIT_CODE=%d", response.code),
 		fmt.Sprintf("FORGEJO_TEST_SLEEP=%d", response.sleep.Milliseconds()),
 	)
@@ -730,21 +737,15 @@ func TestForgejoAXIHelperProcess(t *testing.T) {
 	} else {
 		_, _ = fmt.Fprint(os.Stdout, os.Getenv("FORGEJO_TEST_STDOUT"))
 	}
-	_, _ = fmt.Fprint(os.Stderr, os.Getenv("FORGEJO_TEST_STDERR"))
-	if raw := os.Getenv("FORGEJO_TEST_STDERR_BYTES"); raw != "" && raw != "0" {
-		var count int
-		_, _ = fmt.Sscanf(raw, "%d", &count)
-		chunk := []byte(strings.Repeat("x", 4*1024))
-		for count > 0 {
-			write := len(chunk)
-			if count < write {
-				write = count
-			}
-			if _, err := os.Stderr.Write(chunk[:write]); err != nil {
-				break
-			}
-			count -= write
+	if path := os.Getenv("FORGEJO_TEST_STDERR_FILE"); path != "" {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			_, _ = fmt.Fprint(os.Stderr, err)
+			os.Exit(1)
 		}
+		_, _ = os.Stderr.Write(data)
+	} else {
+		_, _ = fmt.Fprint(os.Stderr, os.Getenv("FORGEJO_TEST_STDERR"))
 	}
 	if os.Getenv("FORGEJO_TEST_EXIT_CODE") != "0" {
 		os.Exit(1)
