@@ -70,6 +70,10 @@ func New(opts Options) *Host {
 			return err == nil
 		}
 	}
+	secrets := append([]string(nil), opts.Secrets...)
+	sort.Slice(secrets, func(i, j int) bool {
+		return len(secrets[i]) > len(secrets[j])
+	})
 	return &Host{
 		cmdFactory: opts.CommandFactory,
 		available:  available,
@@ -77,7 +81,7 @@ func New(opts Options) *Host {
 		baseURL:    strings.TrimRight(strings.TrimSpace(opts.BaseURL), "/"),
 		repository: strings.Trim(strings.TrimSpace(opts.Repository), "/"),
 		tokenEnv:   strings.TrimSpace(opts.TokenEnv),
-		secrets:    append([]string(nil), opts.Secrets...),
+		secrets:    secrets,
 	}
 }
 
