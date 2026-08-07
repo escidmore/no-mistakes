@@ -126,7 +126,7 @@ FORGEJO_BASE_URL=https://forgejo.example forgejo-axi status --json
 
 `no-mistakes` delegates PR identity, lifecycle, commit-status and required-context evaluation, mergeability, and merged proof to forgejo-axi's stable JSON commands. Capabilities are runtime-probed from the server instead of guessed from a major version.
 
-Failed-log retrieval uses forgejo-axi's stable `run view --log-failed --json` command only when the runtime probe advertises the run, run-jobs, and job-log routes. `no-mistakes` accepts only a failing status's canonical native Actions target, verifies the exact run and PR head, validates every returned job against that run, and limits command output to 1 MiB before giving failed-job logs to the repair agent. Live testing against Forgejo 16.0.1 proves identity-matched retrieval through those routes. Forgejo 15.0.5 status gating stays independent: commit statuses remain supported when job and log routes are unavailable.
+Failed-log retrieval uses forgejo-axi's stable `run view --log-failed --json` command only when the runtime probe advertises the run, run-jobs, and job-log routes. `no-mistakes` accepts only a failing status's canonical native Actions target, verifies the exact run and PR head, validates every returned job against that run, and limits command output to 1 MiB before giving failed-job logs to the repair agent. Live testing against Forgejo 16.0.1 proves identity-matched retrieval through those routes. On Forgejo 15.0.5, commit-status gating, mergeability checks, and merged-state proof remain available when job and log routes are unavailable.
 
 Fork PR routing is not implemented for Forgejo; a configured `fork_url` makes the PR step skip rather than opening a self PR.
 
