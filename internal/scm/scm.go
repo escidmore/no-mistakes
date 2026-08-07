@@ -2,6 +2,7 @@ package scm
 
 import (
 	"context"
+	"net"
 	"net/url"
 	"os"
 	"os/exec"
@@ -189,7 +190,7 @@ func forgejoBaseMatchesRemote(baseRaw, remoteRaw string) bool {
 		return false
 	}
 	if remoteScheme == "http" || remoteScheme == "https" {
-		if !strings.EqualFold(remoteHost, base.Host) {
+		if normalizedHTTPAuthority(remoteScheme, remoteHost) != normalizedHTTPAuthority(base.Scheme, base.Host) {
 			return false
 		}
 	} else if !strings.EqualFold(stripPort(remoteHost), base.Hostname()) {
@@ -197,6 +198,22 @@ func forgejoBaseMatchesRemote(baseRaw, remoteRaw string) bool {
 		return false
 	}
 	return forgejoPathsMatch(base.Path, remotePath)
+}
+
+func normalizedHTTPAuthority(scheme, authority string) string {
+	parsed := &url.URL{Host: authority}
+	hostname := strings.ToLower(parsed.Hostname())
+	port := parsed.Port()
+	if (strings.EqualFold(scheme, "http") && port == "80") || (strings.EqualFold(scheme, "https") && port == "443") {
+		port = ""
+	}
+	if port != "" {
+		return net.JoinHostPort(hostname, port)
+	}
+	if strings.Contains(hostname, ":") {
+		return "[" + hostname + "]"
+	}
+	return hostname
 }
 
 func forgejoBaseMatchesResolvedRemote(baseRaw, remoteRaw, resolvedHost string) bool {

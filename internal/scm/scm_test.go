@@ -192,9 +192,23 @@ func TestDetectProvider_ForgejoConfigDoesNotOverrideKnownProviders(t *testing.T)
 func TestDetectProvider_UsesForgejoBaseEnvironment(t *testing.T) {
 	t.Setenv("GLAB_CONFIG_DIR", t.TempDir())
 	t.Setenv("GH_CONFIG_DIR", t.TempDir())
-	t.Setenv("FORGEJO_BASE_URL", "https://code.example:3443/scm")
-	if got := DetectProvider("https://code.example:3443/scm/octo/widgets.git"); got != ProviderForgejo {
-		t.Fatalf("DetectProvider() = %q, want %q", got, ProviderForgejo)
+	tests := []struct {
+		name   string
+		base   string
+		remote string
+	}{
+		{name: "non-default port and prefix", base: "https://code.example:3443/scm", remote: "https://code.example:3443/scm/octo/widgets.git"},
+		{name: "configured HTTPS default port", base: "https://code.example:443", remote: "https://code.example/octo/widgets.git"},
+		{name: "remote HTTPS default port", base: "https://code.example", remote: "https://code.example:443/octo/widgets.git"},
+		{name: "HTTP default port", base: "http://CODE.EXAMPLE:80", remote: "http://code.example/octo/widgets.git"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("FORGEJO_BASE_URL", tt.base)
+			if got := DetectProvider(tt.remote); got != ProviderForgejo {
+				t.Fatalf("DetectProvider() = %q, want %q", got, ProviderForgejo)
+			}
+		})
 	}
 }
 
