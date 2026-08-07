@@ -641,6 +641,7 @@ func fixture(t *testing.T, name string) string {
 
 type fakeResponse struct {
 	stdout      string
+	stdoutFile  string
 	stdoutBytes int
 	stderr      string
 	code        int
@@ -668,6 +669,7 @@ func (r *fakeRecorder) factory(ctx context.Context, name string, args ...string)
 	cmd.Env = append(os.Environ(),
 		"FORGEJO_TEST_HELPER=1",
 		"FORGEJO_TEST_STDOUT="+response.stdout,
+		"FORGEJO_TEST_STDOUT_FILE="+response.stdoutFile,
 		fmt.Sprintf("FORGEJO_TEST_STDOUT_BYTES=%d", response.stdoutBytes),
 		"FORGEJO_TEST_STDERR="+response.stderr,
 		fmt.Sprintf("FORGEJO_TEST_EXIT_CODE=%d", response.code),
@@ -699,6 +701,13 @@ func TestForgejoAXIHelperProcess(t *testing.T) {
 			}
 			count -= write
 		}
+	} else if path := os.Getenv("FORGEJO_TEST_STDOUT_FILE"); path != "" {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			_, _ = fmt.Fprint(os.Stderr, err)
+			os.Exit(1)
+		}
+		_, _ = os.Stdout.Write(data)
 	} else {
 		_, _ = fmt.Fprint(os.Stdout, os.Getenv("FORGEJO_TEST_STDOUT"))
 	}

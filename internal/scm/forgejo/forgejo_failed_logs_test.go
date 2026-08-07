@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -233,6 +235,13 @@ func TestFetchFailedCheckLogsBoundsOutputAndHonorsCancellation(t *testing.T) {
 
 	t.Run("aggregate log limit", func(t *testing.T) {
 		largeLog := strings.Repeat("x", maxForgejoLogOutputBytes/2)
+		responseFile := func(name, response string) fakeResponse {
+			path := filepath.Join(t.TempDir(), name)
+			if err := os.WriteFile(path, []byte(response), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			return fakeResponse{stdoutFile: path}
+		}
 		statuses := fmt.Sprintf(`[
 			{"context":"CI / first (pull_request)","state":"failure","target_url":%q},
 			{"context":"CI / second (pull_request)","state":"failure","target_url":%q}
@@ -241,8 +250,8 @@ func TestFetchFailedCheckLogsBoundsOutputAndHonorsCancellation(t *testing.T) {
 			{stdout: fixture(t, "status-forgejo-16.json")},
 			{stdout: checksJSON("failure", "not_required", false, statuses, `[]`)},
 			{stdout: failedLogRunListJSON(testHeadSHA, testActionRun{id: 91, number: 91}, testActionRun{id: 92, number: 92})},
-			{stdout: failedLogRunViewJSON(91, 91, testHeadSHA, []string{fmt.Sprintf(`{"id":501,"run_id":91,"name":"first","status":"failure","log":%q}`, largeLog)})},
-			{stdout: failedLogRunViewJSON(92, 92, testHeadSHA, []string{fmt.Sprintf(`{"id":502,"run_id":92,"name":"second","status":"failure","log":%q}`, largeLog)})},
+			responseFile("run-91.json", failedLogRunViewJSON(91, 91, testHeadSHA, []string{fmt.Sprintf(`{"id":501,"run_id":91,"name":"first","status":"failure","log":%q}`, largeLog)})),
+			responseFile("run-92.json", failedLogRunViewJSON(92, 92, testHeadSHA, []string{fmt.Sprintf(`{"id":502,"run_id":92,"name":"second","status":"failure","log":%q}`, largeLog)})),
 		}}
 		host := newTestHost(recorder)
 		if err := host.Available(context.Background()); err != nil {
