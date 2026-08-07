@@ -381,7 +381,7 @@ func TestStepCLIAvailable_ResolvesExecutableSuffixFromCustomPath(t *testing.T) {
 func TestStepExecutableAvailable_ResolvesRelativePathFromWorkDir(t *testing.T) {
 	t.Parallel()
 
-	workDir := t.TempDir()
+	workDir := fakeCLIBinDir(t)
 	linkTestBinary(t, workDir, "forgejo-axi")
 	name := "." + string(filepath.Separator) + "forgejo-axi"
 	if runtime.GOOS == "windows" {
