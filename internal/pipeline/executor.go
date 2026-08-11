@@ -723,6 +723,8 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 
 	// Execute with possible fix loop
 	for {
+		reviewStartingHeadSHA := run.HeadSHA
+		sctx.ReviewStartingHeadSHA = reviewStartingHeadSHA
 		outcome, err := step.Execute(sctx)
 		roundNum++
 		roundDuration := time.Since(phaseStart).Milliseconds()
@@ -774,7 +776,11 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 		var inserted *db.StepRound
 		var dbErr error
 		if stepName == types.StepReview {
-			inserted, dbErr = e.db.InsertReviewStepRound(sr.ID, roundNum, nextTrigger, findingsPtr, fixSummaryPtr, reviewApprovedHeadSHA, roundDuration)
+			if e.config != nil && e.config.CaptureEvalProvenance {
+				inserted, dbErr = e.db.InsertReviewStepRoundWithProvenance(sr.ID, roundNum, nextTrigger, findingsPtr, fixSummaryPtr, reviewApprovedHeadSHA, reviewStartingHeadSHA, e.config.TrustedConfigSHA, e.config.ReplayGlobalYAML, e.config.ReplayRepoYAML, roundDuration)
+			} else {
+				inserted, dbErr = e.db.InsertReviewStepRound(sr.ID, roundNum, nextTrigger, findingsPtr, fixSummaryPtr, reviewApprovedHeadSHA, roundDuration)
+			}
 		} else {
 			inserted, dbErr = e.db.InsertStepRound(sr.ID, roundNum, nextTrigger, findingsPtr, fixSummaryPtr, roundDuration)
 		}

@@ -28,7 +28,11 @@ func (s *ReviewStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome,
 
 	reviewScope := fmt.Sprintf("branch changes between %s and %s", baseSHA, sctx.Run.HeadSHA)
 	if sctx.Fixing {
-		reviewScope = fmt.Sprintf("current worktree and HEAD changes relative to base commit %s (starting head %s)", baseSHA, sctx.Run.HeadSHA)
+		startingHeadSHA := sctx.ReviewStartingHeadSHA
+		if startingHeadSHA == "" {
+			startingHeadSHA = sctx.Run.HeadSHA
+		}
+		reviewScope = fmt.Sprintf("current worktree and HEAD changes relative to base commit %s (starting head %s)", baseSHA, startingHeadSHA)
 	}
 
 	// Bounded workload size (changed files + net lines) for local telemetry, so
@@ -54,7 +58,7 @@ func (s *ReviewStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome,
 	// not an enforced sandbox - the agent has free shell access - so the pinned
 	// regression tests guard the wording, not the runtime.
 	var fixSummary string
-	if sctx.Fixing {
+	if sctx.Fixing && !sctx.SkipFixExecution {
 		previousFindings := sanitizedPreviousFindingsForPrompt(sctx.PreviousFindings)
 		historySection := executionContextPromptSection() + roundHistoryPromptSection(sctx) + userIntentPromptSection(sctx) + testguidance.Rule
 		fixPrompt := fmt.Sprintf(
@@ -247,6 +251,7 @@ Risk assessment (after listing all findings):
 	result, err := sctx.Agent.Run(ctx, agent.RunOpts{
 		Prompt:     prompt,
 		CWD:        sctx.WorkDir,
+		Env:        sctx.Env,
 		JSONSchema: reviewFindingsSchema,
 		OnChunk:    sctx.LogChunk,
 		Purpose:    "review",
