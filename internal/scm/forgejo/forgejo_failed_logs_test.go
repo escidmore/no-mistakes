@@ -221,7 +221,7 @@ func TestFetchFailedCheckLogsBoundsOutputAndHonorsCancellation(t *testing.T) {
 		recorder := &fakeRecorder{responses: []fakeResponse{
 			{stdout: fixture(t, "status-forgejo-16.json")},
 			{stdout: checksJSON("failure", "not_required", false, statuses, `[]`)},
-			{stdoutBytes: maxForgejoLogOutputBytes + 128*1024},
+			{stdoutBytes: maxForgejoOutputBytes + 128*1024},
 		}}
 		host := newTestHost(recorder)
 		if err := host.Available(context.Background()); err != nil {
@@ -234,7 +234,7 @@ func TestFetchFailedCheckLogsBoundsOutputAndHonorsCancellation(t *testing.T) {
 	})
 
 	t.Run("aggregate log limit", func(t *testing.T) {
-		largeLog := strings.Repeat("x", maxForgejoLogOutputBytes/2)
+		largeLog := strings.Repeat("x", maxForgejoOutputBytes/2)
 		responseFile := func(name, response string) fakeResponse {
 			path := filepath.Join(t.TempDir(), name)
 			if err := os.WriteFile(path, []byte(response), 0o600); err != nil {

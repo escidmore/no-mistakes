@@ -23,8 +23,9 @@ import (
 )
 
 const (
-	defaultExecutable        = "forgejo-axi"
-	maxForgejoLogOutputBytes = 1 << 20
+	defaultExecutable          = "forgejo-axi"
+	maxForgejoOutputBytes      = 1 << 20
+	maxForgejoErrorOutputBytes = 64 << 10
 )
 
 var errForgejoOutputLimit = errors.New("forgejo-axi output exceeded limit")
@@ -69,6 +70,10 @@ func New(opts Options) *Host {
 			return err == nil
 		}
 	}
+	secrets := append([]string(nil), opts.Secrets...)
+	sort.Slice(secrets, func(i, j int) bool {
+		return len(secrets[i]) > len(secrets[j])
+	})
 	return &Host{
 		cmdFactory: opts.CommandFactory,
 		available:  available,
@@ -76,7 +81,7 @@ func New(opts Options) *Host {
 		baseURL:    strings.TrimRight(strings.TrimSpace(opts.BaseURL), "/"),
 		repository: strings.Trim(strings.TrimSpace(opts.Repository), "/"),
 		tokenEnv:   strings.TrimSpace(opts.TokenEnv),
-		secrets:    append([]string(nil), opts.Secrets...),
+		secrets:    secrets,
 	}
 }
 
@@ -415,7 +420,7 @@ func (h *Host) FetchFailedCheckLogs(ctx context.Context, pr *scm.PR, _ string, _
 	sort.Ints(runNumbers)
 
 	var listed runListResponse
-	if err := h.runJSONWithLimit(ctx, "run list", []string{"--repo", h.repository, "--fields", "all"}, &listed, maxForgejoLogOutputBytes); err != nil {
+	if err := h.runJSONWithLimit(ctx, "run list", []string{"--repo", h.repository, "--fields", "all"}, &listed, maxForgejoOutputBytes); err != nil {
 		return "", err
 	}
 	if !listed.PageInfo.Complete {
@@ -449,12 +454,12 @@ func (h *Host) FetchFailedCheckLogs(ctx context.Context, pr *scm.PR, _ string, _
 	}
 
 	var logs strings.Builder
-	remaining := maxForgejoLogOutputBytes
+	remaining := maxForgejoOutputBytes
 	for _, runNumber := range runNumbers {
 		runID := runIDsByNumber[runNumber]
 		var response runViewResponse
 		args := []string{"--repo", h.repository, strconv.Itoa(runID), "--log-failed"}
-		if err := h.runJSONWithLimit(ctx, "run view", args, &response, maxForgejoLogOutputBytes); err != nil {
+		if err := h.runJSONWithLimit(ctx, "run view", args, &response, maxForgejoOutputBytes); err != nil {
 			return "", err
 		}
 		if err := h.validateRunView(response, runID, runNumber, result.SHA); err != nil {
@@ -496,7 +501,7 @@ func (h *Host) FetchFailedCheckLogs(ctx context.Context, pr *scm.PR, _ string, _
 				separator = "\n\n"
 			}
 			if len(separator)+len(block) > remaining {
-				return "", fmt.Errorf("Forgejo failed check logs exceeded %d bytes: %w", maxForgejoLogOutputBytes, errForgejoOutputLimit)
+				return "", fmt.Errorf("Forgejo failed check logs exceeded %d bytes: %w", maxForgejoOutputBytes, errForgejoOutputLimit)
 			}
 			logs.WriteString(separator)
 			logs.WriteString(block)
@@ -800,6 +805,9 @@ func (h *Host) runJSON(ctx context.Context, operation string, operationArgs []st
 }
 
 func (h *Host) runJSONWithLimit(ctx context.Context, operation string, operationArgs []string, dst any, maxStdoutBytes int) error {
+	if maxStdoutBytes <= 0 {
+		maxStdoutBytes = maxForgejoOutputBytes
+	}
 	args := append(strings.Fields(operation), operationArgs...)
 	args = append(args, "--base-url", h.baseURL)
 	if h.tokenEnv != "" {
@@ -813,7 +821,7 @@ func (h *Host) runJSONWithLimit(ctx context.Context, operation string, operation
 	shellenv.ConfigureShellCommand(cmd)
 	var stdout cappedBuffer
 	stdout.limit = maxStdoutBytes
-	var stderr bytes.Buffer
+	stderr := prefixBuffer{limit: maxForgejoErrorOutputBytes}
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	err := shellenv.RunShellCommand(cmd)
@@ -824,7 +832,7 @@ func (h *Host) runJSONWithLimit(ctx context.Context, operation string, operation
 		return fmt.Errorf("forgejo-axi %s output exceeded %d bytes: %w", operation, maxStdoutBytes, errForgejoOutputLimit)
 	}
 	if err != nil {
-		return h.commandError(operation, err, stdout.String(), stderr.String())
+		return h.commandError(operation, err, stdout.String(), stderr.String(h.secrets))
 	}
 	if err := decodeSingleJSON(stdout.Bytes(), dst); err != nil {
 		return fmt.Errorf("forgejo-axi %s returned invalid JSON: %w", operation, err)
@@ -857,6 +865,47 @@ func (b *cappedBuffer) Write(p []byte) (int, error) {
 
 func (b *cappedBuffer) Bytes() []byte  { return b.buf.Bytes() }
 func (b *cappedBuffer) String() string { return b.buf.String() }
+
+type prefixBuffer struct {
+	buf       bytes.Buffer
+	limit     int
+	truncated bool
+}
+
+func (b *prefixBuffer) Write(p []byte) (int, error) {
+	written := len(p)
+	if remaining := b.limit - b.buf.Len(); remaining > 0 {
+		if len(p) > remaining {
+			p = p[:remaining]
+			b.truncated = true
+		}
+		_, _ = b.buf.Write(p)
+	} else if len(p) > 0 {
+		b.truncated = true
+	}
+	return written, nil
+}
+
+func (b *prefixBuffer) String(secrets []string) string {
+	value := b.buf.String()
+	if !b.truncated {
+		return value
+	}
+	trim := 0
+	for _, secret := range secrets {
+		maxPrefix := len(secret) - 1
+		if maxPrefix > len(value) {
+			maxPrefix = len(value)
+		}
+		for length := maxPrefix; length > trim; length-- {
+			if strings.HasSuffix(value, secret[:length]) {
+				trim = length
+				break
+			}
+		}
+	}
+	return value[:len(value)-trim]
+}
 
 func (h *Host) commandError(operation string, commandErr error, stdout, stderr string) error {
 	message := strings.TrimSpace(stdout)
