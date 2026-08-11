@@ -195,6 +195,26 @@ func TestAvailableRejectsIncompleteStatusIdentity(t *testing.T) {
 	}
 }
 
+func TestAvailableRejectsUnprovenCapabilitySources(t *testing.T) {
+	status := fixture(t, "status-forgejo-16.json")
+	for _, source := range []string{"major-version", "other"} {
+		t.Run(source, func(t *testing.T) {
+			response := strings.Replace(status, `"probe":{"source":"swagger","complete":true}`, fmt.Sprintf(`"probe":{"source":%q,"complete":true}`, source), 1)
+			if response == status {
+				t.Fatal("fixture does not contain the Swagger capability probe")
+			}
+			host := newTestHost(&fakeRecorder{responses: []fakeResponse{{stdout: response}}})
+			err := host.Available(context.Background())
+			if err == nil || !strings.Contains(err.Error(), "capability probe") {
+				t.Fatalf("Available() error = %v, want rejected capability probe", err)
+			}
+			if host.Capabilities().FailedCheckLogs {
+				t.Fatal("unproven capability source advertised failed-check logs")
+			}
+		})
+	}
+}
+
 func TestForgejo15KeepsStatusGatingWithoutActionLogs(t *testing.T) {
 	recorder := &fakeRecorder{responses: []fakeResponse{
 		{stdout: fixture(t, "status-forgejo-15.json")},

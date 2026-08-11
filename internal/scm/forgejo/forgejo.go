@@ -118,8 +118,8 @@ func (h *Host) Available(ctx context.Context) error {
 	if h.tokenEnv != "" && *response.Auth.Source != h.tokenEnv {
 		return fmt.Errorf("Forgejo authentication source %q does not match token environment %q", *response.Auth.Source, h.tokenEnv)
 	}
-	if response.Capabilities.Probe.Source == "" || !response.Capabilities.Probe.Complete {
-		return errors.New("Forgejo capability probe was incomplete; refusing to guess from the server version")
+	if response.Capabilities.Probe.Source != "swagger" || !response.Capabilities.Probe.Complete {
+		return errors.New("Forgejo capability probe was not a complete Swagger probe; refusing to guess from the server version")
 	}
 	if !response.Capabilities.PullRequests {
 		return errors.New("Forgejo host does not report pull-request capability")
