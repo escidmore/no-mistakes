@@ -225,7 +225,15 @@ func (m *RunManager) loadRecoveredConfig(ctx context.Context, run *db.Run, repo 
 	}
 	trustedRepoCfg := loadTrustedRepoConfig(ctx, workDir, trustedSHA, run.ID)
 	allowRepoCommands := trustedRepoCfg != nil && trustedRepoCfg.AllowRepoCommands
-	return config.Merge(globalCfg, config.EffectiveRepoConfig(repoCfg, trustedRepoCfg, allowRepoCommands)), nil
+	effectiveRepoCfg := config.EffectiveRepoConfig(repoCfg, trustedRepoCfg, allowRepoCommands)
+	cfg := config.Merge(globalCfg, effectiveRepoCfg)
+	cfg.TrustedConfigSHA = trustedSHA
+	if os.Getenv("NO_MISTAKES_EVAL_CAPTURE_PROVENANCE") == "1" {
+		if err := cfg.EnableEvalProvenance(globalCfg, effectiveRepoCfg); err != nil {
+			return nil, err
+		}
+	}
+	return cfg, nil
 }
 
 func newPipelineAgent(ctx context.Context, cfg *config.Config, lookPath func(string) (string, error)) (agent.Agent, error) {
@@ -862,6 +870,14 @@ func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo
 		slog.Info("repo commands/agent loaded from default branch, not pushed branch", "run_id", run.ID, "branch", branch, "default_branch", repo.DefaultBranch)
 	}
 	cfg := config.Merge(globalCfg, effectiveRepoCfg)
+	cfg.TrustedConfigSHA = trustedSHA
+	if os.Getenv("NO_MISTAKES_EVAL_CAPTURE_PROVENANCE") == "1" {
+		if err := cfg.EnableEvalProvenance(globalCfg, effectiveRepoCfg); err != nil {
+			m.db.UpdateRunError(run.ID, err.Error())
+			trackStartFailure("eval_provenance")
+			return "", err
+		}
+	}
 
 	// Create agent. In demo mode, skip resolution and use a no-op agent.
 	var ag agent.Agent

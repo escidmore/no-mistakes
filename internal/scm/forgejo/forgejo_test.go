@@ -549,14 +549,14 @@ func TestCommandFailuresAreActionableAndRedacted(t *testing.T) {
 			t.Fatalf("Available() error = %v, want actionable missing executable", err)
 		}
 	})
-	t.Run("nonzero JSON error redacts token", func(t *testing.T) {
+	t.Run("nonzero JSON error redacts overlapping tokens", func(t *testing.T) {
 		recorder := &fakeRecorder{responses: []fakeResponse{{
 			stdout: `{"error":"request failed with secret-token","code":"HTTP_ERROR","details":{"url":"https://user:pass@forge.example/path?token=secret-token"},"help":["check secret-token"]}`,
 			code:   1,
 		}}}
 		host := newTestHost(recorder)
 		_, err := host.FindPR(context.Background(), "feature/forgejo", "main")
-		if err == nil || !strings.Contains(err.Error(), "HTTP_ERROR") || strings.Contains(err.Error(), "secret-token") || strings.Contains(err.Error(), "user:pass") {
+		if err == nil || !strings.Contains(err.Error(), "HTTP_ERROR") || strings.Contains(err.Error(), "secret-token") || strings.Contains(err.Error(), "-token") || strings.Contains(err.Error(), "user:pass") {
 			t.Fatalf("FindPR() error = %v, want code with secrets redacted", err)
 		}
 	})
@@ -565,6 +565,30 @@ func TestCommandFailuresAreActionableAndRedacted(t *testing.T) {
 		_, err := host.FindPR(context.Background(), "feature/forgejo", "main")
 		if err == nil || !strings.Contains(err.Error(), "invalid JSON") {
 			t.Fatalf("FindPR() error = %v, want invalid JSON", err)
+		}
+	})
+	t.Run("oversized JSON output", func(t *testing.T) {
+		host := newTestHost(&fakeRecorder{responses: []fakeResponse{{stdoutBytes: maxForgejoOutputBytes + 1}}})
+		_, err := host.FindPR(context.Background(), "feature/forgejo", "main")
+		if err == nil || !strings.Contains(err.Error(), "output exceeded 1048576 bytes") {
+			t.Fatalf("FindPR() error = %v, want bounded-output error", err)
+		}
+	})
+	t.Run("oversized stderr", func(t *testing.T) {
+		const prefix = "useful prefix: "
+		const partialSecret = "secret"
+		stderr := prefix + strings.Repeat("x", maxForgejoErrorOutputBytes-len(prefix)-len(partialSecret)) + "secret-token"
+		stderrFile := filepath.Join(t.TempDir(), "stderr.txt")
+		if err := os.WriteFile(stderrFile, []byte(stderr), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		host := newTestHost(&fakeRecorder{responses: []fakeResponse{{stderrFile: stderrFile, code: 1}}})
+		_, err := host.FindPR(context.Background(), "feature/forgejo", "main")
+		if err == nil {
+			t.Fatal("FindPR() error = nil, want bounded stderr prefix")
+		}
+		if message := err.Error(); !strings.Contains(message, prefix) || strings.Contains(message, partialSecret) || len(message) > maxForgejoErrorOutputBytes+256 {
+			t.Fatalf("FindPR() error length = %d, want bounded stderr prefix", len(message))
 		}
 	})
 }
@@ -641,8 +665,10 @@ func fixture(t *testing.T, name string) string {
 
 type fakeResponse struct {
 	stdout      string
+	stdoutFile  string
 	stdoutBytes int
 	stderr      string
+	stderrFile  string
 	code        int
 	sleep       time.Duration
 }
@@ -668,8 +694,10 @@ func (r *fakeRecorder) factory(ctx context.Context, name string, args ...string)
 	cmd.Env = append(os.Environ(),
 		"FORGEJO_TEST_HELPER=1",
 		"FORGEJO_TEST_STDOUT="+response.stdout,
+		"FORGEJO_TEST_STDOUT_FILE="+response.stdoutFile,
 		fmt.Sprintf("FORGEJO_TEST_STDOUT_BYTES=%d", response.stdoutBytes),
 		"FORGEJO_TEST_STDERR="+response.stderr,
+		"FORGEJO_TEST_STDERR_FILE="+response.stderrFile,
 		fmt.Sprintf("FORGEJO_TEST_EXIT_CODE=%d", response.code),
 		fmt.Sprintf("FORGEJO_TEST_SLEEP=%d", response.sleep.Milliseconds()),
 	)
@@ -699,10 +727,26 @@ func TestForgejoAXIHelperProcess(t *testing.T) {
 			}
 			count -= write
 		}
+	} else if path := os.Getenv("FORGEJO_TEST_STDOUT_FILE"); path != "" {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			_, _ = fmt.Fprint(os.Stderr, err)
+			os.Exit(1)
+		}
+		_, _ = os.Stdout.Write(data)
 	} else {
 		_, _ = fmt.Fprint(os.Stdout, os.Getenv("FORGEJO_TEST_STDOUT"))
 	}
-	_, _ = fmt.Fprint(os.Stderr, os.Getenv("FORGEJO_TEST_STDERR"))
+	if path := os.Getenv("FORGEJO_TEST_STDERR_FILE"); path != "" {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			_, _ = fmt.Fprint(os.Stderr, err)
+			os.Exit(1)
+		}
+		_, _ = os.Stderr.Write(data)
+	} else {
+		_, _ = fmt.Fprint(os.Stderr, os.Getenv("FORGEJO_TEST_STDERR"))
+	}
 	if os.Getenv("FORGEJO_TEST_EXIT_CODE") != "0" {
 		os.Exit(1)
 	}
@@ -721,7 +765,7 @@ func newTestHostWithOptions(recorder *fakeRecorder, available func(string) bool)
 		BaseURL:        testBaseURL,
 		Repository:     testRepo,
 		TokenEnv:       "FORGEJO_TEST_TOKEN",
-		Secrets:        []string{"secret-token", "pass"},
+		Secrets:        []string{"secret", "secret-token", "pass"},
 	})
 }
 
