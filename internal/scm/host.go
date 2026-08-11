@@ -162,16 +162,9 @@ func (c Check) Pending() bool { return c.Bucket == CheckBucketPending }
 // Capabilities declares which optional Host methods return meaningful data.
 // Callers must consult Capabilities before invoking optional methods.
 type Capabilities struct {
-	MergeableState    bool
-	FailedCheckLogs   bool
-	MergedProof       bool
-	PullRequests      bool
-	CommitStatuses    bool
-	BranchProtection  bool
-	ExpectedHeadMerge bool
-	ActionsJobLogs    bool
-	ActionsRuns       bool
-	ActionsRunJobs    bool
+	MergeableState  bool
+	FailedCheckLogs bool
+	MergedProof     bool
 }
 
 var (

@@ -44,14 +44,15 @@ type Options struct {
 
 // Host maps no-mistakes SCM operations to forgejo-axi --json commands.
 type Host struct {
-	cmdFactory   CmdFactory
-	available    func(string) bool
-	executable   string
-	baseURL      string
-	repository   string
-	tokenEnv     string
-	secrets      []string
-	capabilities scm.Capabilities
+	cmdFactory                CmdFactory
+	available                 func(string) bool
+	executable                string
+	baseURL                   string
+	repository                string
+	tokenEnv                  string
+	secrets                   []string
+	capabilities              scm.Capabilities
+	commitStatusesUnavailable bool
 }
 
 // New constructs a Forgejo host. Callers should resolve the remote with
@@ -124,16 +125,10 @@ func (h *Host) Available(ctx context.Context) error {
 	if !response.Capabilities.PullRequests {
 		return errors.New("Forgejo host does not report pull-request capability")
 	}
+	h.commitStatusesUnavailable = !response.Capabilities.CommitStatuses
 	h.capabilities = scm.Capabilities{
-		MergeableState:    response.Capabilities.CommitStatuses && response.Capabilities.BranchProtection,
-		MergedProof:       true,
-		PullRequests:      response.Capabilities.PullRequests,
-		CommitStatuses:    response.Capabilities.CommitStatuses,
-		BranchProtection:  response.Capabilities.BranchProtection,
-		ExpectedHeadMerge: response.Capabilities.ExpectedHeadMerge,
-		ActionsJobLogs:    response.Capabilities.ActionsJobLogs,
-		ActionsRuns:       response.Capabilities.Runs,
-		ActionsRunJobs:    response.Capabilities.RunJobs,
+		MergeableState: response.Capabilities.CommitStatuses && response.Capabilities.BranchProtection,
+		MergedProof:    true,
 		// Check gating depends only on commit statuses. Failed logs are optional
 		// and require every released run-view route independently.
 		FailedCheckLogs: response.Capabilities.CommitStatuses &&
@@ -269,7 +264,7 @@ func (h *Host) readChecks(ctx context.Context, pr *scm.PR) (checksResult, error)
 	if err != nil {
 		return checksResult{}, err
 	}
-	if h.capabilities.PullRequests && !h.capabilities.CommitStatuses {
+	if h.commitStatusesUnavailable {
 		return checksResult{}, fmt.Errorf("Forgejo commit-status capability unavailable: %w", scm.ErrUnsupported)
 	}
 	var response struct {

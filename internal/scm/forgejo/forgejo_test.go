@@ -145,7 +145,7 @@ func TestAvailableUsesConfiguredExecutableAndRuntimeCapabilities(t *testing.T) {
 		t.Fatalf("command = %#v, want name custom and args %#v", got, wantArgs)
 	}
 	caps := host.Capabilities()
-	if !caps.MergeableState || !caps.MergedProof || !caps.ExpectedHeadMerge || !caps.ActionsJobLogs || !caps.ActionsRuns || !caps.ActionsRunJobs || !caps.FailedCheckLogs {
+	if !caps.MergeableState || !caps.MergedProof || !caps.FailedCheckLogs {
 		t.Fatalf("Capabilities() = %+v, want Forgejo 16 capabilities including failed logs", caps)
 	}
 }
@@ -227,8 +227,8 @@ func TestForgejo15KeepsStatusGatingWithoutActionLogs(t *testing.T) {
 		t.Fatalf("Available() error = %v", err)
 	}
 	caps := host.Capabilities()
-	if !caps.ActionsRuns || caps.ActionsRunJobs || caps.ActionsJobLogs || caps.FailedCheckLogs || !caps.CommitStatuses {
-		t.Fatalf("Capabilities() = %+v, want statuses and run listing independent from unavailable run jobs/logs", caps)
+	if !caps.MergeableState || !caps.MergedProof || caps.FailedCheckLogs {
+		t.Fatalf("Capabilities() = %+v, want mergeability and merged proof with independently unsupported logs", caps)
 	}
 	checks, err := host.GetChecks(context.Background(), testPR())
 	if err != nil {
