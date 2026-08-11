@@ -8,10 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/url"
 	"os/exec"
-	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -1091,14 +1089,14 @@ func ResolveRemote(remote, configuredBase, resolvedSSHHost string) (string, stri
 	}
 	remotePath = stripPullURLSuffix(remotePath)
 	if configuredBase != "" {
-		base, baseURL, err := normalizeBaseURL(configuredBase)
+		base, baseURL, err := scm.NormalizeForgejoBaseURL(configuredBase)
 		if err != nil {
 			return "", "", err
 		}
 		if remoteScheme == "http" || remoteScheme == "https" {
 			remoteURL, parseErr := url.Parse(strings.TrimSpace(remote))
 			if parseErr == nil {
-				_, remoteURL, parseErr = normalizeBaseURL((&url.URL{Scheme: remoteURL.Scheme, Host: remoteURL.Host}).String())
+				_, remoteURL, parseErr = scm.NormalizeForgejoBaseURL((&url.URL{Scheme: remoteURL.Scheme, Host: remoteURL.Host}).String())
 			}
 			if parseErr != nil || remoteURL.Host != baseURL.Host {
 				return "", "", fmt.Errorf("remote host %q does not match configured Forgejo host %q", remoteHost, baseURL.Host)
@@ -1139,43 +1137,11 @@ func ResolveRemote(remote, configuredBase, resolvedSSHHost string) (string, stri
 	remoteURL.Fragment = ""
 	remoteURL.Path = "/" + strings.Join(parts[:len(parts)-2], "/")
 	remoteURL.RawPath = ""
-	base, _, err := normalizeBaseURL(remoteURL.String())
+	base, _, err := scm.NormalizeForgejoBaseURL(remoteURL.String())
 	if err != nil {
 		return "", "", err
 	}
 	return base, repo, nil
-}
-
-func normalizeBaseURL(raw string) (string, *url.URL, error) {
-	parsed, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil {
-		return "", nil, fmt.Errorf("invalid Forgejo base URL %q", raw)
-	}
-	parsed.Scheme = strings.ToLower(parsed.Scheme)
-	hostname := strings.ToLower(parsed.Hostname())
-	if (parsed.Scheme != "http" && parsed.Scheme != "https") || hostname == "" {
-		return "", nil, fmt.Errorf("invalid Forgejo base URL %q", raw)
-	}
-	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
-		return "", nil, errors.New("Forgejo base URL must not contain credentials, a query, or a fragment")
-	}
-	port := parsed.Port()
-	if (parsed.Scheme == "http" && port == "80") || (parsed.Scheme == "https" && port == "443") {
-		port = ""
-	}
-	if port != "" {
-		parsed.Host = net.JoinHostPort(hostname, port)
-	} else if strings.Contains(hostname, ":") {
-		parsed.Host = "[" + hostname + "]"
-	} else {
-		parsed.Host = hostname
-	}
-	parsed.Path = strings.TrimRight(path.Clean("/"+strings.Trim(parsed.Path, "/")), "/")
-	if parsed.Path == "." || parsed.Path == "/" {
-		parsed.Path = ""
-	}
-	parsed.RawPath = ""
-	return strings.TrimRight(parsed.String(), "/"), parsed, nil
 }
 
 func parseRemote(remote string) (host, remotePath, scheme string, err error) {
@@ -1192,7 +1158,7 @@ func parseRemote(remote string) (host, remotePath, scheme string, err error) {
 			return "", "", "", errors.New("Forgejo remote URL must not contain a query or fragment")
 		}
 		scheme := strings.ToLower(parsed.Scheme)
-		if scheme != "http" && scheme != "https" && scheme != "ssh" {
+		if !scm.ForgejoRemoteSchemeSupported(scheme) {
 			return "", "", "", fmt.Errorf("unsupported Forgejo remote URL scheme %q", parsed.Scheme)
 		}
 		return strings.ToLower(parsed.Hostname()), parsed.Path, scheme, nil

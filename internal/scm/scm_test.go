@@ -171,6 +171,43 @@ func TestDetectProvider_ConfiguredForgejoBaseSupportsSelfHostedPrefixesAndPorts(
 	}
 }
 
+func TestDetectProvider_ConfiguredForgejoBaseUsesAdapterURLRules(t *testing.T) {
+	t.Setenv("GLAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("GH_CONFIG_DIR", t.TempDir())
+
+	for _, tt := range []struct {
+		name   string
+		base   string
+		remote string
+		want   Provider
+	}{
+		{
+			name:   "canonical path",
+			base:   "https://code.example/scm/../forgejo",
+			remote: "https://code.example/forgejo/octo/widgets.git",
+			want:   ProviderForgejo,
+		},
+		{
+			name:   "unsupported base scheme",
+			base:   "ftp://code.example/forgejo",
+			remote: "ftp://code.example/forgejo/octo/widgets.git",
+			want:   ProviderUnknown,
+		},
+		{
+			name:   "unsupported remote scheme",
+			base:   "https://code.example/forgejo",
+			remote: "ftp://code.example/forgejo/octo/widgets.git",
+			want:   ProviderUnknown,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := DetectProviderWithForgejoBaseURL(tt.remote, tt.base); got != tt.want {
+				t.Fatalf("DetectProviderWithForgejoBaseURL() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestDetectProvider_ForgejoConfigDoesNotOverrideKnownProviders(t *testing.T) {
 	t.Setenv("GLAB_CONFIG_DIR", t.TempDir())
 	t.Setenv("GH_CONFIG_DIR", t.TempDir())

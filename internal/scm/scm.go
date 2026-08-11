@@ -2,10 +2,13 @@ package scm
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net"
 	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -181,8 +184,8 @@ func lookupSSHHostname(ctx context.Context, alias string) (string, error) {
 }
 
 func forgejoBaseMatchesRemote(baseRaw, remoteRaw string) bool {
-	base, err := url.Parse(strings.TrimSpace(baseRaw))
-	if err != nil || (base.Scheme != "http" && base.Scheme != "https") || base.Host == "" || base.User != nil || base.RawQuery != "" || base.Fragment != "" {
+	_, base, err := NormalizeForgejoBaseURL(baseRaw)
+	if err != nil {
 		return false
 	}
 	remoteHost, remotePath, remoteScheme, ok := providerRemoteParts(remoteRaw)
@@ -217,8 +220,8 @@ func normalizedHTTPAuthority(scheme, authority string) string {
 }
 
 func forgejoBaseMatchesResolvedRemote(baseRaw, remoteRaw, resolvedHost string) bool {
-	base, err := url.Parse(strings.TrimSpace(baseRaw))
-	if err != nil || (base.Scheme != "http" && base.Scheme != "https") || base.Host == "" || base.User != nil || base.RawQuery != "" || base.Fragment != "" {
+	_, base, err := NormalizeForgejoBaseURL(baseRaw)
+	if err != nil {
 		return false
 	}
 	if !strings.EqualFold(stripPort(resolvedHost), base.Hostname()) {
@@ -256,7 +259,11 @@ func providerRemoteParts(raw string) (host, remotePath, scheme string, ok bool) 
 		if err != nil || parsed.Host == "" || parsed.RawQuery != "" || parsed.Fragment != "" {
 			return "", "", "", false
 		}
-		return parsed.Host, parsed.Path, strings.ToLower(parsed.Scheme), true
+		scheme = strings.ToLower(parsed.Scheme)
+		if !ForgejoRemoteSchemeSupported(scheme) {
+			return "", "", "", false
+		}
+		return parsed.Host, parsed.Path, scheme, true
 	}
 	colon := strings.Index(raw, ":")
 	if colon <= 0 {
@@ -276,6 +283,47 @@ func providerPathParts(raw string) []string {
 		return nil
 	}
 	return strings.Split(raw, "/")
+}
+
+func NormalizeForgejoBaseURL(raw string) (string, *url.URL, error) {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return "", nil, fmt.Errorf("invalid Forgejo base URL %q", raw)
+	}
+	parsed.Scheme = strings.ToLower(parsed.Scheme)
+	hostname := strings.ToLower(parsed.Hostname())
+	if (parsed.Scheme != "http" && parsed.Scheme != "https") || hostname == "" {
+		return "", nil, fmt.Errorf("invalid Forgejo base URL %q", raw)
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", nil, errors.New("Forgejo base URL must not contain credentials, a query, or a fragment")
+	}
+	port := parsed.Port()
+	if (parsed.Scheme == "http" && port == "80") || (parsed.Scheme == "https" && port == "443") {
+		port = ""
+	}
+	if port != "" {
+		parsed.Host = net.JoinHostPort(hostname, port)
+	} else if strings.Contains(hostname, ":") {
+		parsed.Host = "[" + hostname + "]"
+	} else {
+		parsed.Host = hostname
+	}
+	parsed.Path = strings.TrimRight(path.Clean("/"+strings.Trim(parsed.Path, "/")), "/")
+	if parsed.Path == "." || parsed.Path == "/" {
+		parsed.Path = ""
+	}
+	parsed.RawPath = ""
+	return strings.TrimRight(parsed.String(), "/"), parsed, nil
+}
+
+func ForgejoRemoteSchemeSupported(scheme string) bool {
+	switch strings.ToLower(scheme) {
+	case "http", "https", "ssh":
+		return true
+	default:
+		return false
+	}
 }
 
 // glabKnowsHost reports whether host appears in glab's configured hosts map,
