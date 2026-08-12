@@ -1,6 +1,7 @@
 package eval
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -64,6 +66,17 @@ CREATE TABLE IF NOT EXISTS cases (
     verdict_should_park INTEGER NOT NULL,
     path TEXT NOT NULL UNIQUE
 );
+CREATE TABLE IF NOT EXISTS pending_case_deletions (
+    id TEXT PRIMARY KEY,
+    path TEXT NOT NULL,
+    repo_fingerprint TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS replay_case_reservations (
+    session_id TEXT NOT NULL,
+    case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE RESTRICT,
+    reserved_until INTEGER NOT NULL,
+    PRIMARY KEY (session_id, case_id)
+);
 CREATE TABLE IF NOT EXISTS evaluations (
     id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL,
@@ -87,6 +100,15 @@ CREATE INDEX IF NOT EXISTS idx_eval_evaluations_case ON evaluations(case_id, com
 `)
 	if err != nil {
 		return fmt.Errorf("migrate eval registry: %w", err)
+	}
+	var reservationLeaseColumn int
+	if err := s.db.QueryRow(`SELECT count(*) FROM pragma_table_info('replay_case_reservations') WHERE name = 'reserved_until'`).Scan(&reservationLeaseColumn); err != nil {
+		return fmt.Errorf("inspect eval replay reservation schema: %w", err)
+	}
+	if reservationLeaseColumn == 0 {
+		if _, err := s.db.Exec(`ALTER TABLE replay_case_reservations ADD COLUMN reserved_until INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("migrate eval replay reservations: %w", err)
+		}
 	}
 	return nil
 }
@@ -187,13 +209,131 @@ func (s *Store) ListCases(set string) ([]Case, error) {
 	}
 }
 
+// Prune bounds the corpus at maxCases by dropping the oldest cases first, and
+// reports how many it removed. A maxCases of 0 or less keeps every case.
+//
+// It never removes a case reserved by a replay session or one that already has
+// recorded candidate replays: those evaluations are the result of tokens
+// somebody spent, and a cohort in an eval report pins the exact case IDs it
+// compared, so reclaiming one would silently invalidate a published comparison.
+// When protected cases alone exceed the cap the corpus stays over it rather than
+// deleting that evidence - the cap is a retention target, not a promise to
+// reach a number.
+func (s *Store) Prune(ctx context.Context, maxCases int) (int, error) {
+	if s == nil || s.db == nil {
+		return 0, fmt.Errorf("eval registry is closed")
+	}
+	unlock, err := lockCorpus(ctx, s.root)
+	if err != nil {
+		return 0, err
+	}
+	defer unlock()
+
+	if err := s.cleanupPendingCaseDeletions(ctx); err != nil {
+		return 0, err
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM replay_case_reservations WHERE reserved_until <= ?`, time.Now().Unix()); err != nil {
+		return 0, fmt.Errorf("release abandoned eval replay reservations: %w", err)
+	}
+	if maxCases <= 0 {
+		return 0, nil
+	}
+	var total int
+	if err := s.db.QueryRow(`SELECT count(*) FROM cases`).Scan(&total); err != nil {
+		return 0, fmt.Errorf("count eval cases: %w", err)
+	}
+	excess := total - maxCases
+	if excess <= 0 {
+		return 0, nil
+	}
+	rows, err := s.db.Query(`SELECT c.id, c.path, c.repo_fingerprint FROM cases c
+WHERE NOT EXISTS (SELECT 1 FROM evaluations e WHERE e.case_id = c.id)
+  AND NOT EXISTS (SELECT 1 FROM replay_case_reservations r WHERE r.case_id = c.id AND r.reserved_until > ?)
+ORDER BY c.captured_at, c.id LIMIT ?`, time.Now().Unix(), excess)
+	if err != nil {
+		return 0, fmt.Errorf("select prunable eval cases: %w", err)
+	}
+	type victim struct{ id, dir, fingerprint string }
+	var victims []victim
+	for rows.Next() {
+		var v victim
+		if err := rows.Scan(&v.id, &v.dir, &v.fingerprint); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("scan prunable eval case: %w", err)
+		}
+		victims = append(victims, v)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, fmt.Errorf("select prunable eval cases: %w", err)
+	}
+	rows.Close()
+
+	pruned := 0
+	for _, v := range victims {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return pruned, fmt.Errorf("begin eval case prune: %w", err)
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT OR REPLACE INTO pending_case_deletions (id, path, repo_fingerprint) VALUES (?, ?, ?)`, v.id, v.dir, v.fingerprint); err == nil {
+			_, err = tx.ExecContext(ctx, `DELETE FROM cases WHERE id = ?`, v.id)
+		}
+		if err != nil {
+			_ = tx.Rollback()
+			return pruned, fmt.Errorf("stage eval case %q deletion: %w", v.id, err)
+		}
+		if err := tx.Commit(); err != nil {
+			return pruned, fmt.Errorf("commit eval case %q deletion: %w", v.id, err)
+		}
+		pruned++
+	}
+	if err := s.cleanupPendingCaseDeletions(ctx); err != nil {
+		return pruned, err
+	}
+	return pruned, nil
+}
+
+func (s *Store) cleanupPendingCaseDeletions(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, path, repo_fingerprint FROM pending_case_deletions ORDER BY id`)
+	if err != nil {
+		return fmt.Errorf("list pending eval case deletions: %w", err)
+	}
+	type pending struct{ id, dir, fingerprint string }
+	var items []pending
+	for rows.Next() {
+		var item pending
+		if err := rows.Scan(&item.id, &item.dir, &item.fingerprint); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan pending eval case deletion: %w", err)
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("list pending eval case deletions: %w", err)
+	}
+	rows.Close()
+	for _, item := range items {
+		if err := dropCaseObjects(ctx, s.poolDir(item.fingerprint), item.id); err != nil {
+			return err
+		}
+		if err := os.RemoveAll(item.dir); err != nil {
+			return fmt.Errorf("remove eval case %q: %w", item.id, err)
+		}
+		if _, err := s.db.ExecContext(ctx, `DELETE FROM pending_case_deletions WHERE id = ?`, item.id); err != nil {
+			return fmt.Errorf("finish eval case %q deletion: %w", item.id, err)
+		}
+	}
+	return nil
+}
+
 func loadCase(dir string) (Case, error) {
 	var manifest Manifest
 	if err := readJSON(filepath.Join(dir, "manifest.json"), &manifest); err != nil {
 		return Case{}, err
 	}
 	if manifest.Version != manifestVersion {
-		return Case{}, fmt.Errorf("unsupported case manifest version %d", manifest.Version)
+		return Case{}, fmt.Errorf("unsupported case manifest version %d (captured by an older no-mistakes whose case format is no longer readable; remove the eval directory to start a fresh corpus, which now refills itself)", manifest.Version)
 	}
 	var labels Labels
 	if err := readJSON(filepath.Join(dir, "labels.json"), &labels); err != nil {

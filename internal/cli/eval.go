@@ -8,14 +8,14 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// newEvalCmd deliberately does not call trackCommand. Eval case bundles and
-// candidate results are local code data, so this opt-in surface has no remote
-// telemetry event and no dependency on the daemon.
+// newEvalCmd deliberately does not call trackCommand. Eval cases and candidate
+// results are local code data, so this command surface has no remote telemetry
+// event and does not use the daemon.
 func newEvalCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "eval",
-		Short: "Capture and locally replay review evaluation cases",
-		Long:  "Capture review passes and compare agent+model candidates using local-only case bundles. Eval never starts or uses the shared daemon.",
+		Short: "Inspect and locally replay review evaluation cases",
+		Long:  "Inspect automatically collected review cases, capture runs on demand, and compare agent+model candidates. Eval never starts or uses the shared daemon.",
 		Args:  cobra.NoArgs,
 	}
 	cmd.AddCommand(newEvalCaptureCmd())
@@ -28,7 +28,7 @@ func newEvalCmd() *cobra.Command {
 func newEvalCaptureCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "capture <run>",
-		Short: "Capture every review pass from a run into local portable cases",
+		Short: "Capture every review pass from a run into local cases",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			p, database, err := openResources()

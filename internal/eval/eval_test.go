@@ -3,6 +3,7 @@ package eval
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -41,8 +42,15 @@ func TestCaptureCreatesPortableReviewCaseWithoutRecordingRemoteURL(t *testing.T)
 	if !captured.Labels.Verdict.Known || !captured.Labels.Verdict.ShouldPark {
 		t.Fatalf("verdict label = %#v, want recorded user-fix park label", captured.Labels.Verdict)
 	}
-	if _, err := os.Stat(filepath.Join(captured.Dir, "branch.bundle")); err != nil {
-		t.Fatalf("case bundle missing: %v", err)
+	restored := filepath.Join(t.TempDir(), "restore.git")
+	if err := git.InitBare(ctx, restored); err != nil {
+		t.Fatal(err)
+	}
+	if err := restoreCaseObjects(ctx, store.poolDir(captured.RepoFingerprint), restored, captured.ID); err != nil {
+		t.Fatalf("case objects are not restorable: %v", err)
+	}
+	if got := mustGit(t, ctx, restored, "rev-parse", captured.ReviewedHeadSHA+"^{commit}"); got != captured.ReviewedHeadSHA {
+		t.Fatalf("restored reviewed commit = %q, want %q", got, captured.ReviewedHeadSHA)
 	}
 
 	manifestBytes, err := os.ReadFile(filepath.Join(captured.Dir, "manifest.json"))
@@ -98,6 +106,33 @@ func TestCaptureRejectsReviewRoundBeforeGateDecision(t *testing.T) {
 	}
 	if len(cases) != 0 {
 		t.Fatalf("premature capture registered %d cases", len(cases))
+	}
+}
+
+func TestCaptureExplainsMissingConfigurationProvenance(t *testing.T) {
+	ctx := context.Background()
+	p, sourceDB, run, _, _ := setupCapturedRun(t, ctx)
+	defer sourceDB.Close()
+	steps, err := sourceDB.GetStepsByRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clean := `{"findings":[],"risk_level":"low","risk_rationale":"clean","risk_scope":"source-or-external"}`
+	if _, err := sourceDB.InsertReviewStepRound(steps[0].ID, 2, "legacy", &clean, nil, run.HeadSHA, 10); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := Open(p.EvalDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	_, err = Capture(ctx, store, p, sourceDB, run.ID)
+	if !errors.Is(err, ErrNoCapturableReview) {
+		t.Fatalf("capture error = %v, want ErrNoCapturableReview", err)
+	}
+	if !strings.Contains(err.Error(), "eval.capture_provenance was off") {
+		t.Fatalf("capture error = %q, want the disabled setting named as the likely cause", err)
 	}
 }
 
@@ -217,6 +252,13 @@ func TestReplayRestoresCaseIntoAnIsolatedWorktree(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(p.Root(), "shared-home-used")); !os.IsNotExist(err) {
 		t.Fatalf("candidate used production NM_HOME: %v", err)
+	}
+	var reservations int
+	if err := store.db.QueryRow(`SELECT count(*) FROM replay_case_reservations WHERE session_id = ?`, session.ID).Scan(&reservations); err != nil {
+		t.Fatal(err)
+	}
+	if reservations != 0 {
+		t.Fatalf("completed replay retained %d case reservations", reservations)
 	}
 }
 
@@ -417,6 +459,15 @@ func TestParseCandidateRequiresAgentAndModel(t *testing.T) {
 
 func setupCapturedRun(t *testing.T, ctx context.Context) (*paths.Paths, *db.DB, *db.Run, *db.Repo, *db.StepRound) {
 	t.Helper()
+	return setupCapturedRunWithHistory(t, ctx, 0)
+}
+
+// setupCapturedRunWithHistory builds the fixture run. padCommits adds that many
+// commits of incompressible content to the default branch BEFORE the reviewed
+// branch is cut, so the padding is real ancestry of every commit a case pins -
+// which is what makes duplicated history measurable.
+func setupCapturedRunWithHistory(t *testing.T, ctx context.Context, padCommits int) (*paths.Paths, *db.DB, *db.Run, *db.Repo, *db.StepRound) {
+	t.Helper()
 	root := t.TempDir()
 	p := paths.WithRoot(root)
 	if err := p.EnsureDirs(); err != nil {
@@ -444,6 +495,7 @@ func setupCapturedRun(t *testing.T, ctx context.Context) (*paths.Paths, *db.DB, 
 	mustGit(t, ctx, workDir, "add", ".")
 	mustGit(t, ctx, workDir, "commit", "-m", "base")
 	mustGit(t, ctx, workDir, "branch", "-M", "main")
+	padHistory(t, ctx, workDir, padCommits)
 	mustGit(t, ctx, workDir, "push", "origin", "main")
 	baseSHA := mustGit(t, ctx, workDir, "rev-parse", "HEAD")
 	mustGit(t, ctx, workDir, "checkout", "-b", "feature/eval")

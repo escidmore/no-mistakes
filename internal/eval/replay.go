@@ -43,6 +43,11 @@ type Session struct {
 	Cohort    string    `json:"cohort"`
 }
 
+const (
+	replayReservationLease   = 5 * time.Minute
+	replayReservationRefresh = time.Minute
+)
+
 // Replay runs exactly the captured review pass. It does not start a daemon or
 // use the production NM_HOME: every case is restored into a fresh temp gate and
 // worktree. Push, PR, CI, and all fix loops are intentionally absent from the
@@ -54,34 +59,26 @@ func Replay(ctx context.Context, store *Store, opts ReplayOptions) (Session, []E
 	if opts.Repeats <= 0 {
 		return Session{}, nil, fmt.Errorf("repeats must be at least 1")
 	}
-	cases, err := store.ListCases(opts.Set)
-	if err != nil {
-		return Session{}, nil, err
-	}
-	if len(cases) == 0 {
-		return Session{}, nil, fmt.Errorf("case set %q is empty", opts.Set)
-	}
 	if _, err := candidateModelArgs(opts.Candidate); err != nil {
 		return Session{}, nil, err
 	}
-	session := Session{ID: newSessionID(), StartedAt: time.Now().UTC(), Set: opts.Set, Candidate: opts.Candidate.String(), Repeats: opts.Repeats}
-	for _, c := range cases {
-		session.CaseIDs = append(session.CaseIDs, c.ID)
+	cases, session, err := store.prepareReplay(ctx, opts)
+	if err != nil {
+		return Session{}, nil, err
 	}
-	session.Cohort = cohortID(session.CaseIDs, session.Repeats)
-	sessionsDir := filepath.Join(store.root, "sessions")
-	if err := os.MkdirAll(sessionsDir, 0o755); err != nil {
-		return Session{}, nil, fmt.Errorf("create eval sessions directory: %w", err)
-	}
-	if err := writeJSON(filepath.Join(sessionsDir, session.ID+".json"), session); err != nil {
-		return Session{}, nil, fmt.Errorf("write eval session: %w", err)
-	}
+	replayCtx, cancelReplay := context.WithCancel(ctx)
+	stopReservation := store.keepReplayReservation(replayCtx, cancelReplay, session.ID)
+	defer func() {
+		cancelReplay()
+		stopReservation()
+		store.releaseReplayReservation(session.ID)
+	}()
 
 	evaluations := make([]Evaluation, 0, len(cases)*opts.Repeats)
 	var failed int
 	for repeat := 1; repeat <= opts.Repeats; repeat++ {
 		for _, c := range cases {
-			evaluation := replayOne(ctx, c, session, opts.Candidate, repeat)
+			evaluation := replayOne(replayCtx, store, c, session, opts.Candidate, repeat)
 			if evaluation.Status != "completed" {
 				failed++
 			}
@@ -97,7 +94,85 @@ func Replay(ctx context.Context, store *Store, opts ReplayOptions) (Session, []E
 	return session, evaluations, nil
 }
 
-func replayOne(ctx context.Context, c Case, session Session, candidate Candidate, repeat int) Evaluation {
+func (s *Store) prepareReplay(ctx context.Context, opts ReplayOptions) ([]Case, Session, error) {
+	unlock, err := lockCorpus(ctx, s.root)
+	if err != nil {
+		return nil, Session{}, err
+	}
+	defer unlock()
+
+	cases, err := s.ListCases(opts.Set)
+	if err != nil {
+		return nil, Session{}, err
+	}
+	if len(cases) == 0 {
+		return nil, Session{}, fmt.Errorf("case set %q is empty", opts.Set)
+	}
+	session := Session{ID: newSessionID(), StartedAt: time.Now().UTC(), Set: opts.Set, Candidate: opts.Candidate.String(), Repeats: opts.Repeats}
+	for _, c := range cases {
+		session.CaseIDs = append(session.CaseIDs, c.ID)
+	}
+	session.Cohort = cohortID(session.CaseIDs, session.Repeats)
+	sessionsDir := filepath.Join(s.root, "sessions")
+	if err := os.MkdirAll(sessionsDir, 0o755); err != nil {
+		return nil, Session{}, fmt.Errorf("create eval sessions directory: %w", err)
+	}
+	sessionPath := filepath.Join(sessionsDir, session.ID+".json")
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, Session{}, fmt.Errorf("begin eval replay reservation: %w", err)
+	}
+	reservedUntil := time.Now().Add(replayReservationLease).Unix()
+	for _, c := range cases {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO replay_case_reservations (session_id, case_id, reserved_until) VALUES (?, ?, ?)`, session.ID, c.ID, reservedUntil); err != nil {
+			_ = tx.Rollback()
+			return nil, Session{}, fmt.Errorf("reserve eval case %q: %w", c.ID, err)
+		}
+	}
+	if err := writeJSON(sessionPath, session); err != nil {
+		_ = tx.Rollback()
+		return nil, Session{}, fmt.Errorf("write eval session: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		_ = os.Remove(sessionPath)
+		return nil, Session{}, fmt.Errorf("commit eval replay reservation: %w", err)
+	}
+	return cases, session, nil
+}
+
+func (s *Store) keepReplayReservation(ctx context.Context, cancelReplay context.CancelFunc, sessionID string) func() {
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(replayReservationRefresh)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-stop:
+				return
+			case <-ticker.C:
+				reservedUntil := time.Now().Add(replayReservationLease).Unix()
+				if _, err := s.db.ExecContext(ctx, `UPDATE replay_case_reservations SET reserved_until = ? WHERE session_id = ?`, reservedUntil, sessionID); err != nil {
+					cancelReplay()
+					return
+				}
+			}
+		}
+	}()
+	return func() {
+		close(stop)
+		<-done
+	}
+}
+
+func (s *Store) releaseReplayReservation(sessionID string) {
+	_, _ = s.db.Exec(`DELETE FROM replay_case_reservations WHERE session_id = ?`, sessionID)
+}
+
+func replayOne(ctx context.Context, store *Store, c Case, session Session, candidate Candidate, repeat int) Evaluation {
 	started := time.Now()
 	evaluation := Evaluation{
 		ID:        newSessionID(),
@@ -142,7 +217,7 @@ func replayOne(ctx context.Context, c Case, session Session, candidate Candidate
 	}
 	defer ownership.Release()
 
-	workDir, err := restoreCase(ctx, c, root)
+	workDir, err := restoreCase(ctx, store, c, root)
 	if err != nil {
 		evaluation.Error = safeurl.RedactText(err.Error())
 		evaluation.CompletedAt = time.Now().Unix()
@@ -223,7 +298,7 @@ func replayOne(ctx context.Context, c Case, session Session, candidate Candidate
 		IntentSource:          c.IntentSource,
 	})
 	// Candidate wall time is the actual review invocation, matching the local
-	// agent-invocation metric rather than charging bundle restoration setup.
+	// agent-invocation metric rather than charging case restoration setup.
 	evaluation.DurationMS = observed.durationMS
 	if evaluation.DurationMS == 0 && observed.result == nil {
 		evaluation.DurationMS = time.Since(started).Milliseconds()
@@ -333,15 +408,13 @@ func stringValue(value *string) string {
 	return *value
 }
 
-func restoreCase(ctx context.Context, c Case, root string) (string, error) {
+func restoreCase(ctx context.Context, store *Store, c Case, root string) (string, error) {
 	gateDir := filepath.Join(root, "gate.git")
 	if err := git.InitBare(ctx, gateDir); err != nil {
 		return "", fmt.Errorf("create isolated eval gate: %w", err)
 	}
-	prefix := "refs/no-mistakes/eval/" + c.ID + "/*"
-	bundle := filepath.Join(c.Dir, "branch.bundle")
-	if _, err := git.Run(ctx, gateDir, "fetch", bundle, "+"+prefix+":"+prefix); err != nil {
-		return "", fmt.Errorf("restore case bundle: %w", err)
+	if err := restoreCaseObjects(ctx, store.poolDir(c.RepoFingerprint), gateDir, c.ID); err != nil {
+		return "", err
 	}
 	defaultBranch := c.DefaultBranch
 	if defaultBranch == "" {
