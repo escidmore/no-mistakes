@@ -63,14 +63,14 @@ func TestWaitForManagedDaemonStartDetectsPublishedChildExit(t *testing.T) {
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	childDone := make(chan struct{})
-	t.Cleanup(func() {
-		_ = cmd.Process.Kill()
-		select {
-		case <-childDone:
-		case <-time.After(time.Second):
-		}
-	})
+	var stopOnce sync.Once
+	stop := func() {
+		stopOnce.Do(func() {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		})
+	}
+	t.Cleanup(stop)
 
 	startedAt, err := daemonProcessStartTime(cmd.Process.Pid)
 	if err != nil {
@@ -83,13 +83,8 @@ func TestWaitForManagedDaemonStartDetectsPublishedChildExit(t *testing.T) {
 	// This avoids a Windows scheduling race where the child exits before the
 	// readiness loop can inspect the published record.
 	oldRunning := daemonProcessRunning
-	var killOnce sync.Once
 	daemonProcessRunning = func(pid int) (bool, error) {
-		killOnce.Do(func() {
-			_ = cmd.Process.Kill()
-			_ = cmd.Wait()
-			close(childDone)
-		})
+		stop()
 		return oldRunning(pid)
 	}
 	t.Cleanup(func() { daemonProcessRunning = oldRunning })

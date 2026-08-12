@@ -53,7 +53,6 @@ func TestEnsureDefaultGlobalConfig_CreatesFile(t *testing.T) {
 	content := string(data)
 	for _, want := range []string{
 		"agent: auto",
-		"forgejo_axi_path: forgejo-axi",
 		"ci_timeout:",
 		"step_quiet_warning:",
 		"daemon_connect_timeout:",
@@ -92,6 +91,9 @@ func TestEnsureDefaultGlobalConfig_CreatedConfigIsLoadable(t *testing.T) {
 	}
 	if cfg.LogLevel != "info" {
 		t.Errorf("log_level = %q, want %q", cfg.LogLevel, "info")
+	}
+	if cfg.ForgejoAXIPath != "forgejo-axi" {
+		t.Errorf("forgejo_axi_path = %q, want forgejo-axi", cfg.ForgejoAXIPath)
 	}
 }
 
