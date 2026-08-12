@@ -128,7 +128,7 @@ func (h *Host) Available(ctx context.Context) error {
 	h.commitStatusesUnavailable = !response.Capabilities.CommitStatuses
 	h.capabilities = scm.Capabilities{
 		MergeableState: response.Capabilities.CommitStatuses && response.Capabilities.BranchProtection,
-		MergedProof:    true,
+		MergedProof:    response.Capabilities.ExpectedHeadMerge,
 		// Check gating depends only on commit statuses. Failed logs are optional
 		// and require every released run-view route independently.
 		FailedCheckLogs: response.Capabilities.CommitStatuses &&

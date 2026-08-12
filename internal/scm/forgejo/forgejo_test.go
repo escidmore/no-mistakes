@@ -150,6 +150,25 @@ func TestAvailableUsesConfiguredExecutableAndRuntimeCapabilities(t *testing.T) {
 	}
 }
 
+func TestAvailableGatesMergedProofFromRuntimeCapability(t *testing.T) {
+	status := fixture(t, "status-forgejo-16.json")
+	status = strings.Replace(status, `"expected_head_merge":true`, `"expected_head_merge":false`, 1)
+	if status == fixture(t, "status-forgejo-16.json") {
+		t.Fatal("fixture does not contain expected-head merge capability")
+	}
+	host := newTestHost(&fakeRecorder{responses: []fakeResponse{{stdout: status}}})
+	if err := host.Available(context.Background()); err != nil {
+		t.Fatalf("Available() error = %v", err)
+	}
+	caps := host.Capabilities()
+	if caps.MergedProof {
+		t.Fatalf("Capabilities() = %+v, want merged proof disabled", caps)
+	}
+	if !caps.MergeableState || !caps.FailedCheckLogs {
+		t.Fatalf("Capabilities() = %+v, want other probed capabilities preserved", caps)
+	}
+}
+
 func TestAvailableAcceptsHostScopedTokenSource(t *testing.T) {
 	status := strings.Replace(fixture(t, "status-forgejo-16.json"), "FORGEJO_TEST_TOKEN", "FORGEJO_TOKEN_FORGE_2E_EXAMPLE_3A_3443", 1)
 	recorder := &fakeRecorder{responses: []fakeResponse{{stdout: status}}}
