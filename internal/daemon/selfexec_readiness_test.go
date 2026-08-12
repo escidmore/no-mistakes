@@ -7,6 +7,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -63,12 +64,6 @@ func TestWaitForManagedDaemonStartDetectsPublishedChildExit(t *testing.T) {
 		t.Fatal(err)
 	}
 	childDone := make(chan struct{})
-	go func() {
-		time.Sleep(100 * time.Millisecond)
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		close(childDone)
-	}()
 	t.Cleanup(func() {
 		_ = cmd.Process.Kill()
 		select {
@@ -84,6 +79,20 @@ func TestWaitForManagedDaemonStartDetectsPublishedChildExit(t *testing.T) {
 	if err := writeDaemonPIDFile(p.PIDFile(), daemonPIDFile{PID: cmd.Process.Pid, StartedAt: startedAt.UTC()}); err != nil {
 		t.Fatal(err)
 	}
+	// Kill at the first liveness probe, after the PID identity was accepted.
+	// This avoids a Windows scheduling race where the child exits before the
+	// readiness loop can inspect the published record.
+	oldRunning := daemonProcessRunning
+	var killOnce sync.Once
+	daemonProcessRunning = func(pid int) (bool, error) {
+		killOnce.Do(func() {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			close(childDone)
+		})
+		return oldRunning(pid)
+	}
+	t.Cleanup(func() { daemonProcessRunning = oldRunning })
 	oldHealth := daemonHealthCheck
 	daemonHealthCheck = func(*paths.Paths) (bool, error) { return false, nil }
 	t.Cleanup(func() { daemonHealthCheck = oldHealth })

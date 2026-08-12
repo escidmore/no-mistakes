@@ -1,31 +1,5 @@
 # Changelog
 
-## [1.49.0](https://github.com/kunchenguid/no-mistakes/compare/v1.48.0...v1.49.0) (2026-08-11)
-
-
-### Features
-
-* **eval:** add local review evaluation toolkit ([#701](https://github.com/kunchenguid/no-mistakes/issues/701)) ([331ee93](https://github.com/kunchenguid/no-mistakes/commit/331ee9386f7a6765f7880313b01ca78a6b16983a))
-
-## [1.48.0](https://github.com/kunchenguid/no-mistakes/compare/v1.47.0...v1.48.0) (2026-08-08)
-
-
-### Features
-
-* **db:** record build identity on run records ([#687](https://github.com/kunchenguid/no-mistakes/issues/687)) ([5fc7bc7](https://github.com/kunchenguid/no-mistakes/commit/5fc7bc7353f020f302f125a2534e874256580fa1))
-
-## [1.47.0](https://github.com/kunchenguid/no-mistakes/compare/v1.46.0...v1.47.0) (2026-08-07)
-
-
-### Features
-
-* **evidence:** publish artifacts to an orphan branch ([#679](https://github.com/kunchenguid/no-mistakes/issues/679)) ([d37d9cc](https://github.com/kunchenguid/no-mistakes/commit/d37d9cc440d382542cc225c8dc2f290643d6e5e6))
-
-
-### Bug Fixes
-
-* **daemon:** reap lingering run-worktree processes that escape their process group ([#685](https://github.com/kunchenguid/no-mistakes/issues/685)) ([a385367](https://github.com/kunchenguid/no-mistakes/commit/a3853679302f2a953640de3ca07e70ebc7c0b77b))
-
 ## [1.46.0](https://github.com/kunchenguid/no-mistakes/compare/v1.45.4...v1.46.0) (2026-08-05)
 
 
