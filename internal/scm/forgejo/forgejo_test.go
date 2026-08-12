@@ -169,6 +169,22 @@ func TestAvailableGatesMergedProofFromRuntimeCapability(t *testing.T) {
 	}
 }
 
+func TestAvailableGatesMergeabilityIndependentlyFromCommitStatuses(t *testing.T) {
+	status := fixture(t, "status-forgejo-16.json")
+	status = strings.Replace(status, `"commit_statuses":true`, `"commit_statuses":false`, 1)
+	if status == fixture(t, "status-forgejo-16.json") {
+		t.Fatal("fixture does not contain commit-status capability")
+	}
+	host := newTestHost(&fakeRecorder{responses: []fakeResponse{{stdout: status}}})
+	if err := host.Available(context.Background()); err != nil {
+		t.Fatalf("Available() error = %v", err)
+	}
+	caps := host.Capabilities()
+	if !caps.MergeableState || !caps.MergedProof || caps.FailedCheckLogs {
+		t.Fatalf("Capabilities() = %+v, want independent mergeability, merged proof, and status/log gating", caps)
+	}
+}
+
 func TestAvailableAcceptsHostScopedTokenSource(t *testing.T) {
 	status := strings.Replace(fixture(t, "status-forgejo-16.json"), "FORGEJO_TEST_TOKEN", "FORGEJO_TOKEN_FORGE_2E_EXAMPLE_3A_3443", 1)
 	recorder := &fakeRecorder{responses: []fakeResponse{{stdout: status}}}
