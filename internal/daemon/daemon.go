@@ -86,6 +86,10 @@ func Run() (retErr error) {
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+	resolvedCfg := config.Merge(globalCfg, &config.RepoConfig{})
+	if err := p.ValidateEvidenceRoot(resolvedCfg.Test.Evidence.LocalRoot); err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
 	initLogger(lifecycleLog, globalCfg.LogLevel)
 
 	databaseStarted := time.Now()
@@ -416,6 +420,23 @@ func recoverOnStartup(d *db.DB, p *paths.Paths, mgr *RunManager) {
 	worktreeStarted := time.Now()
 	cleanupOrphanWorktrees(d, p)
 	logStartupPhase("worktree_cleanup", worktreeStarted)
+
+	// Evidence is reaped after stale-run recovery for the same reason worktrees
+	// are: every run's status is settled by now, so the active-run guard can
+	// tell a crashed run's leftovers from work still in flight.
+	evidenceStarted := time.Now()
+	global, cfgErr := config.LoadGlobal(p.ConfigFile())
+	if cfgErr != nil {
+		slog.Warn("failed to load global config for evidence reaping, using defaults", "error", cfgErr)
+		global = nil
+	}
+	policy := evidenceReapPolicyFor(global)
+	root := evidenceRootFor(p, global)
+	now := time.Now()
+	reapEvidence(d, root, policy, now)
+	reapLegacyEvidence(d, root, policy, now)
+	logStartupPhase("evidence_cleanup", evidenceStarted)
+
 	mgr.resumeRecoveredRuns(plans)
 }
 
