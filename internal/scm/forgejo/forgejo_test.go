@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -229,7 +230,7 @@ func TestForgejo15KeepsStatusGatingWithoutActionLogs(t *testing.T) {
 
 func TestPRLifecycleCommandsAndIdempotentCreate(t *testing.T) {
 	pr := pullJSON("open", false, testHeadSHA)
-	recorder := &fakeRecorder{responses: []fakeResponse{
+	recorder := &fakeRecorder{stdinDir: t.TempDir(), responses: []fakeResponse{
 		{stdout: `{"found":true,"pull_request":` + pr + `,"search_info":{"complete":true,"pages":1,"fetched":1,"total":1}}`},
 		{stdout: `{"created":false,"pull_request":` + pr + `}`},
 		{stdout: `{"updated":true,"pull_request":` + pr + `}`},
@@ -255,13 +256,52 @@ func TestPRLifecycleCommandsAndIdempotentCreate(t *testing.T) {
 
 	want := [][]string{
 		{"pr", "find", "--repo", testRepo, "--head", "feature/forgejo", "--base", "main", "--state", "open", "--base-url", testBaseURL, "--token-env", "FORGEJO_TEST_TOKEN", "--json"},
-		{"pr", "create", "--repo", testRepo, "--head", "feature/forgejo", "--base", "main", "--title", "Title", "--body", "line one\nline two", "--base-url", testBaseURL, "--token-env", "FORGEJO_TEST_TOKEN", "--json"},
-		{"pr", "update", "--repo", testRepo, "42", "--title", "New title", "--body", "new body", "--base-url", testBaseURL, "--token-env", "FORGEJO_TEST_TOKEN", "--json"},
+		{"pr", "create", "--repo", testRepo, "--head", "feature/forgejo", "--base", "main", "--title", "Title", "--body-file", "-", "--base-url", testBaseURL, "--token-env", "FORGEJO_TEST_TOKEN", "--json"},
+		{"pr", "update", "--repo", testRepo, "42", "--title", "New title", "--body-file", "-", "--base-url", testBaseURL, "--token-env", "FORGEJO_TEST_TOKEN", "--json"},
 		{"pr", "view", "--repo", testRepo, "42", "--base-url", testBaseURL, "--token-env", "FORGEJO_TEST_TOKEN", "--json"},
 	}
 	for i := range want {
 		if !reflect.DeepEqual(recorder.calls[i].args, want[i]) {
 			t.Errorf("call %d args = %#v, want %#v", i, recorder.calls[i].args, want[i])
+		}
+	}
+	if got := recorder.stdin(t, 1); got != "line one\nline two" {
+		t.Errorf("pr create stdin = %q, want command body", got)
+	}
+	if got := recorder.stdin(t, 2); got != "new body" {
+		t.Errorf("pr update stdin = %q, want command body", got)
+	}
+}
+
+func TestPRBodyFileSendsBodyByteForByteViaStdin(t *testing.T) {
+	body := "## Summary\n\nFirst paragraph with **markdown** and a list:\n\n- one\n- two\n\n" +
+		"Second paragraph keeps a literal \\n sequence and the entity &#10; untouched.\r\n\r\n" +
+		"Final paragraph follows CRLF breaks, with a `code` span and a [link](https://example.invalid/path?q=1&r=2).\n"
+	pr := pullJSON("open", false, testHeadSHA)
+	recorder := &fakeRecorder{stdinDir: t.TempDir(), responses: []fakeResponse{
+		{stdout: `{"created":true,"pull_request":` + pr + `}`},
+		{stdout: `{"updated":true,"pull_request":` + pr + `}`},
+	}}
+	host := newTestHost(recorder)
+
+	created, err := host.CreatePR(context.Background(), "feature/forgejo", "main", scm.PRContent{Title: "Title", Body: body})
+	if err != nil || created == nil {
+		t.Fatalf("CreatePR() = (%+v, %v)", created, err)
+	}
+	if _, err := host.UpdatePR(context.Background(), created, scm.PRContent{Title: "Title", Body: body}); err != nil {
+		t.Fatalf("UpdatePR() error = %v", err)
+	}
+	if len(recorder.calls) != 2 {
+		t.Fatalf("calls = %d, want 2", len(recorder.calls))
+	}
+	for i, op := range []string{"pr create", "pr update"} {
+		if got := recorder.stdin(t, i); got != body {
+			t.Errorf("%s stdin = %q, want byte-for-byte body %q", op, got, body)
+		}
+		for _, arg := range recorder.calls[i].args {
+			if strings.Contains(arg, body) || strings.Contains(arg, "&#10;") {
+				t.Errorf("%s argv carries body content: %q", op, arg)
+			}
 		}
 	}
 }
@@ -674,17 +714,23 @@ type fakeResponse struct {
 }
 
 type fakeCall struct {
-	name string
-	args []string
+	name      string
+	args      []string
+	stdinPath string
 }
 
 type fakeRecorder struct {
 	calls     []fakeCall
 	responses []fakeResponse
+	stdinDir  string
 }
 
 func (r *fakeRecorder) factory(ctx context.Context, name string, args ...string) *exec.Cmd {
-	r.calls = append(r.calls, fakeCall{name: name, args: append([]string(nil), args...)})
+	call := fakeCall{name: name, args: append([]string(nil), args...)}
+	if r.stdinDir != "" {
+		call.stdinPath = filepath.Join(r.stdinDir, fmt.Sprintf("stdin-%d", len(r.calls)))
+	}
+	r.calls = append(r.calls, call)
 	response := fakeResponse{stderr: "unexpected forgejo-axi command", code: 1}
 	if len(r.responses) > 0 {
 		response = r.responses[0]
@@ -701,12 +747,26 @@ func (r *fakeRecorder) factory(ctx context.Context, name string, args ...string)
 		fmt.Sprintf("FORGEJO_TEST_EXIT_CODE=%d", response.code),
 		fmt.Sprintf("FORGEJO_TEST_SLEEP=%d", response.sleep.Milliseconds()),
 	)
+	if call.stdinPath != "" {
+		cmd.Env = append(cmd.Env, "FORGEJO_TEST_STDIN_CAPTURE="+call.stdinPath)
+	}
 	return cmd
 }
 
 func TestForgejoAXIHelperProcess(t *testing.T) {
 	if os.Getenv("FORGEJO_TEST_HELPER") != "1" {
 		return
+	}
+	if path := os.Getenv("FORGEJO_TEST_STDIN_CAPTURE"); path != "" {
+		data, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			_, _ = fmt.Fprint(os.Stderr, err)
+			os.Exit(1)
+		}
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			_, _ = fmt.Fprint(os.Stderr, err)
+			os.Exit(1)
+		}
 	}
 	if raw := os.Getenv("FORGEJO_TEST_SLEEP"); raw != "" && raw != "0" {
 		var millis int
@@ -751,6 +811,19 @@ func TestForgejoAXIHelperProcess(t *testing.T) {
 		os.Exit(1)
 	}
 	os.Exit(0)
+}
+
+func (r *fakeRecorder) stdin(t *testing.T, call int) string {
+	t.Helper()
+	path := r.calls[call].stdinPath
+	if path == "" {
+		t.Fatalf("call %d has no stdin capture; set fakeRecorder.stdinDir", call)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read captured stdin for call %d: %v", call, err)
+	}
+	return string(data)
 }
 
 func newTestHost(recorder *fakeRecorder) *Host {
