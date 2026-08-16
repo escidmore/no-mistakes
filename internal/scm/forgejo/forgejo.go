@@ -192,8 +192,8 @@ func (h *Host) CreatePR(ctx context.Context, branch, base string, content scm.PR
 		Created     bool        `json:"created"`
 		PullRequest pullRequest `json:"pull_request"`
 	}
-	args := []string{"--repo", h.repository, "--head", branch, "--base", base, "--title", content.Title, "--body", content.Body}
-	if err := h.runJSON(ctx, "pr create", args, &response); err != nil {
+	args := []string{"--repo", h.repository, "--head", branch, "--base", base, "--title", content.Title, "--body-file", "-"}
+	if err := h.runJSONWithLimit(ctx, "pr create", args, strings.NewReader(content.Body), &response, 0); err != nil {
 		return nil, err
 	}
 	pr, err := h.normalizePull(response.PullRequest)
@@ -215,8 +215,8 @@ func (h *Host) UpdatePR(ctx context.Context, pr *scm.PR, content scm.PRContent) 
 		Updated     bool        `json:"updated"`
 		PullRequest pullRequest `json:"pull_request"`
 	}
-	args := []string{"--repo", h.repository, number, "--title", content.Title, "--body", content.Body}
-	if err := h.runJSON(ctx, "pr update", args, &response); err != nil {
+	args := []string{"--repo", h.repository, number, "--title", content.Title, "--body-file", "-"}
+	if err := h.runJSONWithLimit(ctx, "pr update", args, strings.NewReader(content.Body), &response, 0); err != nil {
 		return nil, err
 	}
 	updated, err := h.normalizePull(response.PullRequest)
@@ -420,7 +420,7 @@ func (h *Host) FetchFailedCheckLogs(ctx context.Context, pr *scm.PR, _ string, _
 	sort.Ints(runNumbers)
 
 	var listed runListResponse
-	if err := h.runJSONWithLimit(ctx, "run list", []string{"--repo", h.repository, "--fields", "all"}, &listed, maxForgejoOutputBytes); err != nil {
+	if err := h.runJSONWithLimit(ctx, "run list", []string{"--repo", h.repository, "--fields", "all"}, nil, &listed, maxForgejoOutputBytes); err != nil {
 		return "", err
 	}
 	if !listed.PageInfo.Complete {
@@ -459,7 +459,7 @@ func (h *Host) FetchFailedCheckLogs(ctx context.Context, pr *scm.PR, _ string, _
 		runID := runIDsByNumber[runNumber]
 		var response runViewResponse
 		args := []string{"--repo", h.repository, strconv.Itoa(runID), "--log-failed"}
-		if err := h.runJSONWithLimit(ctx, "run view", args, &response, maxForgejoOutputBytes); err != nil {
+		if err := h.runJSONWithLimit(ctx, "run view", args, nil, &response, maxForgejoOutputBytes); err != nil {
 			return "", err
 		}
 		if err := h.validateRunView(response, runID, runNumber, result.SHA); err != nil {
@@ -801,10 +801,10 @@ func (h *Host) canonicalPRURL(number int) string {
 }
 
 func (h *Host) runJSON(ctx context.Context, operation string, operationArgs []string, dst any) error {
-	return h.runJSONWithLimit(ctx, operation, operationArgs, dst, 0)
+	return h.runJSONWithLimit(ctx, operation, operationArgs, nil, dst, 0)
 }
 
-func (h *Host) runJSONWithLimit(ctx context.Context, operation string, operationArgs []string, dst any, maxStdoutBytes int) error {
+func (h *Host) runJSONWithLimit(ctx context.Context, operation string, operationArgs []string, stdin io.Reader, dst any, maxStdoutBytes int) error {
 	if maxStdoutBytes <= 0 {
 		maxStdoutBytes = maxForgejoOutputBytes
 	}
@@ -819,6 +819,9 @@ func (h *Host) runJSONWithLimit(ctx context.Context, operation string, operation
 		return errors.New("Forgejo command runner returned a nil command")
 	}
 	shellenv.ConfigureShellCommand(cmd)
+	if stdin != nil {
+		cmd.Stdin = stdin
+	}
 	var stdout cappedBuffer
 	stdout.limit = maxStdoutBytes
 	stderr := prefixBuffer{limit: maxForgejoErrorOutputBytes}
