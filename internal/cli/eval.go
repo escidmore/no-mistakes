@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/kunchenguid/no-mistakes/internal/config"
+	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/eval"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
 	"github.com/spf13/cobra"
@@ -43,7 +44,26 @@ func openEvalStore() (*paths.Paths, *eval.Store, error) {
 		return nil, nil, err
 	}
 	store.SetDiversifiedSize(cfg.Eval.DiversifiedSize)
+	store.SetRepoNames(evalRepoNames(p))
 	return p, store, nil
+}
+
+// evalRepoNames resolves the repository fingerprints a case carries back to
+// human names from the locally registered repositories. It is best effort and
+// display-only: when the pipeline database cannot be read, the dashboards fall
+// back to the fingerprint rather than failing an eval command that otherwise
+// needs no database at all.
+func evalRepoNames(p *paths.Paths) map[string]string {
+	database, err := db.Open(p.DB())
+	if err != nil {
+		return nil
+	}
+	defer database.Close()
+	repos, err := database.GetRepos()
+	if err != nil {
+		return nil
+	}
+	return eval.RepoDisplayNames(repos)
 }
 
 func newEvalCaptureCmd() *cobra.Command {
@@ -147,8 +167,26 @@ func newEvalRunCmd() *cobra.Command {
 				return err
 			}
 			defer store.Close()
-			session, evaluations, runErr := eval.Replay(cmd.Context(), store, eval.ReplayOptions{Set: cases, Candidate: candidate, Repeats: repeats})
-			fmt.Fprintf(cmd.OutOrStdout(), "local eval session %s: %d replay(s), candidate %s, repeats %d\n", session.ID, len(evaluations), candidate, repeats)
+			out := cmd.OutOrStdout()
+			caseCount := 0
+			session, evaluations, runErr := eval.Replay(cmd.Context(), store, eval.ReplayOptions{
+				Set:       cases,
+				Candidate: candidate,
+				Repeats:   repeats,
+				OnPlan: func(session eval.Session, planned []eval.Case) {
+					caseCount = len(planned)
+					fmt.Fprintf(out, "replaying %d case(s) x %d repeat(s) with %s on %s (cohort %s)\n\n",
+						len(planned), session.Repeats, session.Candidate, session.Set, session.Cohort)
+				},
+				OnResult: func(evaluation eval.Evaluation, completed, total int) {
+					evalRunProgress(out, evaluation, completed, total)
+				},
+			})
+			if len(evaluations) > 0 {
+				fmt.Fprintln(out)
+				fmt.Fprintln(out, renderEvalRunSummary(session, evaluations, caseCount))
+			}
+			fmt.Fprintf(out, "local eval session %s: %d replay(s), candidate %s, repeats %d\n", session.ID, len(evaluations), candidate, repeats)
 			if runErr != nil {
 				return runErr
 			}
@@ -184,7 +222,7 @@ func newEvalSetsCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			fmt.Fprint(cmd.OutOrStdout(), eval.RenderSets(summaries))
+			fmt.Fprintln(cmd.OutOrStdout(), renderEvalSetsDashboard(summaries))
 			return nil
 		},
 	}

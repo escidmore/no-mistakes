@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.55.0](https://github.com/kunchenguid/no-mistakes/compare/v1.54.0...v1.55.0) (2026-08-19)
+
+
+### Features
+
+* **cli:** improve eval sets repository and matrix display ([#784](https://github.com/kunchenguid/no-mistakes/issues/784)) ([3edab07](https://github.com/kunchenguid/no-mistakes/commit/3edab07028a3604b88772cdf9799962c83c5c635))
+
+## [1.54.0](https://github.com/kunchenguid/no-mistakes/compare/v1.53.0...v1.54.0) (2026-08-19)
+
+
+### Features
+
+* **eval:** add dashboards and idempotent eval workflows ([#779](https://github.com/kunchenguid/no-mistakes/issues/779)) ([8facba5](https://github.com/kunchenguid/no-mistakes/commit/8facba5972fcb2a97c135253d8158aed731b4246))
+
 ## [1.53.0](https://github.com/kunchenguid/no-mistakes/compare/v1.52.0...v1.53.0) (2026-08-16)
 
 

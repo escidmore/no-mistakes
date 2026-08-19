@@ -46,7 +46,7 @@ A case includes:
 - agent-neutral global configuration and the effective repository configuration frozen at capture
 - the original run, step, review-round, decision, and local invocation-metric records
 - a manifest with commit pins, changed-file counts, build identity, and a hash of the redacted remote URL
-- a local `labels.json` file that stores finding-level gold and queued unmatched candidate findings
+- a local `labels.json` file that stores finding-level gold; queued unmatched candidate findings are counted from the recorded replays themselves, so replays never rewrite a case's labels
 
 The manifest never stores a remote URL. Capture is read-only against the existing local database and gate. It does not fetch from the network.
 
@@ -64,7 +64,7 @@ Capture writes gold from the **recorded gate decision** for a review round - wha
 - Skip and approve-with-findings **without a merge** stay **unlabeled / pending** until later adjudication, and so does any round whose gate decision was never recorded (an unknown or aborted resolution), merged or not. Absence of a decision is never read as a judgement.
 - A later replay that raises a new issue absent from the gold set is queued as an unmatched candidate finding. It is never auto-scored as a false positive.
 
-If a PR merges after the first capture, already-captured cases are relabeled. The daemon does this best-effort when it observes the merge; `eval relabel [run-id]` or recapture is the CLI path. Relabel adds merge-derived labels onto previously unlabeled findings and drops obsolete derived merge labels that the current recorded decisions no longer support. Adjudicated, user-fix, and ingested post-PR-miss labels are never overwritten.
+If a PR merges after the first capture, already-captured cases are relabeled. The daemon does this best-effort when it observes the merge; `eval relabel [run-id]` or recapture is the CLI path. Relabel adds merge-derived labels onto previously unlabeled findings and drops obsolete derived merge labels that the current recorded decisions no longer support. Adjudicated, user-fix, and ingested post-PR-miss labels are never overwritten. Relabel and recapture converge in place: repeating either with unchanged source evidence produces the same labels, including for gold findings that lack IDs.
 
 A case with no finding-level gold is unlabeled / pending, never a pass. True-negative also stays unlabeled because the current capture evidence cannot establish that a finding is invalid without the shipped-unfixed or adjudication paths above.
 
@@ -84,7 +84,11 @@ Finding-level gold uses `labels.json` schema version 2. There is no migration fr
 no-mistakes eval sets
 ```
 
-The command shows counts, finding-level gold coverage, unlabeled / pending cases, queued candidate findings, and composition by repository fingerprint, dominant language, change-size bucket, source severity, and finding type.
+The command renders a dashboard headlined by the **diversified holdout** - the official gold-only set - showing its size, pin and cap state, finding-level gold as a confusion-matrix table (raised / missed against real issue / not an issue; true negatives are never counted, because a correctly silent review leaves no gold), and stratum composition (repository, dominant language, change-size bucket, source severity, finding type). A case stores only the fingerprint of its upstream URL, so the repository column resolves each locally registered repository to its upstream namespace/name, then its working-directory name or repository ID; an unresolved case falls back to its short fingerprint. The other sets appear as a compact footnote with their counts, gold coverage, unlabeled / pending cases, and queued candidate findings.
+
+The headline includes an instant **self-score**: the recorded source reviews of the diversified set scored against their own gold with the same matcher a replayed candidate faces. It is computed from the already-captured case files - no replay, agent invocation, or network - and is the baseline a candidate has to beat. Recall, precision bounds, and F1 follow the report's semantics, including withholding F1 when no false-positive gold exists.
+
+`eval sets` is safe to re-run: inspecting the sets materializes the diversified pins, and a second read returns the same summaries without repinning anything.
 
 Four logical sets are available to replay:
 
@@ -121,6 +125,8 @@ The report prints recall, precision bounds (adjudicated vs pending-as-FP), and F
 
 `--repeats` defaults to `3` and must be at least `1`. Candidates must use an agent that can enforce an explicit model; ACP targets such as `cursor` and `acp:<target>` are rejected. Replays are intentionally isolated from the production `NM_HOME`; they do not contact the shared no-mistakes daemon. The selected agent still communicates with its configured model provider in the normal way.
 
+The command streams one scored progress line per replay as it completes, then renders the session's score summary in the same dashboard style as `eval sets` and `stats`, followed by the session identifier. Re-running the same `eval run` is additive by design - each invocation records a fresh measurement session - but it is safe: identical inputs land in the same cohort so the report aggregates the samples instead of fragmenting into a new comparison group, while captured labels and manifests remain unchanged.
+
 ## Report results
 
 ```sh
@@ -139,7 +145,7 @@ The report groups local replays by candidate and cohort. A cohort pins the selec
 - a finite-sample case-level recall range, with repeats averaged inside each case
 - whether a candidate lies on the observed recall-versus-token-cost frontier
 
-The report is deliberately cautious. It never treats an unadjudicated candidate finding as a false positive, excludes candidates with failed replays from the frontier, and distinguishes missing token instrumentation from a real zero.
+The report is deliberately cautious. It never treats an unadjudicated candidate finding as a false positive, excludes candidates with failed replays from the frontier, and distinguishes missing token instrumentation from a real zero. It is a pure read: repeated reports over unchanged recorded evaluations produce identical text output.
 
 ## Current boundary
 
