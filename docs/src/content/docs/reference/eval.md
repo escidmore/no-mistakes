@@ -10,6 +10,8 @@ The `eval` commands do not start or use the shared daemon, alter a gate, emit re
 
 Replay does invoke the selected agent normally, so that agent may send the restored code and review context to its configured model provider. The local-only guarantee concerns eval storage and transport added by no-mistakes, not the selected agent's ordinary provider traffic.
 
+When `eval sets`, `eval report`, or `eval run` resolves repository fingerprints into display names, it consults `state.sqlite` only if that pipeline database already exists and opens it read-only. The display lookup never creates or migrates pipeline state; without a readable database, the dashboards fall back to fingerprints.
+
 ## How cases are collected
 
 Cases arrive on their own. When an eligible run finishes, its decided Review passes are frozen into the local corpus - one case per pass. Collection happens after the pipeline has already reported its outcome, so it can never change or fail the run; a problem is logged and nothing else.
@@ -33,6 +35,8 @@ no-mistakes eval miss ingest <run-id> \
 ```
 
 `--finding` is repeatable. The command captures the run if needed (recapture is a no-op, so existing labels survive), then writes false-negative gold onto the last completed non-blocking review pass. Duplicate finding IDs are no-ops. A parked or blocking review is refused: that class found something, so it is not a post-PR miss.
+
+`id` and `description` are required. `severity` defaults to `error` and must be one of `error`, `warning`, or `info` - it becomes gold and then a composition stratum, so an unrecognized value is refused rather than shown as an invented finding type. `action`, if given, must be one of `auto-fix`, `ask-user`, or `no-op`; gold carries no action, so a valid one is accepted and dropped rather than silently changing what is stored.
 
 The ingest payload is the source of truth. Eval does not scrape GitHub review comments and does not read an external markdown ledger. The curator (a human, or an automation that already vetted the miss) supplies the structured finding.
 
