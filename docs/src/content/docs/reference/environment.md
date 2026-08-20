@@ -16,12 +16,12 @@ When set, everything else moves under this root:
 
 - Global config: `$NM_HOME/config.yaml`
 - Gate repos: `$NM_HOME/repos/<id>.git`
-- Worktrees: `$NM_HOME/worktrees/<repoID>/<runID>/`
+- Worktrees: `$NM_HOME/worktrees/<repoID>/<runID>/`, unless [`worktree_roots`](/no-mistakes/reference/global-config/#worktree_roots) places a repository's run worktrees elsewhere
 - Logs: `$NM_HOME/logs/`
 - Database: `$NM_HOME/state.sqlite`
 - Socket / PID / singleton lock: `$NM_HOME/socket`, `$NM_HOME/daemon.pid`, and `$NM_HOME/daemon.lock`
 - Managed agent server PID records: `$NM_HOME/servers/`
-- Opt-in evaluation cases and registry: `$NM_HOME/eval/` (created only by an explicit `no-mistakes eval` command)
+- Local evaluation cases and registry: `$NM_HOME/eval/` (created by automatic collection or an explicit `no-mistakes eval` command)
 - Managed service names get a short stable suffix derived from `$NM_HOME` so multiple installs don't collide.
 
 ## `NM_DAEMON_CONNECT_TIMEOUT`
@@ -156,17 +156,6 @@ Fallback GitHub token used by `no-mistakes update` when `GITHUB_TOKEN` is unset 
 | Default | (none)   |
 
 See [`GITHUB_TOKEN`](#github_token) for the updater's authentication behavior and precedence.
-
-## `NO_MISTAKES_EVAL_CAPTURE_PROVENANCE`
-
-Opt source runs into recording the immutable local configuration provenance required by `no-mistakes eval capture`.
-
-|         |                                                          |
-| ------- | -------------------------------------------------------- |
-| Type    | `1` to enable, anything else to leave disabled           |
-| Default | unset (normal pipeline rounds record no eval provenance) |
-
-Set this in the daemon environment before starting a source run that you intend to capture. It does not enable replay, send data, or change pipeline decisions. See [Evaluation toolkit](/no-mistakes/reference/eval/).
 
 ## `NO_MISTAKES_NO_UPDATE_CHECK`
 
