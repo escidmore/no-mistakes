@@ -146,8 +146,43 @@ func TestAvailableUsesConfiguredExecutableAndRuntimeCapabilities(t *testing.T) {
 		t.Fatalf("command = %#v, want name custom and args %#v", got, wantArgs)
 	}
 	caps := host.Capabilities()
-	if !caps.MergeableState || !caps.MergedProof || !caps.ExpectedHeadMerge || !caps.ActionsJobLogs || !caps.ActionsRuns || !caps.ActionsRunJobs || !caps.FailedCheckLogs {
+	if !caps.MergeableState || !caps.MergedProof || !caps.FailedCheckLogs {
 		t.Fatalf("Capabilities() = %+v, want Forgejo 16 capabilities including failed logs", caps)
+	}
+}
+
+func TestAvailableGatesMergedProofFromRuntimeCapability(t *testing.T) {
+	status := fixture(t, "status-forgejo-16.json")
+	status = strings.Replace(status, `"expected_head_merge":true`, `"expected_head_merge":false`, 1)
+	if status == fixture(t, "status-forgejo-16.json") {
+		t.Fatal("fixture does not contain expected-head merge capability")
+	}
+	host := newTestHost(&fakeRecorder{responses: []fakeResponse{{stdout: status}}})
+	if err := host.Available(context.Background()); err != nil {
+		t.Fatalf("Available() error = %v", err)
+	}
+	caps := host.Capabilities()
+	if caps.MergedProof {
+		t.Fatalf("Capabilities() = %+v, want merged proof disabled", caps)
+	}
+	if !caps.MergeableState || !caps.FailedCheckLogs {
+		t.Fatalf("Capabilities() = %+v, want other probed capabilities preserved", caps)
+	}
+}
+
+func TestAvailableGatesMergeabilityIndependentlyFromCommitStatuses(t *testing.T) {
+	status := fixture(t, "status-forgejo-16.json")
+	status = strings.Replace(status, `"commit_statuses":true`, `"commit_statuses":false`, 1)
+	if status == fixture(t, "status-forgejo-16.json") {
+		t.Fatal("fixture does not contain commit-status capability")
+	}
+	host := newTestHost(&fakeRecorder{responses: []fakeResponse{{stdout: status}}})
+	if err := host.Available(context.Background()); err != nil {
+		t.Fatalf("Available() error = %v", err)
+	}
+	caps := host.Capabilities()
+	if !caps.MergeableState || !caps.MergedProof || caps.FailedCheckLogs {
+		t.Fatalf("Capabilities() = %+v, want independent mergeability, merged proof, and status/log gating", caps)
 	}
 }
 
@@ -196,6 +231,26 @@ func TestAvailableRejectsIncompleteStatusIdentity(t *testing.T) {
 	}
 }
 
+func TestAvailableRejectsUnprovenCapabilitySources(t *testing.T) {
+	status := fixture(t, "status-forgejo-16.json")
+	for _, source := range []string{"major-version", "other"} {
+		t.Run(source, func(t *testing.T) {
+			response := strings.Replace(status, `"probe":{"source":"swagger","complete":true}`, fmt.Sprintf(`"probe":{"source":%q,"complete":true}`, source), 1)
+			if response == status {
+				t.Fatal("fixture does not contain the Swagger capability probe")
+			}
+			host := newTestHost(&fakeRecorder{responses: []fakeResponse{{stdout: response}}})
+			err := host.Available(context.Background())
+			if err == nil || !strings.Contains(err.Error(), "capability probe") {
+				t.Fatalf("Available() error = %v, want rejected capability probe", err)
+			}
+			if host.Capabilities().FailedCheckLogs {
+				t.Fatal("unproven capability source advertised failed-check logs")
+			}
+		})
+	}
+}
+
 func TestForgejo15KeepsStatusGatingWithoutActionLogs(t *testing.T) {
 	recorder := &fakeRecorder{responses: []fakeResponse{
 		{stdout: fixture(t, "status-forgejo-15.json")},
@@ -208,8 +263,8 @@ func TestForgejo15KeepsStatusGatingWithoutActionLogs(t *testing.T) {
 		t.Fatalf("Available() error = %v", err)
 	}
 	caps := host.Capabilities()
-	if !caps.ActionsRuns || caps.ActionsRunJobs || caps.ActionsJobLogs || caps.FailedCheckLogs || !caps.CommitStatuses {
-		t.Fatalf("Capabilities() = %+v, want statuses and run listing independent from unavailable run jobs/logs", caps)
+	if !caps.MergeableState || !caps.MergedProof || caps.FailedCheckLogs {
+		t.Fatalf("Capabilities() = %+v, want mergeability and merged proof with independently unsupported logs", caps)
 	}
 	checks, err := host.GetChecks(context.Background(), testPR())
 	if err != nil {

@@ -8,10 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/url"
 	"os/exec"
-	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -46,14 +44,15 @@ type Options struct {
 
 // Host maps no-mistakes SCM operations to forgejo-axi --json commands.
 type Host struct {
-	cmdFactory   CmdFactory
-	available    func(string) bool
-	executable   string
-	baseURL      string
-	repository   string
-	tokenEnv     string
-	secrets      []string
-	capabilities scm.Capabilities
+	cmdFactory                CmdFactory
+	available                 func(string) bool
+	executable                string
+	baseURL                   string
+	repository                string
+	tokenEnv                  string
+	secrets                   []string
+	capabilities              scm.Capabilities
+	commitStatusesUnavailable bool
 }
 
 // New constructs a Forgejo host. Callers should resolve the remote with
@@ -120,22 +119,16 @@ func (h *Host) Available(ctx context.Context) error {
 	if h.tokenEnv != "" && *response.Auth.Source != h.tokenEnv {
 		return fmt.Errorf("Forgejo authentication source %q does not match token environment %q", *response.Auth.Source, h.tokenEnv)
 	}
-	if response.Capabilities.Probe.Source == "" || !response.Capabilities.Probe.Complete {
-		return errors.New("Forgejo capability probe was incomplete; refusing to guess from the server version")
+	if response.Capabilities.Probe.Source != "swagger" || !response.Capabilities.Probe.Complete {
+		return errors.New("Forgejo capability probe was not a complete Swagger probe; refusing to guess from the server version")
 	}
 	if !response.Capabilities.PullRequests {
 		return errors.New("Forgejo host does not report pull-request capability")
 	}
+	h.commitStatusesUnavailable = !response.Capabilities.CommitStatuses
 	h.capabilities = scm.Capabilities{
-		MergeableState:    response.Capabilities.CommitStatuses && response.Capabilities.BranchProtection,
-		MergedProof:       true,
-		PullRequests:      response.Capabilities.PullRequests,
-		CommitStatuses:    response.Capabilities.CommitStatuses,
-		BranchProtection:  response.Capabilities.BranchProtection,
-		ExpectedHeadMerge: response.Capabilities.ExpectedHeadMerge,
-		ActionsJobLogs:    response.Capabilities.ActionsJobLogs,
-		ActionsRuns:       response.Capabilities.Runs,
-		ActionsRunJobs:    response.Capabilities.RunJobs,
+		MergeableState: response.Capabilities.BranchProtection,
+		MergedProof:    response.Capabilities.ExpectedHeadMerge,
 		// Check gating depends only on commit statuses. Failed logs are optional
 		// and require every released run-view route independently.
 		FailedCheckLogs: response.Capabilities.CommitStatuses &&
@@ -271,7 +264,7 @@ func (h *Host) readChecks(ctx context.Context, pr *scm.PR) (checksResult, error)
 	if err != nil {
 		return checksResult{}, err
 	}
-	if h.capabilities.PullRequests && !h.capabilities.CommitStatuses {
+	if h.commitStatusesUnavailable {
 		return checksResult{}, fmt.Errorf("Forgejo commit-status capability unavailable: %w", scm.ErrUnsupported)
 	}
 	var response struct {
@@ -819,14 +812,14 @@ func (h *Host) runJSONWithLimit(ctx context.Context, operation string, operation
 		return errors.New("Forgejo command runner returned a nil command")
 	}
 	shellenv.ConfigureShellCommand(cmd)
-	if stdin != nil {
-		cmd.Stdin = stdin
-	}
 	var stdout cappedBuffer
 	stdout.limit = maxStdoutBytes
 	stderr := prefixBuffer{limit: maxForgejoErrorOutputBytes}
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+	if stdin != nil {
+		cmd.Stdin = stdin
+	}
 	err := shellenv.RunShellCommand(cmd)
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return ctxErr
@@ -1094,14 +1087,14 @@ func ResolveRemote(remote, configuredBase, resolvedSSHHost string) (string, stri
 	}
 	remotePath = stripPullURLSuffix(remotePath)
 	if configuredBase != "" {
-		base, baseURL, err := normalizeBaseURL(configuredBase)
+		base, baseURL, err := scm.NormalizeForgejoBaseURL(configuredBase)
 		if err != nil {
 			return "", "", err
 		}
 		if remoteScheme == "http" || remoteScheme == "https" {
 			remoteURL, parseErr := url.Parse(strings.TrimSpace(remote))
 			if parseErr == nil {
-				_, remoteURL, parseErr = normalizeBaseURL((&url.URL{Scheme: remoteURL.Scheme, Host: remoteURL.Host}).String())
+				_, remoteURL, parseErr = scm.NormalizeForgejoBaseURL((&url.URL{Scheme: remoteURL.Scheme, Host: remoteURL.Host}).String())
 			}
 			if parseErr != nil || remoteURL.Host != baseURL.Host {
 				return "", "", fmt.Errorf("remote host %q does not match configured Forgejo host %q", remoteHost, baseURL.Host)
@@ -1142,43 +1135,11 @@ func ResolveRemote(remote, configuredBase, resolvedSSHHost string) (string, stri
 	remoteURL.Fragment = ""
 	remoteURL.Path = "/" + strings.Join(parts[:len(parts)-2], "/")
 	remoteURL.RawPath = ""
-	base, _, err := normalizeBaseURL(remoteURL.String())
+	base, _, err := scm.NormalizeForgejoBaseURL(remoteURL.String())
 	if err != nil {
 		return "", "", err
 	}
 	return base, repo, nil
-}
-
-func normalizeBaseURL(raw string) (string, *url.URL, error) {
-	parsed, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil {
-		return "", nil, fmt.Errorf("invalid Forgejo base URL %q", raw)
-	}
-	parsed.Scheme = strings.ToLower(parsed.Scheme)
-	hostname := strings.ToLower(parsed.Hostname())
-	if (parsed.Scheme != "http" && parsed.Scheme != "https") || hostname == "" {
-		return "", nil, fmt.Errorf("invalid Forgejo base URL %q", raw)
-	}
-	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
-		return "", nil, errors.New("Forgejo base URL must not contain credentials, a query, or a fragment")
-	}
-	port := parsed.Port()
-	if (parsed.Scheme == "http" && port == "80") || (parsed.Scheme == "https" && port == "443") {
-		port = ""
-	}
-	if port != "" {
-		parsed.Host = net.JoinHostPort(hostname, port)
-	} else if strings.Contains(hostname, ":") {
-		parsed.Host = "[" + hostname + "]"
-	} else {
-		parsed.Host = hostname
-	}
-	parsed.Path = strings.TrimRight(path.Clean("/"+strings.Trim(parsed.Path, "/")), "/")
-	if parsed.Path == "." || parsed.Path == "/" {
-		parsed.Path = ""
-	}
-	parsed.RawPath = ""
-	return strings.TrimRight(parsed.String(), "/"), parsed, nil
 }
 
 func parseRemote(remote string) (host, remotePath, scheme string, err error) {
@@ -1195,7 +1156,7 @@ func parseRemote(remote string) (host, remotePath, scheme string, err error) {
 			return "", "", "", errors.New("Forgejo remote URL must not contain a query or fragment")
 		}
 		scheme := strings.ToLower(parsed.Scheme)
-		if scheme != "http" && scheme != "https" && scheme != "ssh" {
+		if !scm.ForgejoRemoteSchemeSupported(scheme) {
 			return "", "", "", fmt.Errorf("unsupported Forgejo remote URL scheme %q", parsed.Scheme)
 		}
 		return strings.ToLower(parsed.Hostname()), parsed.Path, scheme, nil

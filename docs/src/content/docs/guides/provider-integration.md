@@ -126,7 +126,7 @@ FORGEJO_BASE_URL=https://forgejo.example forgejo-axi status --json
 
 `no-mistakes` delegates PR identity, lifecycle, commit-status and required-context evaluation, mergeability, and merged proof to forgejo-axi's stable JSON commands. Capabilities are runtime-probed from the server instead of guessed from a major version.
 
-Failed-log retrieval uses forgejo-axi's stable `run view --log-failed --json` command only when the runtime probe advertises the run, run-jobs, and job-log routes. `no-mistakes` accepts only a failing status's canonical native Actions target, verifies the exact run and PR head, validates every returned job against that run, and limits command output to 1 MiB before giving failed-job logs to the repair agent. Live testing against Forgejo 16.0.1 proves identity-matched retrieval through those routes. On Forgejo 15.0.5, commit-status gating, mergeability checks, and merged-state proof remain available when job and log routes are unavailable.
+Failed-log retrieval uses forgejo-axi's stable `run view --log-failed --json` command only when the runtime probe advertises commit statuses, Actions runs, run jobs, and job logs. `no-mistakes` accepts only a failing status's canonical native Actions target, verifies the exact run and freshly polled PR head, validates every returned job's run identity, and returns non-empty failed-job logs in deterministic order under the aggregate 1 MiB ceiling. Live testing against Forgejo 16.0.1 proves identity-matched retrieval through those routes. On Forgejo 15.0.5, commit-status gating, mergeability checks, and merged-state proof remain available when job and log routes are unavailable.
 
 Fork PR routing is not implemented for Forgejo; a configured `fork_url` makes the PR step skip rather than opening a self PR.
 
@@ -227,7 +227,7 @@ The GitLab backend is pinned against `glab v1.5x`. Self-hosted detection and the
 
 ## SSH host aliases
 
-SSH remotes that use a host alias from your SSH configuration (for example `git@github-personal:owner/repo` or `git@gitlab-work:group/repo`, where `github-personal`/`gitlab-work` map to a real `HostName` via `~/.ssh/config`) are supported. `no-mistakes` resolves the alias through `ssh -G` to its real host name and uses that host only for provider detection and identity checks, including scoping `gh` or `glab` to the right instance. The original Git remote URL is left untouched, so authentication and pushes continue to use the alias exactly as your SSH configuration expects.
+SSH remotes that use a host alias from your SSH configuration (for example `git@github-personal:owner/repo` or `git@gitlab-work:group/repo`, where `github-personal`/`gitlab-work` map to a real `HostName` via `~/.ssh/config`) are supported. `no-mistakes` resolves the alias through `ssh -G` to its real host name and uses that host only for provider detection and identity checks, including scoping `gh` or `glab` to the right instance and matching an SSH Forgejo remote to `FORGEJO_BASE_URL`. The original Git remote URL is left untouched, so authentication and pushes continue to use the alias exactly as your SSH configuration expects.
 
 If `ssh -G` is unavailable or the alias does not resolve, detection falls back to the literal host in the remote URL rather than failing the run.
 

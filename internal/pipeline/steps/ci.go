@@ -196,6 +196,18 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 		return nil, fmt.Errorf("extract PR number: %w", err)
 	}
 	pr := &scm.PR{Number: prNumber, URL: prURL}
+	baseBranch := effectivePRBaseBranch(sctx)
+	// A resumed run may have a different trusted configuration than the run
+	// that created this PR. Re-read the forge record without a base filter so
+	// conflict repair and tip monitoring follow the PR's actual target.
+	if reader, ok := host.(scm.PRBaseBranchReader); ok {
+		if actual, readErr := reader.GetPRBaseBranch(ctx, pr); readErr == nil {
+			pr.BaseBranch = actual
+		}
+	}
+	if strings.TrimSpace(pr.BaseBranch) != "" {
+		baseBranch = strings.TrimSpace(pr.BaseBranch)
+	}
 
 	// CITimeout semantics: <0 (or "unlimited" in config) means never
 	// self-terminate; 0 means the value was never configured, so fall back
@@ -218,7 +230,7 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 	baseBranchTip := s.baseBranchTip
 	if baseBranchTip == nil {
 		baseBranchTip = func(ctx context.Context) (string, bool) {
-			return resolveRunDefaultBranchTip(ctx, sctx, sctx.Run.BaseSHA, sctx.Repo.DefaultBranch)
+			return resolveRunDefaultBranchTip(ctx, sctx, sctx.Run.BaseSHA, baseBranch)
 		}
 	}
 	started := now()
@@ -330,6 +342,7 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 
 		// Check CI status - wait for all checks to complete before fixing
 		ciFixLimit := sctx.Config.AutoFix.CI
+		pr.HeadSHA = sctx.Run.HeadSHA
 		checks, err := host.GetChecks(ctx, pr)
 		if err != nil {
 			clearCIMonitorReady(sctx)
@@ -368,8 +381,9 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 
 			// Before any failure reaches the fix agent, re-run the checks the
 			// provider itself reported as cancelled rather than as a job
-			// failure. A rerun costs another CI run of that job; escalating one
-			// costs an agent round that can edit code which was never broken.
+			// failure. A rerun costs another provider-side workflow run;
+			// escalating one costs an agent round that can edit code which was
+			// never broken.
 			// Genuine failures never take this path, and a merge conflict is
 			// excluded outright: no rerun can ever clear one, so it must reach
 			// the fix agent on its first observation.

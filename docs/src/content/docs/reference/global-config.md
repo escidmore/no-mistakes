@@ -20,29 +20,42 @@ acp_registry_overrides:
 agent_path_override:
   claude: /Users/you/bin/claude
   codex: /opt/homebrew/bin/codex
+  grok: /Users/you/.grok/bin/grok
   rovodev: /usr/local/bin/acli
   opencode: /usr/local/bin/opencode
   pi: /usr/local/bin/pi
   copilot: /usr/local/bin/copilot
 
+agent_config:
+  codex:
+    model: gpt-5.4
+    effort: low
+
 agent_args_override:
   codex:
-    - -m
-    - gpt-5.4
     - -c
     - service_tier="priority"
-    - -c
-    - model_reasoning_effort="low"
 
 ci_timeout: "168h"
 
 step_quiet_warning: "10m"
 
+agent_timeout: "30m"
+
+review_agent_timeout: "30m"
+
+test_agent_timeout: "30m"
+
 daemon_connect_timeout: "3s"
+
+branch_sync_remote_timeout: "60s"
 
 log_level: info
 
 session_reuse: true
+
+worktree_roots:
+  /Users/you/src/my-repo: /Users/you/work/my-repo-runs
 
 auto_fix:
   rebase: 3
@@ -82,10 +95,10 @@ Default agent for all repos and setup-wizard suggestions. Can be overridden per-
 |         |                                                                                             |
 | ------- | ------------------------------------------------------------------------------------------- |
 | Type    | `string` or `string[]`                                                                      |
-| Values  | `auto`, `claude`, `codex`, `rovodev`, `opencode`, `pi`, `copilot`, `cursor`, `acp:<target>` |
+| Values  | `auto`, `claude`, `codex`, `grok`, `rovodev`, `opencode`, `pi`, `copilot`, `antigravity`, `cursor`, `acp:<target>` |
 | Default | `auto`                                                                                      |
 
-`auto` resolves to the first supported native agent or ACP alias in this order: `claude`, `codex`, `opencode`, `acli` with `rovodev` support, `pi`, `copilot`, then `cursor`.
+`auto` resolves to the first supported native agent or ACP alias in this order: `claude`, `codex`, `grok`, `opencode`, `acli` with `rovodev` support, `pi`, `copilot`, `antigravity`, then `cursor`.
 `cursor` is an ACP alias for the `cursor` target with default command `cursor-agent acp`.
 With default paths, `auto` only selects it when both `cursor-agent` and `acpx` resolve; `acp_registry_overrides.cursor` and `acpx_path` replace those respective defaults during availability checks.
 `acp:<target>` uses the user-installed `acpx` binary to run an ACP target, for example `acp:gemini`; `acp:cursor` uses the same default command as `cursor`.
@@ -97,7 +110,7 @@ If an explicit agent is unavailable, `auto` finds no native agent or ACP alias, 
 You can also set an ordered fallback list:
 
 ```yaml
-agent: [codex, claude]
+agent: [codex, grok]
 ```
 
 The list is filtered to entries available to the daemon at run startup, and the first available entry becomes the primary agent.
@@ -164,20 +177,81 @@ Default native binary names when no override is set:
 | ---------- | ---------- |
 | `claude`   | `claude`   |
 | `codex`    | `codex`    |
+| `grok`     | `grok`     |
 | `rovodev`  | `acli`     |
 | `opencode` | `opencode` |
 | `pi`       | `pi`       |
 | `copilot`  | `copilot`  |
+| `antigravity` | `agy`      |
+
+### agent_config
+
+Model and reasoning effort per agent, in one common spelling. no-mistakes maps each field down to whatever mechanism that harness actually uses, so you no longer have to know each CLI's own flag.
+
+|         |                                                                                     |
+| ------- | ----------------------------------------------------------------------------------- |
+| Type    | `map[string]{model, effort}`                                                        |
+| Keys    | `claude`, `codex`, `grok`, `rovodev`, `opencode`, `pi`, `copilot`, `antigravity`, `cursor`, `acp:<target>` |
+| Default | Empty (every harness keeps its own defaults)                                        |
+
+```yaml
+agent_config:
+  codex:
+    model: gpt-5.4
+    effort: low
+  claude:
+    model: sonnet
+    effort: high
+  opencode:
+    model: openai/gpt-5
+  cursor:
+    model: gpt-5
+```
+
+`effort` is one of `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. The value is passed to the harness as written, so a level that harness does not implement is rejected by the harness itself rather than silently downgraded.
+
+How each field maps:
+
+| Agent             | `model`                                       | `effort`                          | Accepted effort levels                              |
+| ----------------- | --------------------------------------------- | --------------------------------- | --------------------------------------------------- |
+| `claude`          | `--model`                                     | `--effort`                        | `low`, `medium`, `high`, `xhigh`, `max`             |
+| `codex`           | `-m`                                          | `-c model_reasoning_effort="…"`   | `minimal`, `low`, `medium`, `high`                  |
+| `grok`            | `--model`                                     | `--reasoning-effort`              | whatever the selected reasoning model accepts       |
+| `copilot`         | `--model`                                     | `--effort`                        | `minimal`, `low`, `medium`, `high`, `xhigh`, `max`  |
+| `pi`              | `--model`                                     | `--thinking`                      | `minimal`, `low`, `medium`, `high`, `xhigh`, `max`  |
+| `opencode`        | session-message `model` (needs `provider/model`) | session-message `variant`      | provider-specific                                   |
+| `cursor`, `acp:*` | `acpx --model`                                | not expressible                   | -                                                   |
+| `rovodev`         | not expressible                               | not expressible                   | -                                                   |
+| `antigravity`     | not expressible                               | not expressible                   | -                                                   |
+
+`opencode` needs the `provider/model` form (for example `openai/gpt-5`) because its session API takes the provider and the model as separate fields; a bare model name is refused at config load rather than dropped. Both of its knobs travel in the session message, not in the launch command, because `opencode serve` exits with usage on an unknown flag.
+
+`rovodev` and `antigravity` have no mechanism no-mistakes can set - `acli rovodev serve` plus its REST session API take no model parameter, and the `agy` CLI parses flags strictly - so `agent_config` for them is a config error rather than a request that quietly does nothing. Reach for [`agent_args_override`](#agent_args_override) there if your build of the CLI accepts a flag. Reasoning effort is likewise unavailable for ACP targets: no-mistakes drives them through `acpx`, which exposes `--model` but no effort surface.
+
+`agent_config` is global-only. Like `agent_args_override`, it decides which model runs with your credentials, so an `agent_config` block in a repository's `.no-mistakes.yaml` is ignored.
+
+**Precedence.** `agent_args_override` always wins. If a raw flag already pins a knob natively - for example, `-m`, `--model`, or a `-c`/`--config` assignment whose exact key is `model` or `model_reasoning_effort` for Codex, plus the other harnesses' `--effort`, `--reasoning-effort`, or `--thinking` forms - then `agent_config` does not emit its value for that knob. Text such as `model=` nested inside an unrelated option's value is not a pin. Any knob the raw flags leave alone still comes from `agent_config`, so adding `agent_config` to an existing configuration never changes the arguments that configuration already supplied:
+
+```yaml
+agent_config:
+  codex:
+    model: gpt-5.4   # ignored: the raw -m below pins it
+    effort: low      # applied: nothing raw pins reasoning depth
+agent_args_override:
+  codex:
+    - -m
+    - o3
+```
 
 ### agent_args_override
 
 Extra CLI flags to pass to each native agent.
-Use this to set model selection, service tier, reasoning effort, permission mode, or any other flag the underlying agent supports.
+Use this for anything [`agent_config`](#agent_config) does not cover - service tier, permission mode, profiles, or any other flag the underlying agent supports - and as the escape hatch for a harness whose model or effort flag no-mistakes cannot map. For model and reasoning effort on a mapped harness, prefer `agent_config`: one spelling instead of seven.
 
 |         |                                                           |
 | ------- | --------------------------------------------------------- |
 | Type    | `map[string][]string`                                     |
-| Keys    | `claude`, `codex`, `rovodev`, `opencode`, `pi`, `copilot` |
+| Keys    | `claude`, `codex`, `grok`, `rovodev`, `opencode`, `pi`, `copilot`, `antigravity` |
 | Default | Empty (no extra flags)                                    |
 
 User-supplied flags are normally inserted ahead of no-mistakes' managed flags, so your choices usually take precedence. Security suppression selected by trusted [`disable_project_settings`](/no-mistakes/reference/repo-config/#disable_project_settings) may be placed first while preserving a compatible operator pin. A few flags are reserved because no-mistakes depends on them to communicate with the agent - setting any of these returns a config error on load:
@@ -186,18 +260,21 @@ User-supplied flags are normally inserted ahead of no-mistakes' managed flags, s
 | ---------- | ----------------------------------------------------------------------------------------------------------- |
 | `claude`   | `-p`, `--print`, `--verbose`, `--output-format`, `--json-schema`, `-r`, `--resume`, `--session-id`, `-c`, `--continue`, `--fork-session` |
 | `codex`    | `exec`, `resume`, `--resume`, `--session`, `--session-id`, `--thread`, `--thread-id`, `--last`, `--json`, `--color` |
+| `grok`     | `-p`, `--single`, `--prompt-file`, `--prompt-json`, `--output-format`, `--json-schema`, `-r`, `--resume`, `-c`, `--continue`, `--fork-session`, `--session-id`, `--system-prompt-override`, `--system-prompt`, `--rules`, `--append-system-prompt`, `--agent`, `--agents`, `--verbatim`, `--no-subagents`, `--no-auto-update`, `--cwd`, `--restore-code`, `--worktree`, `--worktree-ref` |
 | `rovodev`  | `rovodev`, `serve`, `--disable-session-token`                                                               |
 | `opencode` | `serve`, `--hostname`, `--port`, `--print-logs`                                                             |
-| `pi`       | `--mode`, `--no-session`                                                                                    |
+| `pi`       | `--mode`, `--no-session`, `-c`, `--continue`, `-r`, `--resume`, `--session`, `--session-id`, `--fork`     |
 | `copilot`  | `-p`, `--prompt`, `--output-format`, `--no-color`                                                          |
+| `antigravity` | `--dangerously-skip-permissions`, `--print`, `--json-schema`, `--output-format`, `--conversation`, `-c`, `--continue` |
 
 For structured `codex` runs, no-mistakes also appends its own `--output-schema <tempfile>` after your overrides. Treat that flag as managed even though config validation does not currently reject it.
-The Claude and Codex session-control forms are reserved so no-mistakes can keep review-loop conversations deterministic: review turns stay session-free while the fixer keeps its own isolated durable session.
+The Claude, Codex, Grok, Pi, and Antigravity session-control forms are reserved so no-mistakes can keep review-loop conversations deterministic: review turns stay session-free while the fixer keeps its own isolated durable session.
 
 Smart defaults:
 
 - For `claude`, supplying `--permission-mode` (or `--dangerously-skip-permissions`) suppresses the default `--dangerously-skip-permissions`.
 - For `codex`, supplying `--ask-for-approval`, `--sandbox`, or `--dangerously-bypass-approvals-and-sandbox` suppresses the default `--dangerously-bypass-approvals-and-sandbox`.
+- For `grok`, supplying `--permission-mode` or `--always-approve` suppresses the default `--permission-mode bypassPermissions`. No model flag is added: Grok uses its current configured default unless you explicitly set `-m` or `--model`.
 
 Permission and sandbox flags affect the underlying agent, but they do not disable no-mistakes' pipeline prompt steering.
 Pipeline agents are still told to keep intentional writes inside the worktree and avoid mutating system state outside it.
@@ -218,18 +295,20 @@ agent_args_override:
     - service_tier="priority"
     - -c
     - model_reasoning_effort="low"
+  grok:
+    - --reasoning-effort
+    - high
   rovodev:
     - --profile
     - work
-  opencode:
-    - --model
-    - gpt-5
   pi:
     - --provider
     - google
 ```
 
-For Codex, `service_tier` and `model_reasoning_effort` tune different things: `service_tier` selects the speed or priority lane, while `model_reasoning_effort` selects reasoning depth. no-mistakes reloads global config while setting up each run, so edits made before `no-mistakes axi run` apply to that run. For repeatable profiles, use separately initialized `NM_HOME` directories; each has its own `config.yaml` and no-mistakes state.
+Do not put a model flag under `opencode` here: these flags go to `opencode serve`, which exits with usage on an unknown option. Use `agent_config.opencode.model` instead.
+
+For Codex, `service_tier` and reasoning effort tune different things: `service_tier` selects the speed or priority lane, while reasoning depth is what [`agent_config`](#agent_config)'s `effort` sets (as `-c model_reasoning_effort`). no-mistakes reloads global config while setting up each run, so edits made before `no-mistakes axi run` apply to that run. For repeatable profiles, use separately initialized `NM_HOME` directories; each has its own `config.yaml` and no-mistakes state.
 
 ### ci_timeout
 
@@ -270,6 +349,54 @@ It does not cancel the step, change auto-fix behavior, or mark the run failed.
 AXI renders the quiet signal in the `active_steps` table as part of `last_activity`, for example `quiet 12m3s ago: codex started pid=4242`.
 For older active runs that do not yet have activity rows, AXI falls back to the step log file's modification time.
 
+### agent_timeout
+
+Maximum wall-clock time for one pipeline agent invocation that does not already have a more specific deadline.
+This is the default-by-construction budget: Document, Lint, Rebase conflict repair, PR drafting, CI auto-fix, and any future agent-spawning step are bounded even if they forget to install their own timer.
+Review still uses [`review_agent_timeout`](#review_agent_timeout) as a per-round budget, Test still uses [`test_agent_timeout`](#test_agent_timeout) per invocation, and Intent keeps its five-minute extraction cap; any existing deadline is honored rather than capped.
+When this deadline expires, the agent is cancelled and the invocation returns a timeout diagnostic instead of remaining active indefinitely. Agent-driven mutation steps fail the run, while PR drafting follows its existing agent-error fallback and continues with deterministic content.
+A late successful return after the deadline is rejected, so post-agent commits and PR content cannot use work from a timed-out turn.
+
+|         |                        |
+| ------- | ---------------------- |
+| Type    | `string` (Go duration) |
+| Default | `30m`                  |
+
+Accepts any positive Go `time.ParseDuration` string: `5m`, `30m`, `1h`, etc.
+Non-positive values are rejected when loading the global config.
+Raise it for repositories whose document, lint, rebase, PR, or CI-fix agent turns legitimately run long.
+It is global-only: repository config and environment variables cannot override it.
+
+### review_agent_timeout
+
+Maximum wall-clock time for the Review step's agent turns in one review round.
+The budget starts at that round's first agent turn and covers its optional review-fix turn plus the rereview turn together; every later auto-fix round starts a fresh budget.
+When the deadline expires, the review agent is cancelled and the run fails with a diagnostic naming the timeout instead of remaining active indefinitely.
+
+|         |                        |
+| ------- | ---------------------- |
+| Type    | `string` (Go duration) |
+| Default | `30m`                  |
+
+Accepts any positive Go `time.ParseDuration` string: `5m`, `30m`, `1h`, etc.
+Non-positive values are rejected when loading the global config.
+Raise it for repositories whose reviews legitimately run long; it bounds only the Review step, and no other step or environment variable overrides it.
+
+### test_agent_timeout
+
+Maximum wall-clock time for one Test-step agent invocation.
+The budget covers the post-test evidence-gathering turn, and a Test-repair turn gets its own budget of the same length.
+When the deadline expires, the test agent is cancelled and the run fails with a diagnostic naming the timeout instead of remaining active indefinitely.
+
+|         |                        |
+| ------- | ---------------------- |
+| Type    | `string` (Go duration) |
+| Default | `30m`                  |
+
+Accepts any positive Go `time.ParseDuration` string: `5m`, `30m`, `1h`, etc.
+Non-positive values are rejected when loading the global config.
+Raise it for repositories whose targeted tests or evidence gathering legitimately run long; it bounds only the Test step, and no other step or environment variable overrides it.
+
 ### daemon_connect_timeout
 
 Maximum time a CLI client waits for an existing daemon socket to accept a connection before failing instead of hanging. Guards against a daemon process that is alive but stuck or unresponsive.
@@ -280,6 +407,19 @@ Maximum time a CLI client waits for an existing daemon socket to accept a connec
 | Default | `3s`                   |
 
 Accepts any positive Go `time.ParseDuration` string. Overridable per-invocation with the `NM_DAEMON_CONNECT_TIMEOUT` environment variable; see [Environment Variables](/no-mistakes/reference/environment/#nm_daemon_connect_timeout).
+
+### branch_sync_remote_timeout
+
+Maximum time guarded branch synchronization (`sync`, `axi sync`, and the TUI's sync action) waits for each remote Git operation - `ls-remote` or `fetch` - before remote verification fails closed and synchronization is refused.
+
+|         |                        |
+| ------- | ---------------------- |
+| Type    | `string` (Go duration) |
+| Default | `60s`                  |
+
+Accepts any positive Go `time.ParseDuration` string.
+
+Raise this if your environment's Git credential helper (for example `gh auth git-credential`, invoked by Git as a child process against a private remote) legitimately takes longer than the default - this is a real, non-outage latency characteristic that has been observed taking 19-22s in some environments, not a hang. It is a machine/environment setting, not a per-repository one: it is read only from global config and has no matching field in a repository's `.no-mistakes.yaml`, so a pushed branch cannot widen or narrow how long the local service waits before failing closed. It never changes the fail-closed guarantee itself - a timeout or unknown remote state still always refuses synchronization without changing files or refs, whatever this value is set to.
 
 ### log_level
 
@@ -300,13 +440,44 @@ Per-run agent session reuse for the review loop's fixer role.
 | Type    | `bool` |
 | Default | `true` |
 
-When enabled and the pipeline agent supports native session resume (claude via `--resume`, codex via `exec resume`), each run keeps one durable fixer session across its review-fix turns.
+When enabled and the pipeline agent supports native session resume (Claude or Grok via `--resume`, Codex via `exec resume`, Pi via `--session <UUID>`, Antigravity via `--conversation <id>`), each run keeps one durable fixer session across its review-fix turns.
 Review turns - the initial full review and every full rereview - always run as fresh, session-free invocations regardless of this setting: a rereview certifies fixes that implement the previous review turn's findings, so it must never resume the session that prescribed them; cross-round review context travels only in the explicit sanitized round history.
 The fixer session is never lent to review turns, other pipeline steps stay session-isolated in their own cold invocations, and different runs never reuse identities.
-When resume is unavailable or fails, the fix turn falls back to a cold run or a fresh fixer session and the fallback is recorded in the local `agent_invocations` performance record.
-Session identities are persisted only as minimum local resume metadata, never as prompts or transcripts.
+When resume is unavailable or fails, the fix turn falls back to a cold run or a fresh fixer session and the fallback is recorded in the local `agent_invocations` performance record. Pi emits per-invocation usage after a resume, unlike Codex's cumulative session counters.
+Session identities are persisted only as minimum local resume metadata, never as prompts or transcripts; Pi's own session directory retains its native transcript. Keep Pi's session directory private, and keep any `--session-dir` or `PI_CODING_AGENT_SESSION_DIR` setting stable while a run is active so a daemon restart can find the fixer session.
 The [daemon crash-recovery reference](/no-mistakes/concepts/daemon/#crash-recovery) owns which parked gates can resume or reconcile after a restart.
 Set `false` to force every agent invocation cold.
+
+### worktree_roots
+
+Where a repository's pipeline run worktrees are created.
+
+|         |                                                 |
+| ------- | ----------------------------------------------- |
+| Type    | `map[string]string`                             |
+| Keys    | Absolute registered checkout paths (what you ran `no-mistakes init` in) |
+| Values  | Absolute directory paths                        |
+| Default | Empty (`<NM_HOME>/worktrees/<repo id>/<run id>`) |
+
+By default a run worktree is created under `NM_HOME`, outside every checkout, so directory-scoped toolchain configuration (mise, direnv) never reaches it: those tools resolve their settings by path ancestry.
+Point a checkout at a directory of your own and its runs are created at `<value>/<run id>` instead, inheriting whatever that directory configures.
+A relative value is rejected at load time, because the daemon that reads it has an unrelated working directory.
+
+The directory stays yours. no-mistakes never enumerates it: the only directories it touches there are the exact ones its own run records name, which is what startup cleanup, orphan-process reaping, and `no-mistakes eject` all go by. Anything else in it - your files, your scratch checkouts, and a directory that merely looks like a run worktree but no run created - is never read, never swept, never signalled, and never removed.
+
+Each checkout needs its own root: two entries pointing at the same directory, two spellings of one checkout, or a root equal to its checkout are rejected at load time, and `init --worktree-root` refuses a directory another checkout already claims.
+
+Two more values are refused at daemon startup, because they cannot work:
+
+- **Inside `NM_HOME`.** It collides with no-mistakes' own state - under `worktrees` a run worktree is indistinguishable from the per-repository directories the default placement owns, and under `logs` a run's worktree *is* its log directory, so removing the worktree at run end would take the run's logs with it.
+- **Inside any checkout.** The run worktree is then an untracked directory in that checkout while the run executes, so the checkout is dirty and [branch synchronization](/no-mistakes/reference/cli/#no-mistakes-sync) refuses to move it until the run finishes. That holds whether the victim is the checkout whose own runs land there or an unrelated gated one, so the daemon refuses a root inside any repository it has registered. Registering a repository *around* an already configured root is refused by `no-mistakes init` itself, so you can still place that checkout elsewhere or repoint the entry; anything that reaches the configuration another way is caught at the next daemon start.
+
+Changing an entry affects new runs only.
+Each run records the directory it was created in, so editing, adding, or removing an entry never retargets a run that already exists - resuming it after a restart, reading its diff, cleaning it up, reaping processes left standing in it, and ejecting its repository all keep using the directory that run actually has, including after you point the checkout somewhere else.
+
+The key is matched against the checkout path recorded at `init`. After moving a checkout, re-run `no-mistakes init` from the new path and update the key; a key that matches no registered repository is reported in the daemon log at startup and otherwise does nothing.
+
+`no-mistakes init --worktree-root <dir>` prints the exact entry to add for the checkout you are initializing. The global config is hand-maintained, so init never rewrites it for you.
 
 ### auto_fix
 

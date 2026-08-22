@@ -15,6 +15,7 @@ import (
 
 	"github.com/kunchenguid/no-mistakes/internal/agent"
 	"github.com/kunchenguid/no-mistakes/internal/config"
+	"github.com/kunchenguid/no-mistakes/internal/custody"
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/gateguidance"
 	"github.com/kunchenguid/no-mistakes/internal/git"
@@ -398,18 +399,21 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 	telemetry.Track("approval", approvalFields)
 	switch response.action {
 	case types.ActionApprove:
+		e.recordDeclinedRound(gate.lastRoundID, gate.findings, gate.step.Name(), gate.round)
 		if err := completeRecoveredGate(); err != nil {
 			return e.failRun(run, repo, fmt.Errorf("complete recovered step %s: %w", gate.step.Name(), err), ctx)
 		}
 		e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, gate.step.Name(), string(types.StepStatusCompleted), "", "", &duration)
 		return e.executeRecoveredRemainder(ctx, run, repo, workDir, logDir, gate.index+1)
 	case types.ActionSkip:
+		e.recordDeclinedRound(gate.lastRoundID, gate.findings, gate.step.Name(), gate.round)
 		if err := e.db.CompleteStepWithStatus(gate.stepResult.ID, types.StepStatusSkipped, recoveredExitCode(gate.stepResult), duration, recoveredLogPath(gate.stepResult)); err != nil {
 			return e.failRun(run, repo, fmt.Errorf("skip recovered step %s: %w", gate.step.Name(), err), ctx)
 		}
 		e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, gate.step.Name(), string(types.StepStatusSkipped), "", "", &duration)
 		return e.executeRecoveredRemainder(ctx, run, repo, workDir, logDir, gate.index+1)
 	case types.ActionAbort:
+		e.recordDeclinedRound(gate.lastRoundID, gate.findings, gate.step.Name(), gate.round)
 		if dbErr := e.db.FailStep(gate.stepResult.ID, "aborted by user", duration); dbErr != nil {
 			slog.Warn("failed to mark recovered step as aborted", "step", gate.step.Name(), "error", dbErr)
 		}
@@ -694,6 +698,9 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 
 	stepAgent := e.agent
 	if stepAgent != nil {
+		// Innermost: default-by-construction invocation deadline so a step
+		// that calls Agent.Run directly cannot hang the run.
+		stepAgent = &timeoutAgent{inner: stepAgent, timeout: AgentTimeout(e.config)}
 		stepAgent = &gateStepBoundaryAgent{inner: stepAgent, phase: stepName}
 		stepAgent = &lifecycleAgent{inner: stepAgent, onLifecycle: onAgentLifecycle}
 		stepAgent = &perfRecordingAgent{
@@ -743,6 +750,9 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 	if stepName == types.StepReview {
 		BindUncertifiedPipelineRange(sctx)
 	}
+	// Every step, not just review: the steps that used to re-apply a declined
+	// change were precisely the ones a decision never reached.
+	BindBranchDecisions(sctx)
 
 	nextTrigger := "initial"
 	if sctx.Fixing {
@@ -943,11 +953,13 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 		case types.ActionApprove:
 			// Approved - execution already frozen in executionMS, reset phaseStart
 			// so the done label computes no additional elapsed.
+			e.recordDeclinedRound(currentRoundID, outcome.Findings, stepName, roundNum)
 			phaseStart = time.Now()
 			goto done
 
 		case types.ActionSkip:
 			// Skip - mark step skipped and return (not an error)
+			e.recordDeclinedRound(currentRoundID, outcome.Findings, stepName, roundNum)
 			if err := e.db.CompleteStepWithStatus(sr.ID, types.StepStatusSkipped, finalExitCode, executionMS, logPath); err != nil {
 				return false, fmt.Errorf("complete step %s (skip): %w", stepName, err)
 			}
@@ -955,6 +967,7 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 			return false, nil
 
 		case types.ActionAbort:
+			e.recordDeclinedRound(currentRoundID, outcome.Findings, stepName, roundNum)
 			if dbErr := e.db.FailStep(sr.ID, "aborted by user", executionMS); dbErr != nil {
 				slog.Warn("failed to mark step as failed in db", "step", stepName, "error", dbErr)
 			}
@@ -1019,6 +1032,36 @@ done:
 	}
 	e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, stepName, string(status), "", "", &durationMS)
 	return skipRemaining, nil
+}
+
+// recordDeclinedRound persists an approve, skip, or abort resolution as a real
+// decision instead of leaving no trace.
+//
+// Before this existed, those three resolutions wrote no finding-level state at
+// all, so a round where the human read a blocking finding and said "ship it as
+// is" was byte-identical to a round with no findings. Nothing downstream could
+// tell the two apart, and the only durable statement of what the change must do
+// stayed the user-intent prose - which is how a later step could re-derive and
+// re-apply the very change the human had just declined.
+//
+// The decline is stored the way a partial selection already stores one: as the
+// complement of selected_finding_ids. Writing an explicit empty array with the
+// user_declined source is what makes "selected nothing" representable, since a
+// NULL column means "no decision was recorded".
+//
+// Best effort by design. This is advisory prompt context for later steps, so a
+// failed write degrades to today's behavior and must never fail the run.
+func (e *Executor) recordDeclinedRound(roundID, findingsJSON string, stepName types.StepName, roundNum int) {
+	if e == nil || e.db == nil || roundID == "" {
+		return
+	}
+	if findingsCount(findingsJSON) == 0 {
+		// Nothing was declined, so there is no decision to record.
+		return
+	}
+	if err := e.db.SetStepRoundDeclined(roundID); err != nil {
+		slog.Warn("failed to record declined findings", "step", stepName, "round", roundNum, "error", err)
+	}
 }
 
 func roundInsertID(_ string, inserted *db.StepRound, err error) string {
@@ -1308,13 +1351,42 @@ func (e *Executor) reconcileTerminalRunHead(run *db.Run) (string, bool) {
 		return "", false
 	}
 	if observed == recorded {
+		if !e.preserveUnpublishedTerminalHead(ctx, recordedRun, observed) {
+			return "", false
+		}
 		return recorded, true
 	}
 	if _, err := git.Run(ctx, e.workDir, "merge-base", "--is-ancestor", recorded, observed); err != nil {
 		slog.Warn("worktree head is not a verified descendant before terminalization", "run", run.ID, "error", err)
 		return "", false
 	}
+	if !e.preserveUnpublishedTerminalHead(ctx, recordedRun, observed) {
+		return "", false
+	}
 	return observed, true
+}
+
+func (e *Executor) preserveUnpublishedTerminalHead(ctx context.Context, run *db.Run, head string) bool {
+	if run == nil || head == "" {
+		return false
+	}
+	published := ""
+	if run.LastPushedSHA != nil {
+		published = *run.LastPushedSHA
+	}
+	if published == "" {
+		if run.SubmittedHeadSHA != nil {
+			published = *run.SubmittedHeadSHA
+		}
+	}
+	if head == published {
+		return true
+	}
+	if err := custody.PreserveRecoveryHead(ctx, e.workDir, run.ID, head); err != nil {
+		slog.Warn("failed to anchor unpublished terminal head", "run", run.ID, "head", head, "error", err)
+		return false
+	}
+	return true
 }
 
 // --- event helpers ---
