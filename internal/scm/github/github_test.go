@@ -114,6 +114,28 @@ func TestGetChecksPassesRepoFlag(t *testing.T) {
 	}
 }
 
+// A failing gh must surface its stderr in the error: a broken gh (e.g. < v2.50
+// rejecting `pr checks --json`) is only diagnosable from the step log if the
+// provider message survives the error. See the #644 hardening intent.
+func TestGetChecksSurfacesGHErrorStderr(t *testing.T) {
+	t.Parallel()
+
+	host := New(githubTestCmdFactory(map[string]githubTestResponse{
+		"gh pr checks 123 --repo test/repo --json name,state,bucket,completedAt,link": {
+			stderr: "flag needs an argument: --json",
+			code:   1,
+		},
+	}), nil, "", "test/repo")
+
+	_, err := host.GetChecks(context.Background(), &scm.PR{Number: "123"})
+	if err == nil {
+		t.Fatal("GetChecks() expected the gh failure to propagate")
+	}
+	if !strings.Contains(err.Error(), "flag needs an argument: --json") {
+		t.Fatalf("GetChecks() error = %v, want gh stderr in the error", err)
+	}
+}
+
 func TestGetChecksIncludesFailedWorkflowRunMissingFromPRRollup(t *testing.T) {
 	t.Parallel()
 
@@ -860,6 +882,61 @@ func TestFetchFailedCheckLogsSelectsMatchingRunForHeadSHA(t *testing.T) {
 	}
 	if logs != "lint failed" {
 		t.Fatalf("FetchFailedCheckLogs() = %q, want %q", logs, "lint failed")
+	}
+}
+
+// A GitHub Actions action-download outage fails a job inside "Set up job",
+// before any repository step runs. PreRunFailures must flag exactly that job -
+// read structurally from the setup step's conclusion, never from log text - and
+// must never flag a job that cleared setup and failed a later (repository) step.
+// The two directions together are the masking-safety contract.
+func TestPreRunFailures_FlagsSetupFailureNotGenuine(t *testing.T) {
+	t.Parallel()
+
+	host := New(githubTestCmdFactory(map[string]githubTestResponse{
+		"gh run view 1 --repo test/repo --json jobs": {
+			stdout: `{"jobs":[` +
+				`{"databaseId":2,"name":"build","conclusion":"failure","steps":[{"name":"Set up job","number":1,"conclusion":"failure"}]},` +
+				`{"databaseId":3,"name":"unit","conclusion":"failure","steps":[{"name":"Set up job","number":1,"conclusion":"success"},{"name":"Run tests","number":2,"conclusion":"failure"}]}` +
+				`]}` + "\n",
+		},
+	}), nil, "", "test/repo")
+
+	infra, err := host.PreRunFailures(context.Background(), []scm.Check{
+		{Name: "build", Bucket: scm.CheckBucketFail, State: "FAILURE", Link: "https://github.com/test/repo/actions/runs/1/job/2"},
+		{Name: "unit", Bucket: scm.CheckBucketFail, State: "FAILURE", Link: "https://github.com/test/repo/actions/runs/1/job/3"},
+	})
+	if err != nil {
+		t.Fatalf("PreRunFailures() error = %v", err)
+	}
+	if len(infra) != 2 {
+		t.Fatalf("PreRunFailures returned %d results, want 2 parallel to the checks", len(infra))
+	}
+	if !infra[0] {
+		t.Error("PreRunFailures did not flag the setup/action-download failure")
+	}
+	if infra[1] {
+		t.Error("PreRunFailures flagged a genuine test failure that cleared setup (masking)")
+	}
+}
+
+// A run the provider cannot report on must leave every check unflagged, so an
+// unreadable job stays a genuine failure rather than being masked.
+func TestPreRunFailures_FailsClosedOnUnreadableRun(t *testing.T) {
+	t.Parallel()
+
+	host := New(githubTestCmdFactory(map[string]githubTestResponse{
+		"gh run view 9 --repo test/repo --json jobs": {stderr: "HTTP 404\n", code: 1},
+	}), nil, "", "test/repo")
+
+	infra, err := host.PreRunFailures(context.Background(), []scm.Check{
+		{Name: "build", Bucket: scm.CheckBucketFail, State: "FAILURE", Link: "https://github.com/test/repo/actions/runs/9/job/2"},
+	})
+	if err != nil {
+		t.Fatalf("PreRunFailures() error = %v", err)
+	}
+	if len(infra) != 1 || infra[0] {
+		t.Fatalf("PreRunFailures = %v, want nothing flagged when the run is unreadable", infra)
 	}
 }
 
