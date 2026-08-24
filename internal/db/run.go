@@ -612,6 +612,16 @@ func (d *DB) UpdateRunHeadSHA(id, headSHA string) error {
 	return nil
 }
 
+// UpdateRunHeadSHAForRevalidation records a late repair while revoking the
+// previous review binding so the repaired head must pass review before push.
+func (d *DB) UpdateRunHeadSHAForRevalidation(id, headSHA string) error {
+	_, err := d.sql.Exec(`UPDATE runs SET head_sha = ?, review_approved_head_sha = NULL, updated_at = ? WHERE id = ?`, headSHA, now(), id)
+	if err != nil {
+		return fmt.Errorf("update run head sha for revalidation: %w", err)
+	}
+	return nil
+}
+
 // UpdateRunError sets the error message on a run.
 func (d *DB) UpdateRunError(id, errMsg string) error {
 	return d.UpdateRunErrorStatus(id, errMsg, types.RunFailed)

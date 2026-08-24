@@ -151,6 +151,15 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 	if err := assertPipelineHeadContinuity(sctx, s.Name()); err != nil {
 		return nil, err
 	}
+	if sctx.StepResultID != "" {
+		stepResult, err := sctx.DB.GetStepResult(sctx.StepResultID)
+		if err != nil {
+			return nil, fmt.Errorf("restore CI auto-fix attempts: %w", err)
+		}
+		if stepResult != nil {
+			s.ciFixAttempts = max(s.ciFixAttempts, stepResult.CIFixAttempts)
+		}
+	}
 	// A run recovered after a restart resumes the rerun budget it already
 	// spent. Without this the fresh in-memory budget would grant reruns the
 	// documented limit already accounted for.
@@ -511,12 +520,13 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 					manualFixAttempted = true
 					sctx.Log(fmt.Sprintf("issues detected: %s - manual fix requested...", issueDesc))
 					previousHeadSHA := sctx.Run.HeadSHA
-					pushed, err := s.autoFixCI(sctx, host, pr, fixTargets, mergeConflict)
+					changed, err := s.autoFixCI(sctx, host, pr, fixTargets, mergeConflict)
 					if err != nil {
 						sctx.Log(fmt.Sprintf("warning: CI manual fix failed: %v", err))
-					} else if pushed || sctx.Run.HeadSHA != previousHeadSHA {
+					} else if changed || sctx.Run.HeadSHA != previousHeadSHA {
 						s.lastFixedChecks = fixKey
 						s.lastFixedCompletedAt = fixCompletedAt
+						return &pipeline.StepOutcome{RestartFrom: types.StepReview}, nil
 					} else {
 						sctx.Log("CI fix produced no changes, returning for manual intervention...")
 						return ciFailureOutcome(reportedIssues, mergeConflict, "CI fix produced no changes - failures require manual intervention"), nil
@@ -532,15 +542,22 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 				} else if fixKey == s.lastFixedChecks {
 					sctx.Log("fix already attempted for these issues, waiting for CI re-run...")
 				} else {
-					s.ciFixAttempts++
+					nextAttempt := s.ciFixAttempts + 1
+					if sctx.StepResultID != "" {
+						if err := sctx.DB.SetCIFixAttempts(sctx.StepResultID, nextAttempt); err != nil {
+							return nil, fmt.Errorf("persist CI auto-fix attempt: %w", err)
+						}
+					}
+					s.ciFixAttempts = nextAttempt
 					sctx.Log(fmt.Sprintf("issues detected: %s - auto-fixing (attempt %d/%d)...", issueDesc, s.ciFixAttempts, ciFixLimit))
 					previousHeadSHA := sctx.Run.HeadSHA
-					pushed, err := s.autoFixCI(sctx, host, pr, fixTargets, mergeConflict)
+					changed, err := s.autoFixCI(sctx, host, pr, fixTargets, mergeConflict)
 					if err != nil {
 						sctx.Log(fmt.Sprintf("warning: CI auto-fix failed: %v", err))
-					} else if pushed || sctx.Run.HeadSHA != previousHeadSHA {
+					} else if changed || sctx.Run.HeadSHA != previousHeadSHA {
 						s.lastFixedChecks = fixKey
 						s.lastFixedCompletedAt = fixCompletedAt
+						return &pipeline.StepOutcome{RestartFrom: types.StepReview}, nil
 					} else {
 						// No changes produced - don't set lastFixedChecks so next
 						// poll treats this as a new failure and retries if attempts remain.
