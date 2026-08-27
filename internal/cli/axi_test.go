@@ -535,8 +535,9 @@ func TestStatusEmptyHelpIncludesRequiredIntent(t *testing.T) {
 }
 
 func TestLogsNoRunHelpIncludesRequiredIntent(t *testing.T) {
-	if !strings.Contains(noRunLogsHelp(), "--intent") {
-		t.Fatalf("no-run logs help must include required --intent, got %q", noRunLogsHelp())
+	help := strings.Join(noRunLogsHelp(), "\n")
+	if !strings.Contains(help, "--intent") {
+		t.Fatalf("no-run logs help must include required --intent, got %q", help)
 	}
 }
 
@@ -882,7 +883,7 @@ func TestResolveRunPrefersCurrentBranchLatestRun(t *testing.T) {
 		t.Fatalf("run other run: %v", err)
 	}
 
-	got, err := resolveRun(&axiEnv{d: database, repo: repo}, "", "feature/current")
+	got, _, err := resolveRun(&axiEnv{d: database, repo: repo}, "", "feature/current")
 	if err != nil {
 		t.Fatalf("resolve run: %v", err)
 	}

@@ -378,6 +378,7 @@ func (h *Host) GetChecks(ctx context.Context, pr *scm.PR) ([]scm.Check, error) {
 			return nil, err
 		}
 		checks = h.appendUnrepresentedWorkflowRuns(checks, runs)
+		checks = h.collapseLatestByName(checks)
 		currentHeadSHA, err := h.getPRHeadSHA(ctx, selector)
 		if err != nil {
 			return nil, err
@@ -430,7 +431,7 @@ func (h *Host) getPRChecks(ctx context.Context, selector string) ([]scm.Check, e
 	return checks, nil
 }
 
-const commitChecksQuery = `query($owner:String!,$name:String!,$oid:String!,$cursor:String){repository(owner:$owner,name:$name){object(expression:$oid){... on Commit{statusCheckRollup{contexts(first:100,after:$cursor){nodes{__typename ... on CheckRun{name status conclusion completedAt detailsUrl} ... on StatusContext{context state targetUrl}} pageInfo{hasNextPage endCursor}}}}}}}`
+const commitChecksQuery = `query($owner:String!,$name:String!,$oid:String!,$cursor:String){repository(owner:$owner,name:$name){object(expression:$oid){... on Commit{statusCheckRollup{contexts(first:100,after:$cursor){nodes{__typename ... on CheckRun{name status conclusion completedAt startedAt detailsUrl} ... on StatusContext{context state targetUrl}} pageInfo{hasNextPage endCursor}}}}}}}`
 
 func (h *Host) getCommitChecks(ctx context.Context, headSHA string) ([]scm.Check, error) {
 	repo := h.repoSlug()
@@ -466,6 +467,7 @@ func (h *Host) getCommitChecks(ctx context.Context, headSHA string) ([]scm.Check
 									Status      string `json:"status"`
 									Conclusion  string `json:"conclusion"`
 									CompletedAt string `json:"completedAt"`
+									StartedAt   string `json:"startedAt"`
 									DetailsURL  string `json:"detailsUrl"`
 									Context     string `json:"context"`
 									State       string `json:"state"`
@@ -495,6 +497,7 @@ func (h *Host) getCommitChecks(ctx context.Context, headSHA string) ([]scm.Check
 			check := scm.Check{}
 			switch node.Type {
 			case "CheckRun":
+				check.Kind = scm.CheckKindRun
 				check.Name = strings.TrimSpace(node.Name)
 				check.State = strings.ToUpper(strings.TrimSpace(node.Conclusion))
 				if check.State == "" {
@@ -508,7 +511,11 @@ func (h *Host) getCommitChecks(ctx context.Context, headSHA string) ([]scm.Check
 				if parsed, parseErr := time.Parse(time.RFC3339, node.CompletedAt); parseErr == nil {
 					check.CompletedAt = parsed
 				}
+				if parsed, parseErr := time.Parse(time.RFC3339, node.StartedAt); parseErr == nil {
+					check.StartedAt = parsed
+				}
 			case "StatusContext":
+				check.Kind = scm.CheckKindStatus
 				check.Name = strings.TrimSpace(node.Context)
 				check.State = strings.ToUpper(strings.TrimSpace(node.State))
 				check.Bucket = normalizeCheckBucket("", node.State)
@@ -540,23 +547,110 @@ func (h *Host) repoSlug() string {
 }
 
 func (h *Host) appendUnrepresentedWorkflowRuns(checks, runs []scm.Check) []scm.Check {
-	represented := make(map[string]struct{}, len(checks))
-	for _, check := range checks {
+	represented := make(map[string][]int, len(checks))
+	for i, check := range checks {
 		if runID := h.actionsRunID(check.Link); runID != "" {
-			represented[runID] = struct{}{}
+			represented[runID] = append(represented[runID], i)
 		}
 	}
 	for _, run := range runs {
 		runID := h.actionsRunID(run.Link)
-		if _, exists := represented[runID]; runID != "" && exists {
+		if indices := represented[runID]; runID != "" && len(indices) > 0 {
+			for _, i := range indices {
+				if checks[i].StartedAt.IsZero() && !run.StartedAt.IsZero() {
+					checks[i].StartedAt = run.StartedAt
+				}
+				checks[i].WorkflowID = run.WorkflowID
+			}
 			continue
 		}
 		checks = append(checks, run)
 		if runID != "" {
-			represented[runID] = struct{}{}
+			represented[runID] = []int{len(checks) - 1}
 		}
 	}
 	return checks
+}
+
+// collapseLatestByName collapses orderable same-name reruns of one workflow
+// to the most recently started one. Independent workflows and records whose
+// provider metadata cannot establish an order remain visible. GitHub's raw
+// commit statusCheckRollup returns every check run ever attached to the commit,
+// including runs a later same-named run has
+// already superseded - e.g. a CI monitor's auto-fix push re-triggers the
+// same gate check, and the rollup keeps both the old FAILURE and the new
+// SUCCESS forever. Without this collapse the superseded failure stays
+// visible even after the later run at the same head turns green, which
+// manufactures an unrecoverable auto-fix loop (see AGENTS.md "CI Monitor
+// Lifecycle"). This restores the semantics `gh pr checks` already applies
+// (collapse by startedAt) to the commit-rollup path, which never had it.
+//
+// Must run AFTER appendUnrepresentedWorkflowRuns, never before: that call
+// dedupes by Actions run ID against the FULL uncollapsed rollup. Collapsing
+// first would drop a superseded run's ID out of the "represented" set the
+// union checks against, letting the union re-add the same stale run under
+// its own workflow run name - resurrecting exactly the failure this is
+// meant to hide.
+func (h *Host) collapseLatestByName(checks []scm.Check) []scm.Check {
+	collapsed := make([]scm.Check, 0, len(checks))
+	for _, check := range checks {
+		keep := true
+		for i := 0; i < len(collapsed); {
+			other := collapsed[i]
+			if !h.sameCheckReplacementGroup(check, other) {
+				i++
+				continue
+			}
+			after, ordered := h.checkStartedAfter(check, other)
+			if !ordered {
+				i++
+				continue
+			}
+			if !after {
+				keep = false
+				break
+			}
+			collapsed = append(collapsed[:i], collapsed[i+1:]...)
+		}
+		if keep {
+			collapsed = append(collapsed, check)
+		}
+	}
+	return collapsed
+}
+
+func (h *Host) sameCheckReplacementGroup(a, b scm.Check) bool {
+	if a.Kind != scm.CheckKindRun || b.Kind != scm.CheckKindRun || a.Name != b.Name {
+		return false
+	}
+	// Only distinct runs of the same known workflow establish rerun identity.
+	// Missing workflow/run identities may be independent external checks, while
+	// equal run identities may be independent same-name jobs within one run.
+	// Collapsing either case could hide a failing requirement.
+	aRunID := h.actionsRunID(a.Link)
+	bRunID := h.actionsRunID(b.Link)
+	return a.WorkflowID != 0 && a.WorkflowID == b.WorkflowID &&
+		aRunID != "" && bRunID != "" && aRunID != bRunID
+}
+
+// checkStartedAfter reports whether a is newer and whether the available
+// provider metadata establishes an order between the checks.
+func (h *Host) checkStartedAfter(a, b scm.Check) (bool, bool) {
+	if !a.StartedAt.IsZero() && !b.StartedAt.IsZero() && !a.StartedAt.Equal(b.StartedAt) {
+		return a.StartedAt.After(b.StartedAt), true
+	}
+	if aID, aErr := strconv.ParseUint(h.actionsRunID(a.Link), 10, 64); aErr == nil {
+		if bID, bErr := strconv.ParseUint(h.actionsRunID(b.Link), 10, 64); bErr == nil && aID != bID {
+			return aID > bID, true
+		}
+	}
+	if a.StartedAt.IsZero() != b.StartedAt.IsZero() {
+		return false, false
+	}
+	if !a.CompletedAt.IsZero() && !b.CompletedAt.IsZero() && !a.CompletedAt.Equal(b.CompletedAt) {
+		return a.CompletedAt.After(b.CompletedAt), true
+	}
+	return false, false
 }
 
 func (h *Host) getPRHeadSHA(ctx context.Context, selector string) (string, error) {
@@ -593,13 +687,16 @@ func (h *Host) getWorkflowRunChecks(ctx context.Context, headSHA string) ([]scm.
 		return nil, fmt.Errorf("gh api workflow runs for head commit: %s: %w", strings.TrimSpace(string(out)), err)
 	}
 	type workflowRun struct {
-		ID          int64  `json:"id"`
-		Name        string `json:"name"`
-		DisplayName string `json:"display_title"`
-		Status      string `json:"status"`
-		Conclusion  string `json:"conclusion"`
-		UpdatedAt   string `json:"updated_at"`
-		HTMLURL     string `json:"html_url"`
+		ID           int64  `json:"id"`
+		WorkflowID   int64  `json:"workflow_id"`
+		Name         string `json:"name"`
+		DisplayName  string `json:"display_title"`
+		Status       string `json:"status"`
+		Conclusion   string `json:"conclusion"`
+		RunStartedAt string `json:"run_started_at"`
+		CreatedAt    string `json:"created_at"`
+		UpdatedAt    string `json:"updated_at"`
+		HTMLURL      string `json:"html_url"`
 	}
 	var pages []struct {
 		TotalCount   *int          `json:"total_count"`
@@ -646,6 +743,13 @@ func (h *Host) getWorkflowRunChecks(ctx context.Context, headSHA string) ([]scm.
 		if name == "" {
 			name = "GitHub Actions workflow"
 		}
+		var startedAt time.Time
+		for _, timestamp := range []string{run.RunStartedAt, run.CreatedAt} {
+			if parsed, parseErr := time.Parse(time.RFC3339, timestamp); parseErr == nil {
+				startedAt = parsed
+				break
+			}
+		}
 		var completedAt time.Time
 		if run.UpdatedAt != "" {
 			if parsed, parseErr := time.Parse(time.RFC3339, run.UpdatedAt); parseErr == nil {
@@ -674,7 +778,7 @@ func (h *Host) getWorkflowRunChecks(ctx context.Context, headSHA string) ([]scm.
 			}
 			link = fmt.Sprintf("https://%s/%s/actions/runs/%d", host, repo, run.ID)
 		}
-		checks = append(checks, scm.Check{Name: name, Bucket: bucket, State: state, CompletedAt: completedAt, Link: link})
+		checks = append(checks, scm.Check{Name: name, Bucket: bucket, Kind: scm.CheckKindRun, State: state, CompletedAt: completedAt, StartedAt: startedAt, WorkflowID: run.WorkflowID, Link: link})
 	}
 	return checks, nil
 }

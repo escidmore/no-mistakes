@@ -161,24 +161,32 @@ The same successful-output reporting instructions apply to `axi respond` results
 
 ## no-mistakes axi status
 
-Show a run, preferring the current branch's active or most recent run before falling back to repo-wide active or recent runs.
+When `--run` is omitted, show this branch's run: its active run, else its most recent one.
+Resolution is scoped to the current branch and never falls back to another branch's run, because one clone commonly has several worktrees on different branches.
+On a successful status response, when the current branch has no run of its own - including a detached `HEAD`, which owns no branch and so reports `current_branch: unknown` - the output carries no run object at all.
+It reports `current_branch`, `runs_on_current_branch: 0` where a branch is known, and the recent-runs listing, so an unrelated run can never be read as this worktree's.
+If the implicit current-branch lookup itself fails, status returns that error instead of presenting the failure as a detached or no-run result.
+Detached-`HEAD` help offers deliberate `--run <id>` inspection or checking out a branch; it does not offer `axi run`, which requires a branch.
+With `--run <id>`, inspect exactly that run regardless of branch; when its branch differs from a known current branch, it is rendered under `other_branch_run:` instead of `run:`, alongside a top-level `current_branch`, so a parser keyed on `run:` never picks up a run proven to be on another branch.
+An explicit `--run <id>` rendered under `run:` while the current branch is unknown (detached `HEAD` or a branch-lookup failure) encodes no branch relationship.
 
 ```sh
 no-mistakes axi status
 no-mistakes axi status --run <id>
 ```
 
-| Flag    | Type     | Default      | Description               |
-| ------- | -------- | ------------ | ------------------------- |
-| `--run` | `string` | resolved run | Inspect a specific run ID |
+| Flag    | Type     | Default            | Description               |
+| ------- | -------- | ------------------ | ------------------------- |
+| `--run` | `string` | current-branch run | Inspect a specific run ID |
 
-When the resolved run is parked at an `awaiting_approval` or `fix_review` gate, its top-level `run:` object includes `awaiting_agent: parked <duration>` immediately after `status`.
-The field disappears after `axi respond`, on cancel, and on terminal outcomes; use it to distinguish a run waiting for the driving agent from one actively running, fixing, or watching CI.
+When the resolved run is parked at an `awaiting_approval` or `fix_review` gate, its top-level `run:` or `other_branch_run:` object includes `awaiting_agent: parked <duration>` immediately after `status`.
+The field disappears after that run's gate is answered, on cancel, and on terminal outcomes; use it to distinguish a run waiting for the driving agent from one actively running, fixing, or watching CI.
+Status offers branch-scoped `axi respond` commands only for the current branch's implicitly resolved run. An explicitly selected gate stays inspection-only even when its branch matches, because a newer active run on that branch could receive the bare response command instead; the gate remains visible and its log commands retain `--run <id>`.
 When the resolved run has a `running` or `fixing` step, the run object includes `active_steps`.
 Each row reports how long the step has been active, the latest meaningful log or native-agent lifecycle activity, the native agent PID if one is currently running, and the current round such as `round 1`, `auto-fix 1/3`, or `fix 2`.
 If no activity arrives for longer than `step_quiet_warning`, `last_activity` is prefixed with `quiet`; this is only a liveness signal and does not cancel the step.
 For older active runs with no recorded activity timestamp, AXI falls back to the step log file modification time.
-Gate summaries and finding descriptions are bounded in this default status view; truncated values disclose their original length, and the gate help points to `no-mistakes axi logs --step <step> --full` for the complete step log.
+Gate summaries and finding descriptions are bounded in this default status view; truncated values disclose their original length, and the gate help points to `no-mistakes axi logs --step <step> --full` for an implicitly resolved run or `no-mistakes axi logs --run <id> --step <step> --full` for an explicitly selected run.
 Relevant current-branch states also include a cached `branch_sync` object with full SHAs, the run's status, the persisted pipeline push binding, target kind and ref, relation, safety result, PR lifecycle, and a structured next action.
 Cached home and status rendering performs no network read and labels the remote observation `pipeline_push`; only explicit sync check or apply reports `live` freshness.
 
@@ -243,13 +251,16 @@ no-mistakes axi logs --step review --full
 no-mistakes axi logs --step review --run <id>
 ```
 
-| Flag     | Type     | Default      | Description                             |
-| -------- | -------- | ------------ | --------------------------------------- |
-| `--step` | `string` | (none)       | Step name; required                     |
-| `--run`  | `string` | resolved run | Run ID to inspect                       |
-| `--full` | `bool`   | `false`      | Show the entire log instead of the tail |
+| Flag     | Type     | Default            | Description                             |
+| -------- | -------- | ------------------ | --------------------------------------- |
+| `--step` | `string` | (none)             | Step name; required                     |
+| `--run`  | `string` | current-branch run | Run ID to inspect                       |
+| `--full` | `bool`   | `false`            | Show the entire log instead of the tail |
 
-Without `--full`, long logs show the last 40 lines and a help hint for the full log.
+When `--run` is omitted, the run is resolved the same way as [`axi status`](#no-mistakes-axi-status): this branch's run, never another branch's.
+With `--run <id>`, logs are read from exactly that run regardless of branch.
+An unknown explicit run ID exits nonzero with `error: run "<id>" not found` instead of reporting that the current branch has no run.
+Without `--full`, long logs show the last 40 lines and a help hint for the full log; when `--run <id>` selected the log, that hint retains the same run ID.
 Step logs include native subprocess agent lifecycle lines such as `codex started pid=4242`, `codex exited pid=4242 status=success`, and transient retry messages when the selected agent supports lifecycle events.
 They also include fix-loop markers such as `auto-fix round 1/3 starting after round 1` and `user-fix round starting after round 2`.
 
@@ -434,6 +445,7 @@ Checks:
 - Agent runners: native binaries `claude`, `codex`, `grok`, `acli`, `opencode`, `pi`, `copilot`, and `agy` (Antigravity), plus the optional ACP bridge `acpx`
 - ACP alias default binaries: `cursor-agent` plus `acpx` for `cursor`
 - Effective global agent configuration, reported as `gate validation`; an unavailable configured runner is a failed check because the gate cannot validate without it
+- Every configured [`forge_profiles`](/no-mistakes/reference/global-config/#forge_profiles) entry, reported as `forge <host>`: the profile resolves and validates, its provider CLI is installed, and that CLI is authenticated for the profile's host
 
 Uses indicators: `✓` (available), `–` (not found, optional), `✗` (problem detected).
 

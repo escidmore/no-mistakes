@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
@@ -13,6 +12,33 @@ import (
 )
 
 var errOpencodeThinkingToolChoiceConflict = errors.New("opencode provider rejects required tool choice while thinking is enabled")
+
+// errOpencodeToolsAlreadyRan annotates a failure whose turn had already
+// invoked a tool. The prompt-only fallback re-runs the whole prompt in a
+// fresh session, so it must not be taken past this marker.
+var errOpencodeToolsAlreadyRan = errors.New("the failed turn already ran tools")
+
+// errOpencodeToolActivityUnknown annotates a failure whose turn could not be
+// read at all: no tool part observed, and no complete record of the turn to
+// prove none ran. It withholds the same replays as errOpencodeToolsAlreadyRan
+// - an unverified turn is not a turn that did nothing - and stays a separate
+// sentinel so the surfaced error says which of the two it was.
+var errOpencodeToolActivityUnknown = errors.New("could not verify the failed turn ran no tools")
+
+// thinkingConflict builds the fallback trigger, carrying the turn's tool
+// evidence. A session.error can arrive at any point in a turn, so the
+// conflict is not always detected before the model has acted, and the
+// fallback is another fresh session.
+func thinkingConflict(evidence opencodeToolEvidence, cause error) error {
+	err := errOpencodeThinkingToolChoiceConflict
+	if !evidence.replaySafe() {
+		err = fmt.Errorf("%w (%w)", err, evidence.marker())
+	}
+	if cause != nil {
+		return fmt.Errorf("%w: %v", err, cause)
+	}
+	return err
+}
 
 var thinkingToolChoiceConflictPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)(?:(?:required|forced)\s+tool[_ ]choice|tool[_ ]choice\s*(?:is\s*)?["']?(?:required|forced)["']?)\s+(?:is\s+)?(?:incompatible with|cannot be combined with|can't be combined with|cannot be used with|can't be used with|not supported (?:with|when))\s+(?:thinking|reasoning)(?:\s+(?:enabled|mode))?`),
@@ -30,8 +56,9 @@ type opencodeAgent struct {
 	// outright, so unlike every other native adapter these two knobs cannot ride
 	// argv: they belong to the session-message body (see sendMessage).
 	profile agentcfg.Profile
-	mu      sync.Mutex
-	server  *managedServer
+	subprocessContext
+	mu     sync.Mutex
+	server *managedServer
 }
 
 func (a *opencodeAgent) Name() string { return "opencode" }
@@ -39,7 +66,7 @@ func (a *opencodeAgent) Name() string { return "opencode" }
 func (a *opencodeAgent) ReportsAgentAttempts() bool { return true }
 
 func (a *opencodeAgent) Run(ctx context.Context, opts RunOpts) (*Result, error) {
-	return runWithRetry(ctx, "opencode", opts, claudeMaxRetries, classifyTransient, a.recoverTransientRetry, func() (*Result, error) {
+	return runWithRetry(ctx, "opencode", opts, claudeMaxRetries, classifyOpencodeTransient, a.recoverTransientRetry, func() (*Result, error) {
 		return a.runOnce(ctx, opts)
 	})
 }
@@ -61,6 +88,15 @@ func (a *opencodeAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, err
 	result, err := a.runOnceWithFormat(ctx, opts, true)
 	if err == nil || len(opts.JSONSchema) == 0 || !errors.Is(err, errOpencodeThinkingToolChoiceConflict) {
 		return result, err
+	}
+
+	// The fallback is a second attempt in a fresh session, so a turn that
+	// already invoked a tool would replay its side effects - and so would one
+	// whose tool activity could not be established. Same reasoning as
+	// classifyOpencodeTransient, and the same fail-closed answer: report the
+	// conflict and let the operator decide.
+	if opencodeReplayUnsafe(err) {
+		return nil, err
 	}
 
 	// OpenCode implements json_schema output as a required StructuredOutput
@@ -105,20 +141,16 @@ func (a *opencodeAgent) runOnceWithFormat(ctx context.Context, opts RunOpts, nat
 	defer eventBody.Close()
 
 	// Send message concurrently — blocks until agent completes
-	type messageResult struct {
-		resp *opencodeMessageResponse
-		err  error
-	}
 	msgCtx, msgCancel := context.WithCancel(ctx)
 	defer msgCancel()
-	msgCh := make(chan messageResult, 1)
+	msgCh := make(chan opencodeMessageResult, 1)
 	go func() {
 		schema := opts.JSONSchema
 		if !nativeFormat {
 			schema = nil
 		}
 		resp, err := a.sendMessage(msgCtx, baseURL, sessionID, prompt, schema)
-		msgCh <- messageResult{resp: resp, err: err}
+		msgCh <- opencodeMessageResult{resp: resp, err: err, settled: true}
 	}()
 
 	// Process SSE events until session.idle
@@ -132,28 +164,50 @@ func (a *opencodeAgent) runOnceWithFormat(ctx context.Context, opts RunOpts, nat
 	streamCancel()
 
 	if err != nil {
-		// Check if message request failed
-		select {
-		case mr := <-msgCh:
-			if mr.err != nil {
-				if nativeFormat && isThinkingToolChoiceConflictText(mr.err.Error()) {
-					return nil, fmt.Errorf("%w: %v", errOpencodeThinkingToolChoiceConflict, mr.err)
-				}
-				return nil, fmt.Errorf("opencode message: %w", mr.err)
-			}
-		default:
+		// The stream carried the tool events, so with it gone the message
+		// response is the remaining record of what the turn ran. Taking only
+		// what has already arrived answers "nothing yet" while the request is
+		// still in flight, and that is not the same answer as "no tool ran" -
+		// so the evidence is resolved here, before anything classifies the
+		// failure.
+		mr := pollOpencodeMessage(msgCh)
+		aborted := false
+		if !mr.settled {
+			// Aborting is the cleanup this branch already did. Doing it
+			// first also ends the turn opencode is still running, which is
+			// what makes the in-flight request answer - with the assistant
+			// message and its parts. The wait is bounded: a server that is
+			// gone never answers, and that turn is simply unverifiable.
+			a.abortSession(baseURL, sessionID)
+			aborted = true
+			mr = awaitOpencodeMessage(msgCh, opencodeEvidenceWait)
 		}
-		a.abortSession(baseURL, sessionID)
-		return nil, fmt.Errorf("opencode events: %w", err)
+		evidence := resolveOpencodeToolEvidence(state, mr, false)
+		if mr.settled && mr.err != nil {
+			if nativeFormat && isThinkingToolChoiceConflictText(mr.err.Error()) {
+				return nil, thinkingConflict(evidence, mr.err)
+			}
+			return nil, opencodeTurnFailure(evidence, fmt.Errorf("opencode message: %w", mr.err))
+		}
+		if !aborted {
+			a.abortSession(baseURL, sessionID)
+		}
+		if nativeFormat && errors.Is(err, errOpencodeThinkingToolChoiceConflict) {
+			return nil, thinkingConflict(evidence, nil)
+		}
+		return nil, opencodeTurnFailure(evidence, fmt.Errorf("opencode events: %w", err))
 	}
 
-	// Wait for message response
+	// Wait for message response. The stream ran to session.idle, so every
+	// tool part of the session crossed it and the evidence is settled however
+	// this request ends.
 	mr := <-msgCh
+	evidence := resolveOpencodeToolEvidence(state, mr, true)
 	if mr.err != nil {
 		if nativeFormat && isThinkingToolChoiceConflictText(mr.err.Error()) {
-			return nil, fmt.Errorf("%w: %v", errOpencodeThinkingToolChoiceConflict, mr.err)
+			return nil, thinkingConflict(evidence, mr.err)
 		}
-		return nil, fmt.Errorf("opencode message: %w", mr.err)
+		return nil, opencodeTurnFailure(evidence, fmt.Errorf("opencode message: %w", mr.err))
 	}
 
 	// Update usage and text from message response
@@ -220,23 +274,26 @@ func (a *opencodeAgent) runOnceWithFormat(ctx context.Context, opts RunOpts, nat
 		}, nil
 	}
 
+	// A thinking model rejecting the forced tool_choice is handled by the
+	// prompt-only fallback in runOnce, so it must be recognised before the
+	// general failure below claims it.
 	if nativeFormat && mr.resp != nil && mr.resp.Info != nil && isThinkingToolChoiceConflict(mr.resp.Info.Error) {
-		return nil, errOpencodeThinkingToolChoiceConflict
+		return nil, thinkingConflict(evidence, nil)
 	}
 
-	// Surface opencode's StructuredOutputError directly. When the model
-	// fails to call the StructuredOutput tool after the configured retries,
-	// opencode sets info.error.name = "StructuredOutputError" and the
-	// streamed text is just reasoning prose - feeding it to
-	// finalizeTextResult produces the misleading "invalid character 'N'
-	// looking for beginning of value" error.
-	if mr.resp != nil && mr.resp.Info != nil && mr.resp.Info.Error.IsStructuredOutput() {
-		retries := 0
-		if mr.resp.Info.Error.Retries != nil {
-			retries = *mr.resp.Info.Error.Retries
-		}
-		return nil, fmt.Errorf("opencode structured output failed after %d internal retries: %s",
-			retries, mr.resp.Info.Error.Message)
+	// A turn that failed reports its cause on info.error rather than on the
+	// HTTP status, so the request itself looks successful. Surface that error
+	// instead of falling through to the streamed text: opencode leaves no
+	// usable text behind a failed turn, so the fallback reports the
+	// undiagnosable "opencode returned no text output" and hides causes such
+	// as a provider rejecting the forced tool_choice that json_schema output
+	// requires, or an expired provider credential. Any prose streamed before
+	// the failure is reasoning, not an answer. This supersedes the narrower
+	// StructuredOutputError-only branch: opencodeMessageFailure renders that
+	// case with the same wording and decodes the nested error payload the
+	// flat fields never carried.
+	if mr.resp != nil && mr.resp.Info != nil && mr.resp.Info.Error != nil {
+		return nil, newOpencodeMessageFailure(mr.resp.Info.Error, evidence == opencodeToolsRan)
 	}
 
 	// Fall back to parsing JSON from text
@@ -244,15 +301,23 @@ func (a *opencodeAgent) runOnceWithFormat(ctx context.Context, opts RunOpts, nat
 	if outputText == "" {
 		outputText = state.lastText
 	}
-	return finalizeTextResult("opencode", outputText, opts.JSONSchema, state.usage)
+	result, err := finalizeTextResult("opencode", outputText, opts.JSONSchema, state.usage)
+	if err != nil {
+		// A parse failure quotes the model's own output, so whether it looks
+		// transient to the shared classifier is decided by text the model
+		// wrote. It takes the same gate as the rest.
+		return nil, opencodeTurnFailure(evidence, err)
+	}
+	return result, nil
 }
 
 func isThinkingToolChoiceConflict(e *opencodeMessageError) bool {
-	if e == nil {
-		return false
+	for _, text := range e.providerText() {
+		if isThinkingToolChoiceConflictText(text) {
+			return true
+		}
 	}
-	raw, err := json.Marshal(e)
-	return err == nil && isThinkingToolChoiceConflictText(string(raw))
+	return false
 }
 
 func isThinkingToolChoiceConflictText(text string) bool {

@@ -1,5 +1,42 @@
 # Changelog
 
+## [1.59.2](https://github.com/kunchenguid/no-mistakes/compare/v1.59.1...v1.59.2) (2026-08-26)
+
+
+### Bug Fixes
+
+* **cli:** scope AXI run resolution to the current branch ([#850](https://github.com/kunchenguid/no-mistakes/issues/850)) ([10cb727](https://github.com/kunchenguid/no-mistakes/commit/10cb7270405d2dac5dafc50272c5886fa895b223))
+* **pipeline:** recognize push provenance to allow pushing rebased pipeline generations ([#852](https://github.com/kunchenguid/no-mistakes/issues/852)) ([539f09a](https://github.com/kunchenguid/no-mistakes/commit/539f09a3ec81b73eeabc13380a08ca14d275e55f))
+* **scm:** collapse superseded GitHub check runs ([#855](https://github.com/kunchenguid/no-mistakes/issues/855)) ([a59d667](https://github.com/kunchenguid/no-mistakes/commit/a59d6675a18d15cd44076a4c27786814a7a0ad15))
+
+## [1.59.1](https://github.com/kunchenguid/no-mistakes/compare/v1.59.0...v1.59.1) (2026-08-26)
+
+
+### Bug Fixes
+
+* **agent:** harden isolated pipeline execution ([#844](https://github.com/kunchenguid/no-mistakes/issues/844)) ([9694fff](https://github.com/kunchenguid/no-mistakes/commit/9694fff3bb451a8a11e6abdf730e2b0d3ce530b3))
+* **scm/gitlab:** drop unsupported --yes flag from glab mr update ([#841](https://github.com/kunchenguid/no-mistakes/issues/841)) ([3781331](https://github.com/kunchenguid/no-mistakes/commit/3781331358040154d56ed438d937efd104ebb512))
+
+## [1.59.0](https://github.com/kunchenguid/no-mistakes/compare/v1.58.1...v1.59.0) (2026-08-25)
+
+
+### Features
+
+* **forgecontext:** route provider identity per repository with pinned logins ([#548](https://github.com/kunchenguid/no-mistakes/issues/548)) ([cc8d52a](https://github.com/kunchenguid/no-mistakes/commit/cc8d52a5126016a6f5fd4856ea185d1b00b92992))
+
+
+### Bug Fixes
+
+* **agent:** surface opencode's failed-turn error instead of empty output ([#772](https://github.com/kunchenguid/no-mistakes/issues/772)) ([cd5f5ba](https://github.com/kunchenguid/no-mistakes/commit/cd5f5ba286d4bc8d3623e1dcae11d75f593cd10b))
+
+## [1.58.1](https://github.com/kunchenguid/no-mistakes/compare/v1.58.0...v1.58.1) (2026-08-23)
+
+
+### Bug Fixes
+
+* **pipeline:** redact home-directory paths from published PR content ([#831](https://github.com/kunchenguid/no-mistakes/issues/831)) ([c878873](https://github.com/kunchenguid/no-mistakes/commit/c878873c5573a7cff6ed8b780eb0e1c53a8d8fc7))
+* **pipeline:** revalidate CI repairs before push ([#827](https://github.com/kunchenguid/no-mistakes/issues/827)) ([8dc5c15](https://github.com/kunchenguid/no-mistakes/commit/8dc5c158f8b43612c51911c2d7b58ac18356792e))
+
 ## [1.58.0](https://github.com/kunchenguid/no-mistakes/compare/v1.57.1...v1.58.0) (2026-08-23)
 
 

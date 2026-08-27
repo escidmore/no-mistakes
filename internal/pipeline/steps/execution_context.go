@@ -1,5 +1,7 @@
 package steps
 
+import "github.com/kunchenguid/no-mistakes/internal/agent"
+
 // executionContextPromptSection returns a prompt fragment that explains the
 // agent's runtime environment: it is operating inside an isolated git
 // worktree carved from a bare gate repository, not in the original repo.
@@ -13,12 +15,6 @@ package steps
 //
 // The fragment ends with a trailing newline so callers can append it
 // directly to a prompt string without worrying about spacing.
-func executionContextPromptSection() string {
-	return `
-Execution context:
-- You are running inside an isolated git worktree at the current working directory.
-- The worktree's ` + "`.git`" + ` is a pointer file (not a directory) referencing a bare gate repository elsewhere on disk; this is standard git-worktree layout and all normal git commands work as expected.
-- The worktree is checked out to the change being processed; treat it as the project's source of truth for this run and do not search the filesystem for "the real" checkout - this is it.
-- Operate only within this working directory. Do not modify or read from the gate's bare repository or any other clone of this project.
-`
+func executionContextPromptSection(workDir string) string {
+	return agent.ExecutionContextPromptSection(workDir)
 }

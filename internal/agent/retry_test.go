@@ -65,6 +65,21 @@ func TestClassifyTransient_Positive(t *testing.T) {
 			errMsg:  `Post "https://api.anthropic.com": net/http: TLS handshake timeout`,
 			wantSub: "tls",
 		},
+		{
+			name:    "prose turn ending",
+			errMsg:  `antigravity output parse: ended its turn with prose instead of the required JSON object`,
+			wantSub: "prose",
+		},
+		{
+			name:    "agy permission declaration",
+			errMsg:  `antigravity reported error: declaring permissions: cortex tool view_file: failed`,
+			wantSub: "permission",
+		},
+		{
+			name:    "invalid tool call",
+			errMsg:  `antigravity reported error: invalid tool call error (invalid_args)`,
+			wantSub: "tool call",
+		},
 	}
 
 	for _, tc := range cases {
@@ -105,12 +120,45 @@ func TestClassifyTransient_Negative(t *testing.T) {
 			name:   "schema validation",
 			errMsg: `JSON output missing required field "summary"`,
 		},
+		{
+			name:   "free usage limit",
+			errMsg: `API rate limit reached with HTTP 429: FreeUsageLimit exceeded`,
+		},
+		{
+			name:   "quota exhausted",
+			errMsg: `provider error: quota_exhausted`,
+		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			if label, ok := classifyTransient(errors.New(tc.errMsg)); ok {
 				t.Errorf("expected non-transient for %q, got %q", tc.errMsg, label)
+			}
+		})
+	}
+}
+
+func TestRunWithRetry_DoesNotRetryQuotaExhaustion(t *testing.T) {
+	defer withFastBackoff(t)()
+
+	for _, message := range []string{
+		"API rate limit reached with HTTP 429: FreeUsageLimit exceeded",
+		"API request failed with HTTP 429: insufficient_quota",
+		"API request failed with HTTP 429: You exceeded your current quota",
+	} {
+		t.Run(message, func(t *testing.T) {
+			calls := 0
+			quotaErr := errors.New(message)
+			_, err := runWithRetry(context.Background(), "antigravity", RunOpts{}, 3, classifyTransient, nil, func() (*Result, error) {
+				calls++
+				return nil, quotaErr
+			})
+			if !errors.Is(err, quotaErr) {
+				t.Fatalf("expected quota error to propagate, got %v", err)
+			}
+			if calls != 1 {
+				t.Fatalf("expected one call for quota exhaustion, got %d", calls)
 			}
 		})
 	}

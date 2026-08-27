@@ -27,7 +27,7 @@ func newAxiStatusCmd() *cobra.Command {
 	var runID string
 	cmd := &cobra.Command{
 		Use:           "status",
-		Short:         "Show the active (or most recent) run in detail",
+		Short:         "Show a current-branch or explicitly selected run in detail",
 		Args:          cobra.NoArgs,
 		SilenceErrors: true,
 		SilenceUsage:  true,
@@ -40,7 +40,7 @@ func newAxiStatusCmd() *cobra.Command {
 			})
 		},
 	}
-	cmd.Flags().StringVar(&runID, "run", "", "inspect a specific run ID (default: active or most recent)")
+	cmd.Flags().StringVar(&runID, "run", "", "inspect a specific run ID (default: current branch's active or most recent)")
 	return cmd
 }
 
@@ -54,7 +54,11 @@ func runAxiStatus(cmd *cobra.Command, runID string) (string, error) {
 	}
 	defer env.close()
 
-	run, err := resolveRun(env, runID, currentBranchForRunResolve(cmd.Context()))
+	branch, branchErr := currentBranchForRunResolve(cmd.Context())
+	if branchErr != nil && runID == "" {
+		return "", emitError(cmd, 1, branchErr.Error())
+	}
+	run, runs, err := resolveRun(env, runID, branch)
 	if err != nil {
 		return "", emitError(cmd, 1, err.Error())
 	}
@@ -63,15 +67,13 @@ func runAxiStatus(cmd *cobra.Command, runID string) (string, error) {
 		if runID != "" {
 			return "", emitError(cmd, 1, fmt.Sprintf("run %q not found", runID))
 		}
-		emitDoc(cmd,
-			toon.Field{Key: "runs", Value: "0 runs yet in this repository"},
-			toon.Field{Key: "help", Value: []string{startRunHelp()}},
-		)
-		fingerprint := "explicit|no-runs"
-		if env.repo != nil {
-			fingerprint = env.repo.ID + "|no-runs"
+		if branch == "" {
+			runs, err = env.d.GetRunsByRepo(env.repo.ID)
+			if err != nil {
+				return "", emitError(cmd, 1, fmt.Sprintf("list runs: %v", err))
+			}
 		}
-		return fingerprint, nil
+		return emitNoRunForCaller(cmd, env, branch, runs)
 	}
 
 	steps, err := env.d.GetStepsByRun(run.ID)
@@ -80,12 +82,35 @@ func runAxiStatus(cmd *cobra.Command, runID string) (string, error) {
 	}
 	rv := runViewFromDB(run, steps)
 	annotateRunView(env, &rv)
-	fields := []toon.Field{runObjectField(rv)}
+	var fields []toon.Field
+	// A run reached by an explicit --run may belong to another branch. Say so
+	// with the key itself, reusing the home view's other_branch_* vocabulary,
+	// so a parser reading `run:` never picks up a run that is provably not
+	// this worktree's. Only positive evidence marks it: an undeterminable
+	// branch cannot contradict the id the caller asked for.
+	runKey := "run"
+	foreignRun := branch != "" && run.Branch != branch
+	if foreignRun {
+		runKey = "other_branch_run"
+		fields = append(fields, toon.Field{Key: "current_branch", Value: branch})
+	}
+	fields = append(fields, runObjectFieldWithKey(runKey, rv))
 	if syncField := cachedBranchSyncField(cmd, run.ID); syncField != nil {
 		fields = append(fields, *syncField)
 	}
 	if gate, ok := rv.awaitingStep(); ok {
-		fields = append(fields, gateFields(gate)...)
+		// The label above and the commands below deliberately use different
+		// evidence rules. Branch equality is enough to label the selected run,
+		// but not enough to attach a bare mutation command to it: another active
+		// run may exist (or appear) on the same branch, and `axi respond` has no
+		// run selector. Keep every explicit selection inspection-only so its run
+		// identity cannot be lost between this status read and the next command.
+		branchScopedCommandsSafe := runID == ""
+		if !branchScopedCommandsSafe {
+			fields = append(fields, inspectionOnlyGateFields(gate, run.ID)...)
+		} else {
+			fields = append(fields, gateFields(gate)...)
+		}
 	} else if terminalStatus(rv.Status) {
 		fields = append(fields, toon.Field{Key: "outcome", Value: outcomeFor(rv.Status)})
 		if run.Error != nil && *run.Error != "" {
@@ -94,6 +119,36 @@ func runAxiStatus(cmd *cobra.Command, runID string) (string, error) {
 	}
 	emitDoc(cmd, fields...)
 	return runStateFingerprint(rv), nil
+}
+
+// emitNoRunForCaller answers `axi status` when the caller has no run of its
+// own: the current branch has never had one, or the caller has a detached HEAD.
+// It never substitutes some other branch's run. It names the branch it looked
+// for, lists the repository's recent runs so a deliberate
+// `--run <id>` inspection is one step away, and provides next-step help.
+func emitNoRunForCaller(cmd *cobra.Command, env *axiEnv, branch string, runs []*db.Run) (string, error) {
+	branchDisplay := branch
+	if branchDisplay == "" {
+		branchDisplay = "unknown"
+	}
+	fields := []toon.Field{{Key: "current_branch", Value: branchDisplay}}
+	if branch != "" {
+		fields = append(fields, toon.Field{Key: "runs_on_current_branch", Value: 0})
+	}
+	fields = append(fields, runsFields(runs, recentRunsHomeLimit)...)
+
+	var help []string
+	switch {
+	case branch == "":
+		help = append(help, "This worktree has no current branch (detached HEAD), so no run can be attributed to it; inspect a specific run with `no-mistakes axi status --run <id>`, or check out a branch first")
+	case len(runs) > 0:
+		help = append(help, startRunHelp(), "No run exists for this branch; every run listed above is on another branch - inspect one deliberately with `no-mistakes axi status --run <id>`")
+	default:
+		help = append(help, startRunHelp())
+	}
+	fields = append(fields, toon.Field{Key: "help", Value: help})
+	emitDoc(cmd, fields...)
+	return env.repo.ID + "|no-run-for:" + branchDisplay + "|runs:" + renderedRunsFingerprint(runs, recentRunsHomeLimit), nil
 }
 
 // runStateFingerprint summarizes a run's observable state for telemetry
@@ -155,8 +210,11 @@ func startRunHelp() string {
 	return `Run no-mistakes axi run --intent "the user's goal" --yes to validate the current branch`
 }
 
-func noRunLogsHelp() string {
-	return startRunHelp()
+func noRunLogsHelp() []string {
+	return []string{
+		startRunHelp(),
+		"To read another branch's run, name it: `no-mistakes axi logs --run <id> --step <step>`",
+	}
 }
 
 func newAxiLogsCmd() *cobra.Command {
@@ -180,7 +238,7 @@ func newAxiLogsCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&step, "step", "", "step name: intent, rebase, review, test, document, lint, push, pr, ci (required)")
-	cmd.Flags().StringVar(&runID, "run", "", "run ID (default: active or most recent)")
+	cmd.Flags().StringVar(&runID, "run", "", "run ID (default: current branch's active or most recent)")
 	cmd.Flags().BoolVar(&full, "full", false, "show the entire log instead of the tail")
 	return cmd
 }
@@ -205,13 +263,24 @@ func runAxiLogs(cmd *cobra.Command, step, runID string, full bool) (string, erro
 	}
 	defer env.close()
 
-	run, err := resolveRun(env, runID, currentBranchForRunResolve(cmd.Context()))
+	branch, branchErr := currentBranchForRunResolve(cmd.Context())
+	if branchErr != nil && runID == "" {
+		return "", emitError(cmd, 1, branchErr.Error())
+	}
+	run, _, err := resolveRun(env, runID, branch)
 	if err != nil {
 		return "", emitError(cmd, 1, err.Error())
 	}
 	if run == nil {
-		return "", emitError(cmd, 1, "no run found to read logs from",
-			noRunLogsHelp())
+		if runID != "" {
+			return "", emitError(cmd, 1, fmt.Sprintf("run %q not found", runID))
+		}
+		help := noRunLogsHelp()
+		if branch == "" {
+			help = []string{"This worktree has no current branch (detached HEAD), so no run can be attributed to it; inspect a specific run with `no-mistakes axi logs --run <id> --step <step>`, or check out a branch first"}
+		}
+		return "", emitError(cmd, 1, "no run found for this branch to read logs from",
+			help...)
 	}
 	steps, err := env.d.GetStepsByRun(run.ID)
 	if err != nil {
@@ -238,10 +307,14 @@ func runAxiLogs(cmd *cobra.Command, step, runID string, full bool) (string, erro
 	shown := lines
 	if !full && len(lines) > logTailLines {
 		shown = lines[len(lines)-logTailLines:]
+		selectedRunID := ""
+		if runID != "" {
+			selectedRunID = run.ID
+		}
 		fields = append(fields,
 			toon.Field{Key: "lines", Value: fmt.Sprintf("%d of %d total (tail)", len(shown), len(lines))},
 			toon.Field{Key: "log", Value: logRows(shown)},
-			toon.Field{Key: "help", Value: []string{fmt.Sprintf("Run `no-mistakes axi logs --step %s --full` to see the entire log", step)}},
+			toon.Field{Key: "help", Value: []string{fmt.Sprintf("Run `%s` to see the entire log", axiLogsFullCommand(step, selectedRunID))}},
 		)
 		emitDoc(cmd, fields...)
 		return fingerprint, nil
@@ -264,57 +337,60 @@ func logRows(lines []string) []logRow {
 	return rows
 }
 
-// resolveRun picks the run to inspect: an explicit ID, else the active run,
-// else the most recent run for the repo. Returns (nil, nil) when none exist.
-func resolveRun(env *axiEnv, runID, branch string) (*db.Run, error) {
+// resolveRun picks the run to inspect: an explicit ID, else the caller's
+// current-branch active run, else that branch's most recent run. It returns a
+// nil run when the caller's branch has no run of its own, and when the caller
+// has a detached HEAD - a detached HEAD owns no branch, so no run can be
+// attributed to it.
+//
+// It deliberately does NOT fall back to the repository's active or most recent
+// run on some other branch. One clone commonly has several worktrees sitting on
+// different branches, and that fallback handed every branch without a run of
+// its own another branch's run under exactly the key a run of the caller's own
+// gets - so a terminal run read as though the caller's own work had failed.
+// Inspecting a run that is not this branch's is what `--run <id>` is for.
+func resolveRun(env *axiEnv, runID, branch string) (*db.Run, []*db.Run, error) {
 	if runID != "" {
 		run, err := env.d.GetRun(runID)
 		if err != nil {
-			return nil, fmt.Errorf("get run: %w", err)
+			return nil, nil, fmt.Errorf("get run: %w", err)
 		}
-		return run, nil
+		return run, nil, nil
 	}
-	if branch != "" {
-		active, err := env.d.GetActiveRun(env.repo.ID, branch)
-		if err != nil {
-			return nil, fmt.Errorf("get active run: %w", err)
-		}
-		if active != nil {
-			return active, nil
-		}
-		runs, err := env.d.GetRunsByRepo(env.repo.ID)
-		if err != nil {
-			return nil, fmt.Errorf("list runs: %w", err)
-		}
-		for _, run := range runs {
-			if run.Branch == branch {
-				return run, nil
-			}
-		}
+	if branch == "" {
+		return nil, nil, nil
 	}
-	active, err := env.d.GetActiveRun(env.repo.ID, "")
+	active, err := env.d.GetActiveRun(env.repo.ID, branch)
 	if err != nil {
-		return nil, fmt.Errorf("get active run: %w", err)
+		return nil, nil, fmt.Errorf("get active run: %w", err)
 	}
 	if active != nil {
-		return active, nil
+		return active, nil, nil
 	}
 	runs, err := env.d.GetRunsByRepo(env.repo.ID)
 	if err != nil {
-		return nil, fmt.Errorf("list runs: %w", err)
+		return nil, nil, fmt.Errorf("list runs: %w", err)
 	}
-	if len(runs) == 0 {
-		return nil, nil
+	for _, run := range runs {
+		if run.Branch == branch {
+			return run, runs, nil
+		}
 	}
-	return runs[0], nil
+	return nil, runs, nil
 }
 
-func currentBranchForRunResolve(ctx context.Context) string {
+func currentBranchForRunResolve(ctx context.Context) (string, error) {
 	branch, err := git.CurrentBranch(ctx, ".")
-	if err != nil || branch == "HEAD" {
-		return ""
+	if err != nil {
+		return "", fmt.Errorf("determine current branch: %w", err)
 	}
-	return branch
+	if branch == "HEAD" {
+		return "", nil
+	}
+	if branch == "" {
+		return "", fmt.Errorf("determine current branch: git returned an empty branch name")
+	}
+	return branch, nil
 }
 
 func splitLogLines(s string) []string {

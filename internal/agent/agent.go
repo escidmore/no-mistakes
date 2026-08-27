@@ -7,10 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
+	"reflect"
 	"strings"
 	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/agentcfg"
+	"github.com/kunchenguid/no-mistakes/internal/runenv"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
@@ -254,6 +257,7 @@ type InvocationWorkload struct {
 // targets, to raw ACP agent commands.
 type Options struct {
 	ACPRegistryOverrides map[string]string
+	Environment          runenv.Overlay
 	// DisableProjectSettings, when true, asks a supported adapter (codex,
 	// claude, pi) to launch with the target repo's project-level agent
 	// settings/instructions suppressed. It is the resolved, trusted-only opt-out
@@ -332,25 +336,52 @@ func parseStructuredTextOutput(text string, schema json.RawMessage) (json.RawMes
 	// inline example never shadows a real trailing block, and an unclosed
 	// fence never competes with a closed one. Only when no closed fence
 	// parses do we consult the open candidates.
-	if parsed := parseCandidates(closed); len(parsed) > 1 {
+	closedParsed := parseCandidates(closed)
+	if len(closedParsed) > 1 {
 		return nil, fmt.Errorf("multiple JSON code fences found in output")
-	} else if len(parsed) == 1 {
-		return parsed[0], nil
 	}
-	if parsed := parseCandidates(openCands); len(parsed) > 1 {
+	openParsed := parseCandidates(openCands)
+	if len(openParsed) > 1 {
 		return nil, fmt.Errorf("multiple JSON code fences found in output")
-	} else if len(parsed) == 1 {
-		return parsed[0], nil
 	}
 
-	if bare, err := lastBareJSONObject(text, validationSchema); err == nil && bare != nil {
-		return bare, nil
-	} else if candidateErr == nil && err != nil {
-		candidateErr = err
+	var fenced json.RawMessage
+	if len(closedParsed) == 1 {
+		fenced = closedParsed[0]
+	} else if len(openParsed) == 1 {
+		fenced = openParsed[0]
+	}
+
+	bareParsed, bareErr := bareJSONObjects(text, validationSchema)
+	if len(bareParsed) > 1 {
+		return nil, fmt.Errorf("multiple bare JSON objects found in output")
+	}
+	if fenced != nil && len(bareParsed) == 1 {
+		if !jsonEqual(fenced, bareParsed[0]) {
+			return nil, fmt.Errorf("conflicting JSON candidates found in output")
+		}
+		return fenced, nil
+	}
+	if fenced != nil {
+		return fenced, nil
+	}
+	if len(bareParsed) == 1 {
+		return bareParsed[0], nil
+	}
+	if candidateErr == nil && bareErr != nil {
+		candidateErr = bareErr
 	}
 
 	if candidateErr != nil {
 		return nil, candidateErr
+	}
+	if _, err := decodeJSONValue([]byte(text)); err == nil {
+		return nil, rawErr
+	}
+
+	trimmedText := strings.TrimSpace(text)
+	if !strings.HasPrefix(trimmedText, "{") {
+		return nil, fmt.Errorf("ended its turn with prose instead of the required JSON object")
 	}
 	return nil, rawErr
 }
@@ -510,11 +541,15 @@ func indexJSONFenceClose(text string) (int, int) {
 	return -1, -1
 }
 
-// lastBareJSONObject scans text for balanced {...} substrings that parse
-// as JSON and returns the last one found. This handles models that emit
-// reasoning prose followed by a raw JSON answer, with no code fence.
-func lastBareJSONObject(text string, schema json.RawMessage) (json.RawMessage, error) {
-	var last json.RawMessage
+// bareJSONObjects scans text for balanced {...} substrings outside code fences
+// that parse as JSON and validate against the schema. Only concluding objects
+// are candidates; an incidental object followed by substantive prose is not a
+// verdict.
+func bareJSONObjects(text string, schema json.RawMessage) ([]json.RawMessage, error) {
+	var valid []struct {
+		obj      json.RawMessage
+		endIndex int
+	}
 	var lastErr error
 	for i := 0; i < len(text); i++ {
 		if strings.HasPrefix(text[i:], "```") {
@@ -540,17 +575,170 @@ func lastBareJSONObject(text string, schema json.RawMessage) (json.RawMessage, e
 		candidate := text[i:end]
 		obj, err := parseStructuredCandidate([]byte(candidate), schema)
 		if err == nil {
-			last = obj
+			valid = append(valid, struct {
+				obj      json.RawMessage
+				endIndex int
+			}{obj: obj, endIndex: end})
 			lastErr = nil
 		} else if lastErr == nil {
 			lastErr = err
 		}
 		i = end - 1
 	}
-	if last != nil {
-		return last, nil
+	if len(valid) > 1 {
+		objects := make([]json.RawMessage, 0, len(valid))
+		for _, candidate := range valid {
+			objects = append(objects, candidate.obj)
+		}
+		return objects, nil
+	}
+	if len(valid) == 1 && strings.TrimSpace(text[valid[0].endIndex:]) == "" {
+		return []json.RawMessage{valid[0].obj}, nil
 	}
 	return nil, lastErr
+}
+
+func jsonEqual(a, b json.RawMessage) bool {
+	if bytes.Equal(bytes.TrimSpace(a), bytes.TrimSpace(b)) {
+		return true
+	}
+	valA, err := decodeJSONValue(a)
+	if err != nil {
+		return false
+	}
+	valB, err := decodeJSONValue(b)
+	if err != nil {
+		return false
+	}
+	return jsonValuesEqual(valA, valB)
+}
+
+func jsonValuesEqual(a, b any) bool {
+	switch valueA := a.(type) {
+	case json.Number:
+		valueB, ok := b.(json.Number)
+		if !ok {
+			return false
+		}
+		return jsonNumbersEqual(valueA, valueB)
+	case map[string]any:
+		valueB, ok := b.(map[string]any)
+		if !ok || len(valueA) != len(valueB) {
+			return false
+		}
+		for key, childA := range valueA {
+			childB, ok := valueB[key]
+			if !ok || !jsonValuesEqual(childA, childB) {
+				return false
+			}
+		}
+		return true
+	case []any:
+		valueB, ok := b.([]any)
+		if !ok || len(valueA) != len(valueB) {
+			return false
+		}
+		for i := range valueA {
+			if !jsonValuesEqual(valueA[i], valueB[i]) {
+				return false
+			}
+		}
+		return true
+	default:
+		return reflect.DeepEqual(a, b)
+	}
+}
+
+type jsonDecimal struct {
+	negative bool
+	digits   string
+	power    *big.Int
+}
+
+func jsonNumbersEqual(a, b json.Number) bool {
+	decimalA, ok := parseJSONDecimal(a)
+	if !ok {
+		return false
+	}
+	decimalB, ok := parseJSONDecimal(b)
+	if !ok {
+		return false
+	}
+	if decimalA.digits == "" || decimalB.digits == "" {
+		return decimalA.digits == decimalB.digits
+	}
+	if decimalA.negative != decimalB.negative {
+		return false
+	}
+
+	orderA := decimalOrder(decimalA)
+	orderB := decimalOrder(decimalB)
+	if orderA.Cmp(orderB) != 0 {
+		return false
+	}
+
+	maxDigits := len(decimalA.digits)
+	if len(decimalB.digits) > maxDigits {
+		maxDigits = len(decimalB.digits)
+	}
+	for i := 0; i < maxDigits; i++ {
+		digitA, digitB := byte('0'), byte('0')
+		if i < len(decimalA.digits) {
+			digitA = decimalA.digits[i]
+		}
+		if i < len(decimalB.digits) {
+			digitB = decimalB.digits[i]
+		}
+		if digitA != digitB {
+			return false
+		}
+	}
+	return true
+}
+
+func parseJSONDecimal(number json.Number) (jsonDecimal, bool) {
+	raw := number.String()
+	negative := strings.HasPrefix(raw, "-")
+	if negative {
+		raw = raw[1:]
+	}
+
+	exponent := new(big.Int)
+	mantissa := raw
+	if exponentIndex := strings.IndexAny(raw, "eE"); exponentIndex >= 0 {
+		mantissa = raw[:exponentIndex]
+		exponentText := raw[exponentIndex+1:]
+		if strings.HasPrefix(exponentText, "+") {
+			exponentText = exponentText[1:]
+		}
+		if exponentText == "" {
+			return jsonDecimal{}, false
+		}
+		if _, ok := exponent.SetString(exponentText, 10); !ok {
+			return jsonDecimal{}, false
+		}
+	}
+
+	fractionalPart := ""
+	if dotIndex := strings.IndexByte(mantissa, '.'); dotIndex >= 0 {
+		fractionalPart = mantissa[dotIndex+1:]
+		mantissa = mantissa[:dotIndex] + fractionalPart
+	}
+
+	digits := strings.TrimLeft(mantissa, "0")
+	if digits == "" {
+		return jsonDecimal{}, true
+	}
+	trimmedDigits := strings.TrimRight(digits, "0")
+	trailingZeros := len(digits) - len(trimmedDigits)
+	power := new(big.Int).Sub(exponent, big.NewInt(int64(len(fractionalPart))))
+	power.Add(power, big.NewInt(int64(trailingZeros)))
+	return jsonDecimal{negative: negative, digits: trimmedDigits, power: power}, true
+}
+
+func decimalOrder(decimal jsonDecimal) *big.Int {
+	order := new(big.Int).Set(decimal.power)
+	return order.Add(order, big.NewInt(int64(len(decimal.digits))))
 }
 
 // scanBalancedObject returns the exclusive end index of a brace-balanced
@@ -865,7 +1053,7 @@ func NewWithOptions(name types.AgentName, bin string, extraArgs []string, opts O
 	}
 	if target, ok := types.ACPTargetFor(name); ok {
 		rawCommand := types.ACPRawCommand(target, opts.ACPRegistryOverrides)
-		return &acpxAgent{bin: bin, target: target, rawCommand: rawCommand, model: opts.Profile.Model}, nil
+		return &acpxAgent{bin: bin, target: target, rawCommand: rawCommand, model: opts.Profile.Model, subprocessContext: newSubprocessContext(opts.Environment)}, nil
 	}
 	// Mapped flags follow the operator's raw agent_args_override flags, so they
 	// still precede no-mistakes' managed flags in every adapter's argv. A knob
@@ -879,21 +1067,26 @@ func NewWithOptions(name types.AgentName, bin string, extraArgs []string, opts O
 	}
 	switch name {
 	case types.AgentClaude:
-		return &claudeAgent{bin: bin, extraArgs: extraArgs, disableProjectSettings: opts.DisableProjectSettings}, nil
+		return &claudeAgent{bin: bin, extraArgs: extraArgs, disableProjectSettings: opts.DisableProjectSettings, subprocessContext: newSubprocessContext(opts.Environment)}, nil
 	case types.AgentCodex:
-		return &codexAgent{bin: bin, extraArgs: extraArgs, disableProjectSettings: opts.DisableProjectSettings}, nil
+		return &codexAgent{bin: bin, extraArgs: extraArgs, disableProjectSettings: opts.DisableProjectSettings, subprocessContext: newSubprocessContext(opts.Environment)}, nil
 	case types.AgentGrok:
-		return &grokAgent{bin: bin, extraArgs: extraArgs, disableProjectSettings: opts.DisableProjectSettings}, nil
+		return &grokAgent{bin: bin, extraArgs: extraArgs, disableProjectSettings: opts.DisableProjectSettings, subprocessContext: newSubprocessContext(opts.Environment)}, nil
 	case types.AgentRovoDev:
-		return &rovodevAgent{bin: bin, extraArgs: extraArgs}, nil
+		return &rovodevAgent{bin: bin, extraArgs: extraArgs, subprocessContext: newSubprocessContext(opts.Environment)}, nil
 	case types.AgentOpenCode:
-		return &opencodeAgent{bin: bin, extraArgs: extraArgs, profile: opts.Profile}, nil
+		return &opencodeAgent{bin: bin, extraArgs: extraArgs, profile: opts.Profile, subprocessContext: newSubprocessContext(opts.Environment)}, nil
 	case types.AgentPi:
-		return &piAgent{bin: bin, extraArgs: extraArgs, disableProjectSettings: opts.DisableProjectSettings}, nil
+		return &piAgent{
+			bin:                    bin,
+			extraArgs:              extraArgs,
+			disableProjectSettings: opts.DisableProjectSettings,
+			subprocessContext:      newSubprocessContext(opts.Environment),
+		}, nil
 	case types.AgentCopilot:
-		return &copilotAgent{bin: bin, extraArgs: extraArgs}, nil
+		return &copilotAgent{bin: bin, extraArgs: extraArgs, subprocessContext: newSubprocessContext(opts.Environment)}, nil
 	case types.AgentAntigravity:
-		return &antigravityAgent{bin: bin, extraArgs: extraArgs}, nil
+		return &antigravityAgent{bin: bin, extraArgs: extraArgs, subprocessContext: newSubprocessContext(opts.Environment)}, nil
 	default:
 		return nil, fmt.Errorf("unknown agent %q; valid options: auto, claude, codex, grok, rovodev, opencode, pi, copilot, cursor, antigravity, acp:<target> (set 'agent' in ~/.no-mistakes/config.yaml)", name)
 	}

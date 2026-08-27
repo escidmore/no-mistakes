@@ -53,6 +53,8 @@ var canonicalBranchSyncPhrases = []string{
 
 const canonicalPipelineAgentPrerequisite = "a supported native agent binary, the `agent: cursor` ACP alias, or an explicit `acp:<target>` through `acpx`"
 
+const canonicalUnknownBranchRunRelationship = "An explicit `--run <id>` rendered under `run:` while the current branch is unknown (detached `HEAD` or a branch-lookup failure) encodes no branch relationship."
+
 // TestStaleMonitorGuidance_SyncedAcrossSurfaces guards the repo invariant that
 // agent-driving guidance stays in sync across its three surfaces: the skill
 // body, the published agents guide, and the live axi help string. The earlier
@@ -153,6 +155,12 @@ func TestPipelineAgentPrerequisiteGuidance_SyncedAcrossSurfaces(t *testing.T) {
 		if !strings.Contains(normalized, canonicalPipelineAgentPrerequisite) {
 			t.Errorf("%s is missing the canonical pipeline-agent prerequisite %q", name, canonicalPipelineAgentPrerequisite)
 		}
+	}
+}
+
+func TestAxiStatusUnknownBranchRunRelationshipGuidance_InInstalledSkill(t *testing.T) {
+	if !strings.Contains(skill.Markdown(), canonicalUnknownBranchRunRelationship) {
+		t.Error("installed skill is missing the explicit-run unknown-branch relationship contract")
 	}
 }
 
