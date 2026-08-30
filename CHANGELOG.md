@@ -1,5 +1,40 @@
 # Changelog
 
+## [1.60.2](https://github.com/kunchenguid/no-mistakes/compare/v1.60.1...v1.60.2) (2026-08-29)
+
+
+### Bug Fixes
+
+* **agent:** pass --print-timeout 24h by default in Antigravity adapter ([#896](https://github.com/kunchenguid/no-mistakes/issues/896)) ([be9138f](https://github.com/kunchenguid/no-mistakes/commit/be9138fdabb528acecafc78005b277028e1612c9))
+* **pipeline:** harden CI repair scope and attestation ([#899](https://github.com/kunchenguid/no-mistakes/issues/899)) ([4a84a15](https://github.com/kunchenguid/no-mistakes/commit/4a84a153dbcba764c76d7113fd8a8d886e35e3d6))
+
+## [1.60.1](https://github.com/kunchenguid/no-mistakes/compare/v1.60.0...v1.60.1) (2026-08-29)
+
+
+### Bug Fixes
+
+* **pipeline:** keep review fixes within authorized scope ([#892](https://github.com/kunchenguid/no-mistakes/issues/892)) ([f1f249d](https://github.com/kunchenguid/no-mistakes/commit/f1f249d26ef14507757a85273ab3244d3bf5e6c6))
+* **pipeline:** safely publish CI repairs with proven continuity ([#887](https://github.com/kunchenguid/no-mistakes/issues/887)) ([5d5b650](https://github.com/kunchenguid/no-mistakes/commit/5d5b650300e51639c79f5516b4c8c11b4425b1c3))
+
+## [1.60.0](https://github.com/kunchenguid/no-mistakes/compare/v1.59.3...v1.60.0) (2026-08-28)
+
+
+### Features
+
+* **pipeline:** ingest review comments and synchronize gate refs ([#873](https://github.com/kunchenguid/no-mistakes/issues/873)) ([605481b](https://github.com/kunchenguid/no-mistakes/commit/605481b9e3523fb7c11acf671826b22b8076b2fa))
+
+
+### Bug Fixes
+
+* **pipeline:** make native agent timeouts observable and bounded ([#877](https://github.com/kunchenguid/no-mistakes/issues/877)) ([dc45531](https://github.com/kunchenguid/no-mistakes/commit/dc4553128e4e29c78b7f5223daa9d9aabcca5471))
+
+## [1.59.3](https://github.com/kunchenguid/no-mistakes/compare/v1.59.2...v1.59.3) (2026-08-27)
+
+
+### Bug Fixes
+
+* **update:** reap background update-check processes ([#858](https://github.com/kunchenguid/no-mistakes/issues/858)) ([06c6504](https://github.com/kunchenguid/no-mistakes/commit/06c65043ede499378ab8c524aff2e0f966806ab0))
+
 ## [1.59.2](https://github.com/kunchenguid/no-mistakes/compare/v1.59.1...v1.59.2) (2026-08-26)
 
 

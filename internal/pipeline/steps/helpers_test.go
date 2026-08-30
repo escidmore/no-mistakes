@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -19,6 +18,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
+	"github.com/kunchenguid/no-mistakes/internal/pipeline/steps/internal/stepstest"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
@@ -213,28 +213,10 @@ func fakeCLIBinDir(t *testing.T) string {
 	return dir
 }
 
-// linkTestBinary creates a hard link (or copy) of the current test binary
-// with the given name in binDir. On Windows, .exe is appended.
+// linkTestBinary places the tiny fake-CLI helper on PATH under name.
 func linkTestBinary(t *testing.T, binDir, name string) {
 	t.Helper()
-	exe, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if runtime.GOOS == "windows" {
-		name += ".exe"
-	}
-	dst := filepath.Join(binDir, name)
-	if err := os.Link(exe, dst); err != nil {
-		// Fallback to copy if hard link fails (cross-device, etc.)
-		data, readErr := os.ReadFile(exe)
-		if readErr != nil {
-			t.Fatal(readErr)
-		}
-		if err := os.WriteFile(dst, data, 0o755); err != nil {
-			t.Fatal(err)
-		}
-	}
+	stepstest.LinkFakeCLI(t, binDir, name)
 }
 
 // fakeGH creates a mock gh binary in a temp dir and returns env entries for StepContext.Env.

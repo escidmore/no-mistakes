@@ -3,6 +3,7 @@ package steps
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/kunchenguid/no-mistakes/internal/branchsync"
@@ -60,6 +61,41 @@ func (s *PushStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, e
 		newHeadSHA = headSHA
 	}
 
+	headBeingPushed, err := git.HeadSHA(ctx, sctx.WorkDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve head before push: %w", err)
+	}
+	if err := publishRunHead(sctx, headBeingPushed, newHeadSHA); err != nil {
+		return nil, err
+	}
+
+	sctx.Log("pushed successfully")
+	return &pipeline.StepOutcome{}, nil
+}
+
+// publishRunHead is the single guarded publication path for a run's head. Both
+// the Push step and a CI repair published without revalidation
+// (ci.revalidate_repairs: false) go through it, so the review-approved-head
+// continuity check, the force-with-lease anchor, the remote verification, the
+// push binding, and the gate-mirror update are written once and can never
+// drift apart between the two callers.
+//
+// localRefUpdate, when non-empty, is the SHA the run's local branch ref is
+// moved to after a verified push. Callers that already advanced the ref with
+// their commit pass "".
+//
+// Every worktree git call here is step-scoped (stepGitRun), not git.Run,
+// because the CI step runs with a step-local PATH and credential environment
+// that a plain runner would not see. Gate-mirror calls stay on git.Run: they
+// operate on the bare gate directory, not the run worktree.
+// Publication becomes durable only after the remote and gate mirror settle;
+// the push binding and recorded head then land in one database update.
+//
+// It deliberately does not relax the review-approved-head check for anyone.
+// Whether a CI repair may be published at all is decided before publication, by
+// ciRepairContinuityGap.
+func publishRunHead(sctx *pipeline.StepContext, headBeingPushed, localRefUpdate string) error {
+	ctx := sctx.Ctx
 	ref := normalizedBranchRef(sctx.Run.Branch)
 	branch := strings.TrimPrefix(ref, "refs/heads/")
 
@@ -73,12 +109,8 @@ func (s *PushStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, e
 		sctx.Log(fmt.Sprintf("pushing to %s (%s)...", safeurl.Redact(pushURL), ref))
 	}
 
-	headBeingPushed, err := git.HeadSHA(ctx, sctx.WorkDir)
-	if err != nil {
-		return nil, fmt.Errorf("resolve head before push: %w", err)
-	}
 	if err := assertReviewApprovedPushHead(sctx, headBeingPushed); err != nil {
-		return nil, err
+		return err
 	}
 
 	// Decide whether force-pushing would discard commits the pipeline never saw.
@@ -89,83 +121,155 @@ func (s *PushStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, e
 	// A bare --force-with-lease offers no protection when pushing to a URL (no
 	// remote-tracking refs), so the anchor is explicit.
 	lastSeen := lastKnownBranchTip(ctx, sctx, branch, usingFork)
-	gitRun := func(args ...string) (string, error) { return git.Run(ctx, sctx.WorkDir, args...) }
+	gitRun := func(args ...string) (string, error) { return stepGitRun(sctx, args...) }
 	decision, err := resolveForcePushDecision(gitRun, pushURL, ref, headBeingPushed, lastSeen, sctx.Run.BaseSHA)
 	if err != nil {
-		return nil, fmt.Errorf("push to %s: %w", pushTarget, err)
+		return fmt.Errorf("push to %s: %w", pushTarget, err)
 	}
 	switch {
 	case decision.newBranch:
 		// New branch: regular push (no force needed).
-		if err := git.PushCommit(ctx, sctx.WorkDir, pushURL, headBeingPushed, ref, "", false); err != nil {
-			return nil, fmt.Errorf("push to %s: %w", pushTarget, err)
+		if err := stepGitPushCommit(sctx, pushURL, headBeingPushed, ref, "", false); err != nil {
+			return fmt.Errorf("push to %s: %w", pushTarget, err)
 		}
 	case decision.upToDate:
 		// Remote already at this exact head. This freshly verified equality is a
 		// successful binding even though no objects needed to move.
 	default:
 		// Existing branch: force-with-lease anchored to the verified remote head.
-		if err := git.PushCommit(ctx, sctx.WorkDir, pushURL, headBeingPushed, ref, decision.remoteSHA, true); err != nil {
-			return nil, fmt.Errorf("push to %s: %w", pushTarget, err)
+		if err := stepGitPushCommit(sctx, pushURL, headBeingPushed, ref, decision.remoteSHA, true); err != nil {
+			return fmt.Errorf("push to %s: %w", pushTarget, err)
 		}
 	}
-	verifiedRemote, err := git.LsRemote(ctx, sctx.WorkDir, pushURL, ref)
+	verifiedRemote, err := lsRemoteSHA(gitRun, pushURL, ref)
 	if err != nil || verifiedRemote != headBeingPushed {
 		if err != nil {
-			return nil, fmt.Errorf("verify successful push to %s: %w", pushTarget, err)
+			return fmt.Errorf("verify successful push to %s: %w", pushTarget, err)
 		}
-		return nil, fmt.Errorf("verify successful push to %s: remote head %s does not equal pushed head %s", pushTarget, verifiedRemote, headBeingPushed)
+		return fmt.Errorf("verify successful push to %s: remote head %s does not equal pushed head %s", pushTarget, verifiedRemote, headBeingPushed)
 	}
-	if err := sctx.DB.UpdateRunPushBinding(sctx.Run.ID, db.PushBinding{
+	// Settle the gate mirror BEFORE recording the publication. The remote
+	// already has the head, but a run is only "published" once the gate mirror
+	// carries it too: `no-mistakes rerun` resolves its starting head from the
+	// gate, so a head recorded as published while the gate is behind is a head
+	// a later rerun silently omits.
+	//
+	// Ordering it here is what makes a mirror failure retryable instead of
+	// having to choose between two wrong answers. Nothing durable has been
+	// written yet, so the caller's next attempt re-enters this path, finds the
+	// remote already at this head (an up-to-date no-op push), and retries the
+	// mirror. The alternative orderings both lose: recording first and
+	// returning the error makes the CI monitor treat an already published
+	// repair as a failed one, and recording first and swallowing the error
+	// strands the gate behind the remote for good.
+	if err := updateGateMirrorAfterPush(ctx, sctx, ref, headBeingPushed); err != nil {
+		return err
+	}
+
+	if localRefUpdate != "" {
+		if _, err := stepGitRun(sctx, "update-ref", ref, localRefUpdate); err != nil {
+			return fmt.Errorf("update local branch ref: %w", err)
+		}
+	}
+
+	if err := sctx.DB.UpdateRunPublication(sctx.Run.ID, db.PushBinding{
 		HeadSHA:           headBeingPushed,
 		TargetKind:        pushTarget,
 		TargetFingerprint: branchsync.TargetFingerprint(pushURL),
 		Ref:               ref,
 	}); err != nil {
-		return nil, err
+		return err
 	}
-
-	if newHeadSHA != "" {
-		if _, err := git.Run(ctx, sctx.WorkDir, "update-ref", ref, newHeadSHA); err != nil {
-			return nil, fmt.Errorf("update local branch ref: %w", err)
-		}
-	}
-
-	// Persist the immutable source that was verified and delivered, never a
-	// fresh read of mutable worktree HEAD after the push.
-	if headBeingPushed != sctx.Run.HeadSHA {
-		sctx.Run.HeadSHA = headBeingPushed
-		if err := sctx.DB.UpdateRunHeadSHA(sctx.Run.ID, headBeingPushed); err != nil {
-			return nil, err
-		}
-	}
-
-	sctx.Log("pushed successfully")
-	return &pipeline.StepOutcome{}, nil
+	sctx.Run.HeadSHA = headBeingPushed
+	return nil
 }
 
+func updateGateMirrorAfterPush(ctx context.Context, sctx *pipeline.StepContext, ref, headBeingPushed string) error {
+	if sctx.Repo == nil || strings.TrimSpace(sctx.GateDir) == "" {
+		return nil
+	}
+	gateDir := strings.TrimSpace(sctx.GateDir)
+	if _, statErr := os.Stat(gateDir); statErr != nil {
+		if os.IsNotExist(statErr) {
+			return nil
+		}
+		return fmt.Errorf("stat gate mirror repository: %w", statErr)
+	}
+	if err := git.ValidateBareRepository(ctx, gateDir); err != nil {
+		return fmt.Errorf("update gate mirror ref %s: validate repository: %w", ref, err)
+	}
+
+	if fetchErr := git.FetchRemoteRef(ctx, gateDir, sctx.WorkDir, headBeingPushed, headBeingPushed); fetchErr != nil {
+		return fmt.Errorf("update gate mirror ref %s: fetch pushed head: %w", ref, fetchErr)
+	}
+
+	gateTip, _ := git.Run(ctx, gateDir, "rev-parse", "--verify", ref)
+	gateTip = strings.TrimSpace(gateTip)
+
+	submittedHead := ""
+	if sctx.Run.SubmittedHeadSHA != nil {
+		submittedHead = strings.TrimSpace(*sctx.Run.SubmittedHeadSHA)
+	}
+
+	shouldUpdate := gateTip == "" || gateTip == headBeingPushed || (submittedHead != "" && gateTip == submittedHead)
+	if !shouldUpdate {
+		if _, err := git.Run(ctx, gateDir, "merge-base", "--is-ancestor", headBeingPushed, gateTip); err == nil {
+			// Preserve a newer descendant.
+			shouldUpdate = false
+		} else if _, err := git.Run(ctx, gateDir, "merge-base", "--is-ancestor", gateTip, headBeingPushed); err == nil {
+			// Fast-forward advance from an older ancestor.
+			shouldUpdate = true
+		} else {
+			return fmt.Errorf("gate mirror ref %s at %s diverged from pushed head %s", ref, gateTip, headBeingPushed)
+		}
+	}
+	if shouldUpdate {
+		if _, updateErr := git.Run(ctx, gateDir, "update-ref", ref, headBeingPushed, gateTip); updateErr != nil {
+			return fmt.Errorf("update gate mirror ref %s to %s: %w", ref, headBeingPushed, updateErr)
+		}
+	}
+	return nil
+}
+
+// assertReviewApprovedPushHead refuses to publish a head that is not the
+// durably review-approved commit or a descendant of it. There is no exception:
+// a head that cannot show that ancestry has not been reviewed, and the CI
+// repair path answers that case by revalidating instead of publishing.
 func assertReviewApprovedPushHead(sctx *pipeline.StepContext, proposedHead string) error {
 	run, err := sctx.DB.GetRun(sctx.Run.ID)
 	if err != nil {
 		return fmt.Errorf("load durable review approval before push: %w", err)
 	}
+	approvedHead, reason := reviewApprovedHead(sctx, run)
+	if approvedHead == "" {
+		return fmt.Errorf("refusing to push: %s", reason)
+	}
+	if proposedHead == approvedHead {
+		return nil
+	}
+	if _, err := stepGitRun(sctx, "merge-base", "--is-ancestor", approvedHead, proposedHead); err != nil {
+		return fmt.Errorf("refusing to push: proposed head %s violates continuity with review-approved head %s (it is not an equal or descendant commit)", shortObjectID(proposedHead), shortObjectID(approvedHead))
+	}
+	return nil
+}
+
+// reviewApprovedHead returns the run's durable review-approved commit, or ""
+// plus the reason it is unusable. It is the single reader of that authority, so
+// the pre-publication continuity decision and the publication guard itself can
+// never disagree about what "reviewed" means.
+func reviewApprovedHead(sctx *pipeline.StepContext, run *db.Run) (string, string) {
 	if run == nil || run.ReviewApprovedHeadSHA == nil || strings.TrimSpace(*run.ReviewApprovedHeadSHA) == "" {
-		return fmt.Errorf("refusing to push: run has no durably recorded review-approved head")
+		return "", "run has no durably recorded review-approved head"
 	}
 	approvedHead := strings.TrimSpace(*run.ReviewApprovedHeadSHA)
 	if !isFullGitObjectID(approvedHead) {
-		return fmt.Errorf("refusing to push: durable review-approved head is malformed")
+		return "", "durable review-approved head is malformed"
 	}
-	resolved, err := git.Run(sctx.Ctx, sctx.WorkDir, "rev-parse", "--verify", approvedHead+"^{commit}")
+	resolved, err := stepGitRun(sctx, "rev-parse", "--verify", approvedHead+"^{commit}")
 	if err != nil || !strings.EqualFold(strings.TrimSpace(resolved), approvedHead) {
-		return fmt.Errorf("refusing to push: durable review-approved head is unreachable")
+		return "", "durable review-approved head is unreachable"
 	}
-	if proposedHead != approvedHead {
-		if _, err := git.Run(sctx.Ctx, sctx.WorkDir, "merge-base", "--is-ancestor", approvedHead, proposedHead); err != nil {
-			return fmt.Errorf("refusing to push: proposed head %s violates continuity with review-approved head %s (it is not an equal or descendant commit)", shortObjectID(proposedHead), shortObjectID(approvedHead))
-		}
-	}
-	return nil
+	return approvedHead, ""
 }
 
 func isFullGitObjectID(value string) bool {
