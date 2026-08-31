@@ -2,6 +2,7 @@ package steps
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -49,6 +50,40 @@ type CIStep struct {
 	// must not re-arm the timeout. Overridable for testing; defaults to
 	// fetching the upstream default branch.
 	baseBranchTip func(context.Context) (string, bool)
+}
+
+// SetPollIntervalOverride is a test hook; production leaves the override unset.
+func (s *CIStep) SetPollIntervalOverride(d time.Duration) *CIStep {
+	s.pollIntervalOverride = d
+	return s
+}
+
+// SetWaitForNextPoll is a test hook; production sleeps for the poll interval.
+func (s *CIStep) SetWaitForNextPoll(fn func(context.Context, time.Duration) error) *CIStep {
+	s.waitForNextPoll = fn
+	return s
+}
+
+// SetNow is a test hook; production uses time.Now.
+func (s *CIStep) SetNow(fn func() time.Time) *CIStep {
+	s.now = fn
+	return s
+}
+
+// SetBaseBranchTip is a test hook; production fetches the upstream default branch.
+func (s *CIStep) SetBaseBranchTip(fn func(context.Context) (string, bool)) *CIStep {
+	s.baseBranchTip = fn
+	return s
+}
+
+// TransientRerunRecorded reports whether a rerun budget entry exists for name.
+// Tests use this to assert monitor accounting without reading unexported state.
+func (s *CIStep) TransientRerunRecorded(name string) bool {
+	if s == nil {
+		return false
+	}
+	_, ok := s.transientReruns.rollup[name]
+	return ok
 }
 
 func (s *CIStep) Name() types.StepName { return types.StepCI }
@@ -226,6 +261,11 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 	} else {
 		sctx.Log(fmt.Sprintf("monitoring CI for PR #%s (timeout: %s)...", prNumber, timeout))
 	}
+	// State the repair policy once, at entry, rather than at every poll: which
+	// of the two very differently priced paths a repair will take is the single
+	// most useful thing to know when reading a CI step log after the fact, and
+	// it cannot be inferred from the repair line alone until a repair happens.
+	sctx.Log(fmt.Sprintf("CI repair policy: %s (ci.revalidate_repairs: %t)", ciRepairPolicyDescription(sctx), ciRevalidatesRepairs(sctx)))
 	now := s.now
 	if now == nil {
 		now = time.Now
@@ -257,6 +297,30 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 			return ciMergeabilityOutcome("mergeability check timed out", mergeabilityBlockedReason), nil
 		}
 		return ciMonitoringTimeoutOutcome(), nil
+	}
+	waitForPoll := func() error {
+		interval := s.pollIntervalOverride
+		if interval == 0 {
+			interval = pollInterval(now().Sub(started))
+		}
+		if !unlimited {
+			remaining := timeout - now().Sub(timeoutAnchor)
+			if remaining < interval {
+				interval = remaining
+			}
+		}
+		waitForNextPoll := s.waitForNextPoll
+		if waitForNextPoll == nil {
+			waitForNextPoll = func(ctx context.Context, interval time.Duration) error {
+				select {
+				case <-time.After(interval):
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+		}
+		return waitForNextPoll(ctx, interval)
 	}
 
 	for {
@@ -514,13 +578,28 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 					manualFixAttempted = true
 					sctx.Log(fmt.Sprintf("issues detected: %s - manual fix requested...", issueDesc))
 					previousHeadSHA := sctx.Run.HeadSHA
-					changed, err := s.autoFixCI(sctx, host, pr, fixTargets, mergeConflict)
+					repair, err := s.autoFixCI(sctx, host, pr, fixTargets, mergeConflict)
+					if outcome := ciFixAgentBudgetOutcome(sctx, issueDesc, err); outcome != nil {
+						return outcome, nil
+					}
+					if err != nil && errors.Is(err, errCIAttestationUnsettled) {
+						sctx.Log(fmt.Sprintf("CI repair push is not settled: %v", err))
+						return ciFailureOutcome(reportedIssues, mergeConflict, err.Error()), nil
+					}
 					if err != nil {
 						sctx.Log(fmt.Sprintf("warning: CI manual fix failed: %v", err))
-					} else if changed || sctx.Run.HeadSHA != previousHeadSHA {
+					} else if repair.HeadAdvanced || sctx.Run.HeadSHA != previousHeadSHA {
 						s.lastFixedChecks = fixKey
 						s.lastFixedCompletedAt = fixCompletedAt
-						return &pipeline.StepOutcome{RestartFrom: types.StepReview}, nil
+						if repair.Revalidate {
+							return &pipeline.StepOutcome{RestartFrom: types.StepReview}, nil
+						}
+						// The repair was published, so the monitor stays on
+						// this run and waits for the provider to re-run the
+						// checks against the new head.
+					} else if repair.NoCodeChangeNeeded {
+						sctx.Log(fmt.Sprintf("CI fixer concluded no code change is needed: %s", repair.Summary))
+						return ciFailureOutcome(reportedIssues, mergeConflict, repair.Summary), nil
 					} else {
 						sctx.Log("CI fix produced no changes, returning for manual intervention...")
 						return ciFailureOutcome(reportedIssues, mergeConflict, "CI fix produced no changes - failures require manual intervention"), nil
@@ -545,13 +624,28 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 					s.ciFixAttempts = nextAttempt
 					sctx.Log(fmt.Sprintf("issues detected: %s - auto-fixing (attempt %d/%d)...", issueDesc, s.ciFixAttempts, ciFixLimit))
 					previousHeadSHA := sctx.Run.HeadSHA
-					changed, err := s.autoFixCI(sctx, host, pr, fixTargets, mergeConflict)
+					repair, err := s.autoFixCI(sctx, host, pr, fixTargets, mergeConflict)
+					if outcome := ciFixAgentBudgetOutcome(sctx, issueDesc, err); outcome != nil {
+						return outcome, nil
+					}
+					if err != nil && errors.Is(err, errCIAttestationUnsettled) {
+						sctx.Log(fmt.Sprintf("CI repair push is not settled: %v", err))
+						return ciFailureOutcome(reportedIssues, mergeConflict, err.Error()), nil
+					}
 					if err != nil {
 						sctx.Log(fmt.Sprintf("warning: CI auto-fix failed: %v", err))
-					} else if changed || sctx.Run.HeadSHA != previousHeadSHA {
+					} else if repair.HeadAdvanced || sctx.Run.HeadSHA != previousHeadSHA {
 						s.lastFixedChecks = fixKey
 						s.lastFixedCompletedAt = fixCompletedAt
-						return &pipeline.StepOutcome{RestartFrom: types.StepReview}, nil
+						if repair.Revalidate {
+							return &pipeline.StepOutcome{RestartFrom: types.StepReview}, nil
+						}
+						// The repair was published, so the monitor stays on
+						// this run and waits for the provider to re-run the
+						// checks against the new head.
+					} else if repair.NoCodeChangeNeeded {
+						sctx.Log(fmt.Sprintf("CI fixer concluded no code change is needed: %s", repair.Summary))
+						return ciFailureOutcome(reportedIssues, mergeConflict, repair.Summary), nil
 					} else {
 						// No changes produced - don't set lastFixedChecks so next
 						// poll treats this as a new failure and retries if attempts remain.
@@ -596,29 +690,7 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 			}
 		}
 
-		// Sleep for poll interval
-		interval := s.pollIntervalOverride
-		if interval == 0 {
-			interval = pollInterval(now().Sub(started))
-		}
-		if !unlimited {
-			remaining := timeout - now().Sub(timeoutAnchor)
-			if remaining < interval {
-				interval = remaining
-			}
-		}
-		waitForNextPoll := s.waitForNextPoll
-		if waitForNextPoll == nil {
-			waitForNextPoll = func(ctx context.Context, interval time.Duration) error {
-				select {
-				case <-time.After(interval):
-					return nil
-				case <-ctx.Done():
-					return ctx.Err()
-				}
-			}
-		}
-		if err := waitForNextPoll(ctx, interval); err != nil {
+		if err := waitForPoll(); err != nil {
 			return nil, err
 		}
 	}

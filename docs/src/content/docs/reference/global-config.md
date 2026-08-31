@@ -75,6 +75,7 @@ auto_fix:
 
 ci:
   rerun_transient: 0
+  revalidate_repairs: false
 
 commit:
   fix_message: "chore(no-mistakes-{{.Step}}): {{.Summary}}"
@@ -283,6 +284,7 @@ Smart defaults:
 - For `claude`, supplying `--permission-mode` (or `--dangerously-skip-permissions`) suppresses the default `--dangerously-skip-permissions`.
 - For `codex`, supplying `--ask-for-approval`, `--sandbox`, or `--dangerously-bypass-approvals-and-sandbox` suppresses the default `--dangerously-bypass-approvals-and-sandbox`.
 - For `grok`, supplying `--permission-mode` or `--always-approve` suppresses the default `--permission-mode bypassPermissions`. No model flag is added: Grok uses its current configured default unless you explicitly set `-m` or `--model`.
+- For `antigravity`, supplying `-t` or `--print-timeout` suppresses the default `--print-timeout 24h`.
 
 Permission and sandbox flags affect the underlying agent, but they do not disable no-mistakes' pipeline prompt steering.
 Pipeline agents are still told to keep intentional writes inside the worktree and avoid mutating system state outside it.
@@ -363,7 +365,7 @@ Accepts any Go `time.ParseDuration` string: `30m`, `2h`, `4h30m`, etc.
 
 This is an idle timeout, not an absolute deadline: every time the base branch advances, the monitor re-arms it.
 So an actively-updated green PR keeps its monitor no matter how long it stays open.
-If it later develops an actual GitHub, GitLab, Forgejo, or Azure DevOps merge conflict, the CI auto-fix path rebases it, restarts validation at Review, and publishes it through Push, while a clean behind PR needs no command.
+If it later develops an actual GitHub, GitLab, Forgejo, or Azure DevOps merge conflict, the CI auto-fix path rebases it, revalidates from Review because rebasing cannot prove continuity with the reviewed head, and publishes it through Push, while a clean behind PR needs no command.
 A genuinely idle/abandoned PR still parks at an approval gate after the timeout elapses.
 While that CI gate is parked, the daemon continues bounded read-only PR-state checks.
 If the PR is merged or closed externally, the stale gate completes automatically; an open, unknown, or temporarily unreachable PR remains parked for a user decision.
@@ -394,8 +396,17 @@ For older active runs that do not yet have activity rows, AXI falls back to the 
 Maximum wall-clock time for one pipeline agent invocation that does not already have a more specific deadline.
 This is the default-by-construction budget: Document, Lint, Rebase conflict repair, PR drafting, CI auto-fix, and any future agent-spawning step are bounded even if they forget to install their own timer.
 Review still uses [`review_agent_timeout`](#review_agent_timeout) as a per-round budget, Test still uses [`test_agent_timeout`](#test_agent_timeout) per invocation, and Intent keeps its five-minute extraction cap; any existing deadline is honored rather than capped.
-When this deadline expires, the agent is cancelled and the invocation returns a timeout diagnostic instead of remaining active indefinitely. Agent-driven mutation steps fail the run, while PR drafting follows its existing agent-error fallback and continues with deterministic content.
+When this deadline expires, the agent is cancelled and the invocation returns a timeout diagnostic instead of remaining active indefinitely. Most agent-driven mutation steps fail the run, CI auto-fix parks for a user decision, and PR drafting follows its existing agent-error fallback and continues with deterministic content. The [CI step reference](/no-mistakes/reference/pipeline-steps/#ci) owns the approval behavior.
 A late successful return after the deadline is rejected, so post-agent commits and PR content cannot use work from a timed-out turn.
+
+The diagnostic reports what was actually measured, not the budget restated. Evidence resets whenever a retry or fallback starts a replacement attempt, including provider fallback, failed session resume, and OpenCode's prompt-only structured-output fallback, so the diagnostic describes only the attempt that reached the deadline:
+
+- `agent produced no output at all in 30m0s after its subprocess started (pid=1234)` - the current attempt launched and then emitted nothing. Check that the agent CLI is authenticated and responsive.
+- `agent last produced output 4s ago (312 observed)` - the current attempt was working right up to the deadline. The turn needs a larger budget, or the request is too large for one turn.
+- `agent produced no output at all in 30m0s and never reported a subprocess start` - the current attempt never reached a running agent process.
+
+Output means anything observable: streamed assistant text, or raw bytes on the agent subprocess's stdout or stderr. Subprocess bytes matter because an agent spends most of a long turn running tools rather than writing prose, so prose alone cannot tell a working agent from a wedged one.
+Any substantive report from the agent adapter - for a native agent, its exit status and captured stderr - is appended to the diagnostic as `agent reported: ...`; credential-bearing URLs are redacted and the report is length-bounded before it can reach logs or findings. A bare context cancellation is omitted because it adds no evidence.
 
 |         |                        |
 | ------- | ---------------------- |
@@ -412,6 +423,7 @@ It is global-only: repository config and environment variables cannot override i
 Maximum wall-clock time for the Review step's agent turns in one review round.
 The budget starts at that round's first agent turn and covers its optional review-fix turn plus the rereview turn together; every later auto-fix round starts a fresh budget.
 When the deadline expires, the review agent is cancelled and the run fails with a diagnostic naming the timeout instead of remaining active indefinitely.
+That diagnostic carries the same measured evidence and adapter report described under [`agent_timeout`](#agent_timeout).
 
 |         |                        |
 | ------- | ---------------------- |
@@ -427,6 +439,7 @@ Raise it for repositories whose reviews legitimately run long; it bounds only th
 Maximum wall-clock time for one Test-step agent invocation.
 The budget covers the post-test evidence-gathering turn, and a Test-repair turn gets its own budget of the same length.
 When the deadline expires, the test agent is cancelled and the run fails with a diagnostic naming the timeout instead of remaining active indefinitely.
+That diagnostic carries the same measured evidence and adapter report described under [`agent_timeout`](#agent_timeout).
 
 |         |                        |
 | ------- | ---------------------- |
@@ -562,6 +575,22 @@ Each rerun is another provider-side workflow run billed to the repository being 
 Set `0` here to never spend someone else's CI minutes; this is the only place to make that choice for a repository whose default branch you do not control.
 
 The per-repo [`ci.rerun_transient`](/no-mistakes/reference/repo-config/#cirerun_transient) overrides this value and owns the classification, the trust boundary, and every case that skips the rerun.
+
+### ci.revalidate_repairs
+
+The operator-level fallback for [`ci.revalidate_repairs`](/no-mistakes/reference/repo-config/#cirevalidate_repairs), whose per-repository reference owns the repair-delivery semantics, safety rationale, and trust boundary.
+
+| | |
+|---|---|
+| Type | `bool` |
+| Default | `false` |
+
+```yaml
+ci:
+  revalidate_repairs: false
+```
+
+A value in the trusted repository config overrides this global value in both directions: an explicit repository `true` enables revalidation when this is `false`, and an explicit repository `false` disables opt-in revalidation when this is `true`. When the trusted repository config omits the key, this global value applies.
 
 ### commit.fix_message
 

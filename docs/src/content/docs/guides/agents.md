@@ -153,7 +153,7 @@ Successful outcomes also instruct the agent to summarize the run for the user.
 When the pipeline applied fixes, successful outcomes include a `fixes` table listing each fix so the agent can acknowledge what it missed and the user can review them.
 
 If that PR later falls behind the default branch or hits a merge conflict - commonly because another PR merged first - the agent runs no command and must never hand-rebase.
-The CI monitor stays live in the background after checks pass, and when it sees an actual conflict it rebases onto the base, resolves it, restarts validation at Review, and re-pushes the branch through Push, so no agent or user action is needed.
+The CI monitor stays live in the background after checks pass, and when it sees an actual conflict it rebases onto the base, resolves it, revalidates from Review because rebasing cannot prove continuity with the reviewed head, and re-pushes the branch through Push, so no agent or user action is needed.
 A PR that is merely behind but still clean needs nothing either, since the platform merges it.
 The one exception is when that monitor is no longer running - the PR was closed, the run was aborted or superseded, it idle-timed-out, or its auto-fix attempts were exhausted - in which case the agent recovers with `no-mistakes rerun`, which cancels the stale monitor and re-runs the full pipeline including a deterministic rebase step.
 The agent must not use `no-mistakes axi run` to refresh a still-active PR: after `checks-passed` it reattaches to the running monitor with HEAD unchanged and returns the monitor output without rebasing.
@@ -216,7 +216,7 @@ All agents implement the same interface. Each invocation receives:
 - **Environment** - the daemon environment plus non-interactive Git overrides (`GIT_EDITOR=true`, `GIT_SEQUENCE_EDITOR=true`, and `GIT_TERMINAL_PROMPT=0`) so agent-invoked Git commands do not hang on editors or credential prompts
 - **JSONSchema** - optional structured output schema for typed responses
 - **OnChunk** - callback for streaming text output to the TUI
-- **OnLifecycle** - callback for native subprocess start, exit, and retry activity that is recorded in step logs and AXI active-step status
+- **OnLifecycle** - callback for native subprocess start, exit, retry, fallback, and output-liveness activity; control events reach step logs and AXI active-step status, while throttled output liveness updates status without flooding the log
 - **Session** - optional no-mistakes-owned native session identity for review-fixer reuse
 - **Purpose** - local performance label for the pipeline duty served
 
@@ -277,7 +277,7 @@ Grok is not available to a repository with `disable_project_settings: true`, bec
 
 ## Antigravity
 
-Spawns an `agy` subprocess for each invocation with `--print <prompt> --output-format stream-json`, plus `--dangerously-skip-permissions` (always present; `agent_args_override` cannot suppress it). Reads NDJSON events from stdout, streaming `step_update` text deltas to the TUI. Structured output is requested with a temporary `--json-schema` file and read from the terminal result's `structured_output`. Result precedence is terminal-authoritative: `structured_output` outranks the terminal result's `response`, which outranks the streamed deltas.
+Spawns an `agy` subprocess for each invocation with `--print <prompt> --output-format stream-json`, plus `--dangerously-skip-permissions` (always present; `agent_args_override` cannot suppress it). By default it also adds `--print-timeout 24h` to prevent premature pipe closure during long-running turns, unless you already set a timeout flag (`-t` or `--print-timeout`) through `agent_args_override`. Reads NDJSON events from stdout, streaming `step_update` text deltas to the TUI. Structured output is requested with a temporary `--json-schema` file and read from the terminal result's `structured_output`. Result precedence is terminal-authoritative: `structured_output` outranks the terminal result's `response`, which outranks the streamed deltas.
 For review-fixer reuse, Antigravity resumes the reported conversation with `--conversation <id>`. A pruned or unknown conversation id starts a fresh conversation instead of failing the turn.
 Usage accounting includes agy's reported `thinking_tokens` as reasoning tokens.
 `--conversation`, `-c`/`--continue`, the print/output flags, and the permission flag are reserved so global overrides cannot redirect the managed invocation.

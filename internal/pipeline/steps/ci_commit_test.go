@@ -49,12 +49,15 @@ func TestCIStep_CommitAndPush_CommitsLocallyWithoutPushing(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// This test pins the ci.revalidate_repairs: true path, where the
+	// repair is held locally until Review re-approves it.
+	sctx.Config.CI.RevalidateRepairs = true
 	step := &CIStep{}
-	changed, err := step.commitRepair(sctx, "stabilize Windows path test")
+	repair, err := step.commitRepair(sctx, "stabilize Windows path test")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !changed {
+	if !repair.HeadAdvanced {
 		t.Error("expected commitAndPush to report committed changes")
 	}
 
@@ -120,12 +123,15 @@ func TestCIStep_CommitAndPushDoesNotPushForkWhenConfigured(t *testing.T) {
 	sctx.Repo.ForkURL = fork
 	sctx.Run.Branch = "refs/heads/feature"
 
+	// This test pins the ci.revalidate_repairs: true path, where the
+	// repair is held locally until Review re-approves it.
+	sctx.Config.CI.RevalidateRepairs = true
 	step := &CIStep{}
-	changed, err := step.commitAndPush(sctx)
+	repair, err := step.commitAndPush(sctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !changed {
+	if !repair.HeadAdvanced {
 		t.Fatal("expected commitAndPush to report committed changes")
 	}
 
@@ -147,11 +153,11 @@ func TestCIStep_CommitAndPush_NoChanges(t *testing.T) {
 	sctx.Run.Branch = "refs/heads/feature"
 
 	step := &CIStep{}
-	changed, err := step.commitAndPush(sctx)
+	repair, err := step.commitAndPush(sctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if changed {
+	if repair.HeadAdvanced {
 		t.Error("expected commitAndPush to report no local changes")
 	}
 }
@@ -196,11 +202,11 @@ func TestCIStep_CommitAndPush_StatusError(t *testing.T) {
 	sctx.Run.Branch = "refs/heads/feature"
 
 	step := &CIStep{}
-	changed, err := step.commitAndPush(sctx)
+	repair, err := step.commitAndPush(sctx)
 	if err == nil {
 		t.Fatal("expected status error")
 	}
-	if changed {
+	if repair.HeadAdvanced {
 		t.Error("expected commitAndPush to report no changes on status error")
 	}
 	if !strings.Contains(err.Error(), "git status --porcelain") {
@@ -269,12 +275,15 @@ func TestCIStep_CommitAndPush_UsesStepEnvForAllGitCommands(t *testing.T) {
 	sctx.Repo.UpstreamURL = upstream
 	sctx.Run.Branch = "refs/heads/feature"
 
+	// This test pins the ci.revalidate_repairs: true path, where the
+	// repair is held locally until Review re-approves it.
+	sctx.Config.CI.RevalidateRepairs = true
 	step := &CIStep{}
-	changed, err := step.commitAndPush(sctx)
+	repair, err := step.commitAndPush(sctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !changed {
+	if !repair.HeadAdvanced {
 		t.Fatal("expected commitAndPush to report committed changes")
 	}
 
@@ -346,12 +355,15 @@ func TestCIStep_CommitAndPush_GitCommandsUseStandardCredentialEnv(t *testing.T) 
 	sctx.Repo.UpstreamURL = upstream
 	sctx.Run.Branch = "refs/heads/feature"
 
+	// This test pins the ci.revalidate_repairs: true path, where the
+	// repair is held locally until Review re-approves it.
+	sctx.Config.CI.RevalidateRepairs = true
 	step := &CIStep{}
-	changed, err := step.commitAndPush(sctx)
+	repair, err := step.commitAndPush(sctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !changed {
+	if !repair.HeadAdvanced {
 		t.Fatal("expected commitAndPush to report committed changes")
 	}
 }
@@ -387,12 +399,15 @@ func TestCIStep_CommitAndPush_NoChanges_ReconcilesStaleDatabaseHeadSHA(t *testin
 	sctx.Repo.UpstreamURL = upstream
 	sctx.Run.Branch = "refs/heads/feature"
 
+	// This test pins the ci.revalidate_repairs: true path, where the
+	// repair is held locally until Review re-approves it.
+	sctx.Config.CI.RevalidateRepairs = true
 	step := &CIStep{}
-	changed, err := step.commitAndPush(sctx)
+	repair, err := step.commitAndPush(sctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !changed {
+	if !repair.HeadAdvanced {
 		t.Error("expected commitAndPush to report the reconciled local head")
 	}
 
@@ -450,12 +465,15 @@ func TestCIStep_CommitAndPush_NoChanges_ReconcilesStaleDatabaseHeadSHA_UsesStepE
 	sctx.Repo.UpstreamURL = upstream
 	sctx.Run.Branch = "refs/heads/feature"
 
+	// This test pins the ci.revalidate_repairs: true path, where the
+	// repair is held locally until Review re-approves it.
+	sctx.Config.CI.RevalidateRepairs = true
 	step := &CIStep{}
-	changed, err := step.commitAndPush(sctx)
+	repair, err := step.commitAndPush(sctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !changed {
+	if !repair.HeadAdvanced {
 		t.Error("expected commitAndPush to report the reconciled local head")
 	}
 
@@ -505,12 +523,15 @@ func TestCIStep_CommitAndPush_NoDirtyChangesRecordsAdvancedLocalHead(t *testing.
 	sctx.Repo.UpstreamURL = upstream
 	sctx.Run.Branch = "refs/heads/feature"
 
+	// This test pins the ci.revalidate_repairs: true path, where the
+	// repair is held locally until Review re-approves it.
+	sctx.Config.CI.RevalidateRepairs = true
 	step := &CIStep{}
-	changed, err := step.commitAndPush(sctx)
+	repair, err := step.commitAndPush(sctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !changed {
+	if !repair.HeadAdvanced {
 		t.Fatal("expected commitAndPush to record advanced clean head")
 	}
 
@@ -561,12 +582,15 @@ func TestCIStep_CommitAndPush_UpdatesLocalBranchRefWithoutDetachedPush(t *testin
 	sctx.Repo.UpstreamURL = upstream
 	sctx.Run.Branch = "refs/heads/feature"
 
+	// This test pins the ci.revalidate_repairs: true path, where the
+	// repair is held locally until Review re-approves it.
+	sctx.Config.CI.RevalidateRepairs = true
 	step := &CIStep{}
-	changed, err := step.commitAndPush(sctx)
+	repair, err := step.commitAndPush(sctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !changed {
+	if !repair.HeadAdvanced {
 		t.Error("expected commitAndPush to report committed changes")
 	}
 	newHeadSHA := gitCmd(t, dir, "rev-parse", "HEAD")

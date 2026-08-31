@@ -198,6 +198,7 @@ type Capabilities struct {
 	MergeableState    bool
 	FailedCheckLogs   bool
 	MergedProof       bool
+	ReviewComments    bool
 	PullRequests      bool
 	CommitStatuses    bool
 	BranchProtection  bool
@@ -217,6 +218,31 @@ var (
 	// the wrong commit.
 	ErrHeadChanged = errors.New("pull request head changed")
 )
+
+// ReviewComment represents a code review comment or bot finding on a pull request.
+type ReviewComment struct {
+	ID        string
+	Author    string
+	Path      string
+	Line      int
+	Body      string
+	CreatedAt time.Time
+	URL       string
+}
+
+// ReviewCommentsHost is an optional interface for SCM hosts that support fetching
+// unresolved review comments on a pull request.
+type ReviewCommentsHost interface {
+	GetReviewComments(ctx context.Context, pr *PR) ([]ReviewComment, error)
+}
+
+// PRContentReader is an optional interface for hosts that can read the current
+// title and body of an existing PR. The CI repair publisher uses it to rebind
+// a live pipeline attestation to a newly published head without rewriting the
+// rest of the body or inventing an attestation that was not already there.
+type PRContentReader interface {
+	GetPRContent(ctx context.Context, pr *PR) (PRContent, error)
+}
 
 // MergedProof is provider evidence that a specific PR head was merged.
 type MergedProof struct {

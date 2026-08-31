@@ -58,8 +58,8 @@ CREATE TABLE IF NOT EXISTS step_results (
     last_activity_at INTEGER,
     last_activity    TEXT,
     agent_pid        INTEGER,
-    auto_fix_limit   INTEGER,
-    ci_fix_attempts  INTEGER NOT NULL DEFAULT 0
+    auto_fix_limit              INTEGER,
+    ci_fix_attempts             INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS step_rounds (

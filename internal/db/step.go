@@ -31,11 +31,13 @@ type StepResult struct {
 const stepResultColumns = `id, run_id, step_name, step_order, status, exit_code, duration_ms, log_path, findings_json, error, started_at, completed_at, last_activity_at, last_activity, agent_pid, auto_fix_limit`
 
 func (d *DB) readableStepResultColumns() string {
+	columns := stepResultColumns
 	if d.hasColumn("step_results", "ci_fix_attempts") {
-		return stepResultColumns + ", ci_fix_attempts"
+		columns += ", ci_fix_attempts"
+	} else {
+		columns += ", 0 AS ci_fix_attempts"
 	}
-	// Read-only preflight can inspect a database before migrations run.
-	return stepResultColumns + ", 0 AS ci_fix_attempts"
+	return columns
 }
 
 // InsertStepResult creates a new step result record.
