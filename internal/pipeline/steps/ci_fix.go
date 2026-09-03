@@ -131,7 +131,7 @@ CI logs:
 	}
 	prompt += userIntentPromptSection(sctx)
 	prompt += executionContextPromptSection(sctx.WorkDir)
-	prompt = testguidance.LateRepairPrompt(string(s.Name()), prompt)
+	prompt = fixerPrompt(testguidance.LateRepairPrompt(string(s.Name()), prompt))
 
 	sctx.Log("running agent to fix CI issues...")
 	result, err := sctx.RunAgentContext(ctx, agent.RunOpts{

@@ -1,5 +1,47 @@
 # Changelog
 
+## [1.64.0](https://github.com/kunchenguid/no-mistakes/compare/v1.63.0...v1.64.0) (2026-09-03)
+
+
+### Features
+
+* **pipeline:** add simplification-first review and repair guidance ([#950](https://github.com/kunchenguid/no-mistakes/issues/950)) ([72ffc59](https://github.com/kunchenguid/no-mistakes/commit/72ffc59bf30fc2d2ee85627d1180323bba40aad7))
+
+## [1.63.0](https://github.com/kunchenguid/no-mistakes/compare/v1.62.0...v1.63.0) (2026-09-03)
+
+
+### Features
+
+* **pipeline:** add authorization and privacy tracing to review ([#946](https://github.com/kunchenguid/no-mistakes/issues/946)) ([961fbfb](https://github.com/kunchenguid/no-mistakes/commit/961fbfb699f968a290351e7977afd78b48f01694))
+
+
+### Bug Fixes
+
+* **cli:** clarify combined document and lint housekeeping attribution ([#941](https://github.com/kunchenguid/no-mistakes/issues/941)) ([19e5db9](https://github.com/kunchenguid/no-mistakes/commit/19e5db95951f013cd096267a572ce675c05add25))
+* **pipeline:** require intended-usage evidence for review findings ([#948](https://github.com/kunchenguid/no-mistakes/issues/948)) ([f9415ab](https://github.com/kunchenguid/no-mistakes/commit/f9415ab1db06a739961e09ed18256e0bd7378806))
+
+## [1.62.0](https://github.com/kunchenguid/no-mistakes/compare/v1.61.0...v1.62.0) (2026-09-02)
+
+
+### Features
+
+* **axi:** add per-run PR base branch via --base-branch ([#861](https://github.com/kunchenguid/no-mistakes/issues/861)) ([e08143f](https://github.com/kunchenguid/no-mistakes/commit/e08143f8407681d922ad50df9bcf14906095dd57))
+* **pipeline:** attach media evidence to GitHub pull requests ([#934](https://github.com/kunchenguid/no-mistakes/issues/934)) ([b262caa](https://github.com/kunchenguid/no-mistakes/commit/b262caa9218d47a4df28e4394cba8c392383d2bb))
+
+
+### Bug Fixes
+
+* **agent:** take the terminal bare JSON object for ACP agents ([#931](https://github.com/kunchenguid/no-mistakes/issues/931)) ([c6ad6ce](https://github.com/kunchenguid/no-mistakes/commit/c6ad6ce784761c1e7e759147e71f5a9a3b97b13c)), closes [#930](https://github.com/kunchenguid/no-mistakes/issues/930)
+* **cli:** make untracked-file guidance safe ([#927](https://github.com/kunchenguid/no-mistakes/issues/927)) ([552c22a](https://github.com/kunchenguid/no-mistakes/commit/552c22adaee2c9d114e47467a03135cfc02ea2c0))
+* **pipeline:** never report a CI approval override as a clean pass ([#923](https://github.com/kunchenguid/no-mistakes/issues/923)) ([76fa092](https://github.com/kunchenguid/no-mistakes/commit/76fa0921a9797b09e120c8b5979c4d0e65f88922))
+
+## [1.61.0](https://github.com/kunchenguid/no-mistakes/compare/v1.60.3...v1.61.0) (2026-08-31)
+
+
+### Features
+
+* **config:** make gate reconcile timings configurable ([#862](https://github.com/kunchenguid/no-mistakes/issues/862)) ([d0c4feb](https://github.com/kunchenguid/no-mistakes/commit/d0c4feb46b2297d548dd284fdf989cd57fa96721))
+
 ## [1.60.3](https://github.com/kunchenguid/no-mistakes/compare/v1.60.2...v1.60.3) (2026-08-29)
 
 

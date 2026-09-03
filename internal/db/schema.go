@@ -59,7 +59,8 @@ CREATE TABLE IF NOT EXISTS step_results (
     last_activity    TEXT,
     agent_pid        INTEGER,
     auto_fix_limit              INTEGER,
-    ci_fix_attempts             INTEGER NOT NULL DEFAULT 0
+    ci_fix_attempts             INTEGER NOT NULL DEFAULT 0,
+    override_reason             TEXT
 );
 
 CREATE TABLE IF NOT EXISTS step_rounds (
@@ -132,6 +133,20 @@ CREATE TABLE IF NOT EXISTS run_agent_sessions (
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (run_id, role)
+);
+
+-- User-attachment URLs are durable for the life of a run so restarting the
+-- pipeline from Review can render the same evidence without uploading another
+-- orphaned GitHub asset. The digest prevents reuse if a file is overwritten at
+-- the same path during a repair.
+CREATE TABLE IF NOT EXISTS run_media_attachments (
+    run_id    TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    path      TEXT NOT NULL,
+    digest    TEXT NOT NULL,
+    url       TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (run_id, path)
 );
 
 CREATE TABLE IF NOT EXISTS intent_cache (
@@ -221,11 +236,22 @@ var migrationStatements = []string{
 	// unpublished head this run produced; a timestamp means an explicit
 	// guarded recovery ended that ownership (internal/branchsync).
 	`ALTER TABLE runs ADD COLUMN custody_returned_at INTEGER`,
+	// Per-run PR target branch chosen by the operator (e.g. axi run
+	// --base-branch). Nullable: absent means fall back to repo config and the
+	// forge default branch.
+	`ALTER TABLE runs ADD COLUMN pr_base_branch TEXT`,
 	`ALTER TABLE step_results ADD COLUMN last_activity_at INTEGER`,
 	`ALTER TABLE step_results ADD COLUMN last_activity TEXT`,
 	`ALTER TABLE step_results ADD COLUMN agent_pid INTEGER`,
 	`ALTER TABLE step_results ADD COLUMN auto_fix_limit INTEGER`,
 	`ALTER TABLE step_results ADD COLUMN ci_fix_attempts INTEGER NOT NULL DEFAULT 0`,
+	// Non-nil exactly when a human answered ActionApprove on a step whose gate
+	// existed because of an unresolved external condition (currently: the CI
+	// step's live checks were still failing) - see
+	// pipeline.ApprovalOverrideVerifier. Durable so the distinction between a
+	// verified-green completion and a deliberate override survives daemon
+	// restart, resume, and axi status/logs on an already-terminal run.
+	`ALTER TABLE step_results ADD COLUMN override_reason TEXT`,
 	// Session-fidelity telemetry columns (all nullable so pre-existing rows read
 	// back as unknown, never a fabricated zero).
 	`ALTER TABLE agent_invocations ADD COLUMN model_provider TEXT`,

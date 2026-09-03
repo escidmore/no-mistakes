@@ -466,6 +466,9 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 	switch response.action {
 	case types.ActionApprove:
 		e.recordDeclinedRound(gate.lastRoundID, gate.findings, gate.step.Name(), gate.round)
+		if err := e.applyApprovalOverride(gate.step, reconcileCtx, gate.stepResult.ID); err != nil {
+			return e.failRun(run, repo, err, ctx)
+		}
 		if err := completeRecoveredGate(); err != nil {
 			return e.failRun(run, repo, fmt.Errorf("complete recovered step %s: %w", gate.step.Name(), err), ctx)
 		}
@@ -1067,6 +1070,9 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 			// Approved - execution already frozen in executionMS, reset phaseStart
 			// so the done label computes no additional elapsed.
 			e.recordDeclinedRound(currentRoundID, outcome.Findings, stepName, roundNum)
+			if err := e.applyApprovalOverride(step, sctx, sr.ID); err != nil {
+				return false, "", err
+			}
 			phaseStart = time.Now()
 			goto done
 
@@ -1164,6 +1170,45 @@ done:
 //
 // Best effort by design. This is advisory prompt context for later steps, so a
 // failed write degrades to today's behavior and must never fail the run.
+// applyApprovalOverride is the single place both ActionApprove sites (the
+// live wait in executeStep and the daemon-restart recovery path in Resume)
+// route through before completing a step on approval. If step raised its gate
+// over a live, re-checkable condition (ApprovalOverrideVerifier), this
+// re-checks it once and, only when it is still unresolved, records the
+// upcoming completion as an explicit override (db.SetStepOverrideReason)
+// instead of a silent plain pass - see ApprovalOverrideVerifier's doc for the
+// incident this exists to make impossible. It never blocks or changes the
+// approval itself: a human's ActionApprove always proceeds, and a step that
+// does not implement the interface (every step but CI today) is completely
+// unaffected. A verification error fails closed - it is recorded as an
+// unresolved condition, not silently treated as clear - but still never stops
+// the approval, only what it gets recorded as.
+//
+// Persisting that override marker is itself fail-closed: every downstream
+// surface (outcomeForRun, the run_completed CIOverrideReason delta, the TUI
+// banner) derives override status solely from step_results.override_reason, so
+// a swallowed write failure would complete the step as an ordinary clean pass -
+// the exact false-green this feature exists to prevent. When the marker cannot
+// be written this returns the error so the caller fails the run closed instead
+// of recording that plain pass.
+func (e *Executor) applyApprovalOverride(step Step, sctx *StepContext, stepResultID string) error {
+	verifier, ok := step.(ApprovalOverrideVerifier)
+	if !ok {
+		return nil
+	}
+	unresolved, err := verifier.VerifyApprovalOverride(sctx)
+	if err != nil {
+		unresolved = fmt.Sprintf("could not verify: %v", err)
+	}
+	if unresolved == "" {
+		return nil
+	}
+	if dbErr := e.db.SetStepOverrideReason(stepResultID, unresolved); dbErr != nil {
+		return fmt.Errorf("record approval override reason for step %s: %w", step.Name(), dbErr)
+	}
+	return nil
+}
+
 func (e *Executor) recordDeclinedRound(roundID, findingsJSON string, stepName types.StepName, roundNum int) {
 	if e == nil || e.db == nil || roundID == "" {
 		return
@@ -1515,7 +1560,33 @@ func (e *Executor) emitRunEvent(eventType ipc.EventType, run *db.Run, repo *db.R
 		Error:  run.Error,
 		PRURL:  run.PRURL,
 	}
+	// A completed run may have passed with a CI approval override; the TUI
+	// banner reads the reason off the delta (like PRURL) so it never needs a
+	// snapshot to distinguish it from a genuinely green run. Derived from step
+	// rows so both ActionApprove sites (live wait and Resume) are covered.
+	// Gated on the terminal status, not the event type: errorRun emits the same
+	// event for failed/cancelled runs, whose banner never reads it.
+	if run.Status == types.RunCompleted {
+		if reason := e.runOverrideReason(run.ID); reason != "" {
+			event.CIOverrideReason = &reason
+		}
+	}
 	e.onEvent(event)
+}
+
+// runOverrideReason returns the first step OverrideReason recorded for the run,
+// deriving the run-level CI override reason the same way daemon.runToInfo does.
+func (e *Executor) runOverrideReason(runID string) string {
+	steps, err := e.db.GetStepsByRun(runID)
+	if err != nil {
+		return ""
+	}
+	for _, s := range steps {
+		if s.OverrideReason != nil && *s.OverrideReason != "" {
+			return *s.OverrideReason
+		}
+	}
+	return ""
 }
 
 func (e *Executor) emitCIReadinessEvent(run *db.Run, repo *db.Repo, ready, declaredNoCI bool) {
@@ -1545,6 +1616,15 @@ func (e *Executor) emitStepEventWithFindingsAndError(eventType ipc.EventType, ru
 		StepName:   &stepName,
 		Status:     &status,
 		DurationMS: durationMS,
+	}
+	// The combined housekeeping invocation is recorded under Document because
+	// that is where it executes. Carry its broader scope on completion so an
+	// attached TUI does not temporarily present the shared wall time as
+	// documentation-only work while waiting for another snapshot.
+	if stepName == types.StepDocument {
+		if combined, err := e.db.HasAgentInvocationPurpose(run.ID, string(stepName), "housekeeping"); err == nil && combined {
+			event.WorkScope = ipc.WorkScopeDocumentLintHousekeeping
+		}
 	}
 	stats := e.findingStatsForStep(run.ID, stepName)
 	if stats.ReportedFindings > 0 || stats.FixedFindings > 0 {

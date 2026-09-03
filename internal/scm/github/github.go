@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/http"
 	"net/url"
 	"os/exec"
 	"strconv"
@@ -27,6 +28,11 @@ type Host struct {
 	host         string // repo's GitHub hostname; scopes the auth check
 	repo         string // "owner/name" slug for --repo; empty when unknown
 	forkOwner    string // fork owner for cross-repository PR heads
+	// assetHTTP and assetUploadPrefix override the unofficial user-attachments
+	// upload transport in tests. Production leaves both nil/empty and uses
+	// http.DefaultClient against uploads.github.com (or uploads.<ghec-host>).
+	assetHTTP         *http.Client
+	assetUploadPrefix string
 }
 
 // New builds a Host. cliAvailable reports whether the gh binary is
@@ -376,6 +382,20 @@ func (h *Host) GetPRContent(ctx context.Context, pr *scm.PR) (scm.PRContent, err
 		return scm.PRContent{}, fmt.Errorf("parse gh pr view: %w", err)
 	}
 	return scm.PRContent{Title: parsed.Title, Body: parsed.Body}, nil
+}
+
+func (h *Host) SetPRBaseBranch(ctx context.Context, pr *scm.PR, baseBranch string) error {
+	selector, err := prSelector(pr)
+	if err != nil {
+		return err
+	}
+	args := append([]string{"pr", "edit", selector}, h.repoArgs()...)
+	args = append(args, "--base", baseBranch)
+	cmd := h.cmd(ctx, "gh", args...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("gh pr edit --base: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+	return nil
 }
 
 func (h *Host) GetPRState(ctx context.Context, pr *scm.PR) (scm.PRState, error) {

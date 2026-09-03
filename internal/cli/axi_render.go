@@ -35,6 +35,12 @@ type stepRow struct {
 	DurationMS int64  `toon:"duration_ms"`
 }
 
+type sharedWorkRow struct {
+	AttributedTo string `toon:"attributed_to"`
+	Scope        string `toon:"scope"`
+	DurationMS   int64  `toon:"duration_ms"`
+}
+
 type activeStepRow struct {
 	Step         string `toon:"step"`
 	Status       string `toon:"status"`
@@ -80,6 +86,7 @@ type stepView struct {
 	Name             string
 	Status           string
 	DurationMS       int64
+	WorkScope        string
 	FindingsJSON     string
 	FixSummaries     []string
 	StartedAt        *int64
@@ -107,6 +114,11 @@ type runView struct {
 	// the top-level parked signal in the run object.
 	AwaitingAgentSince *int64
 	Steps              []stepView
+	// CIOverrideReason is non-empty when a human approved past a still-failing
+	// live check (see pipeline.ApprovalOverrideVerifier). outcomeForRun uses
+	// it to keep a deliberate override from reading identically to a
+	// genuinely green run in agent-facing output.
+	CIOverrideReason string
 }
 
 func runViewFromIPC(r *ipc.RunInfo) runView {
@@ -118,6 +130,7 @@ func runViewFromIPC(r *ipc.RunInfo) runView {
 		CIReady:            r.CIReady,
 		CIReadyNoCI:        r.CIReadyNoCI,
 		AwaitingAgentSince: r.AwaitingAgentSince,
+		CIOverrideReason:   r.CIOverrideReason,
 	}
 	if r.PRURL != nil {
 		rv.PRURL = *r.PRURL
@@ -135,6 +148,7 @@ func runViewFromIPC(r *ipc.RunInfo) runView {
 			FixRoundCount:    s.FixRoundCount,
 			AutoFixLimit:     s.AutoFixLimit,
 			PendingFixSource: s.PendingFixSource,
+			WorkScope:        s.WorkScope,
 		}
 		if s.LastActivity != nil {
 			sv.LastActivity = *s.LastActivity
@@ -150,7 +164,7 @@ func runViewFromIPC(r *ipc.RunInfo) runView {
 	return rv
 }
 
-func runViewFromDB(r *db.Run, steps []*db.StepResult) runView {
+func runViewFromDB(r *db.Run, steps []*db.StepResult, database *db.DB) runView {
 	rv := runView{
 		ID:                 r.ID,
 		Branch:             r.Branch,
@@ -179,8 +193,20 @@ func runViewFromDB(r *db.Run, steps []*db.StepResult) runView {
 		if s.DurationMS != nil {
 			sv.DurationMS = *s.DurationMS
 		}
+		if database != nil && s.StepName == types.StepDocument {
+			if combined, err := database.HasAgentInvocationPurpose(s.RunID, string(s.StepName), "housekeeping"); err == nil && combined {
+				sv.WorkScope = ipc.WorkScopeDocumentLintHousekeeping
+			}
+		}
 		if s.FindingsJSON != nil {
 			sv.FindingsJSON = *s.FindingsJSON
+		}
+		// Mirror executor.runOverrideReason / RunInfo.CIOverrideReason: the run's
+		// override reason is the first step that recorded one. Without this the
+		// DB-backed status path reads a passed-with-override run as a plain pass,
+		// disagreeing with the live IPC path and outcomeForRun.
+		if rv.CIOverrideReason == "" && s.OverrideReason != nil && *s.OverrideReason != "" {
+			rv.CIOverrideReason = *s.OverrideReason
 		}
 		rv.Steps = append(rv.Steps, sv)
 	}
@@ -427,10 +453,17 @@ func runObjectFieldWithKey(key string, rv runView) toon.Field {
 	fields = append(fields, toon.Field{Key: "findings", Value: rv.findingsTally()})
 
 	rows := make([]stepRow, 0, len(rv.Steps))
+	sharedRows := make([]sharedWorkRow, 0, 1)
 	for _, s := range rv.Steps {
 		rows = append(rows, stepRow{Step: s.Name, Status: s.Status, Findings: s.findingCount(), DurationMS: s.DurationMS})
+		if s.WorkScope != "" {
+			sharedRows = append(sharedRows, sharedWorkRow{AttributedTo: s.Name, Scope: s.WorkScope, DurationMS: s.DurationMS})
+		}
 	}
 	fields = append(fields, toon.Field{Key: "steps", Value: rows})
+	if len(sharedRows) > 0 {
+		fields = append(fields, toon.Field{Key: "shared_work", Value: sharedRows})
+	}
 	if activeRows := rv.activeRows(); len(activeRows) > 0 {
 		fields = append(fields, toon.Field{Key: "active_steps", Value: activeRows})
 	}

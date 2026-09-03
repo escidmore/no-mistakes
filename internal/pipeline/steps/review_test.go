@@ -473,6 +473,108 @@ func TestReviewStep_DurableFixAdequacyContract(t *testing.T) {
 	}
 }
 
+// The qualitative corpus is an executable unified-diff contract, so each
+// fixture must remain consumable by the documented git-based evaluation flow.
+func TestReviewStep_IntendedUsageFixturesApply(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name     string
+		file     string
+		baseline string
+	}{
+		{name: "rare duplicate window", file: "jobs/finish.go", baseline: "package jobs\n"},
+		{name: "hypothetical unused lock", file: "run/status.go", baseline: "package run\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			path := filepath.Join(dir, tc.file)
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte(tc.baseline), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			gitCmd(t, dir, "init", "-q")
+			// Keep both inputs LF-only regardless of the runner's checkout
+			// conversion policy. Git parses context lines from the patch as-is.
+			gitCmd(t, dir, "config", "core.autocrlf", "false")
+			fixture, err := os.ReadFile(filepath.Join("testdata", "intended_usage_review", strings.ReplaceAll(tc.name, " ", "-")+".diff"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			fixturePath := filepath.Join(dir, "fixture.diff")
+			fixture = []byte(strings.ReplaceAll(string(fixture), "\r\n", "\n"))
+			if err := os.WriteFile(fixturePath, fixture, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			gitCmd(t, dir, "apply", "--check", fixturePath)
+		})
+	}
+}
+
+// Intended-usage evidence is a finding threshold, not a general "be less
+// noisy" rewrite: a rare but real sequence under intended usage still
+// qualifies, while a hypothetical unused path does not. The completeness
+// obligations stay; this pins the emitted contract, not model interpretation.
+func TestReviewStep_IntendedUsageEvidenceContract(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+
+	findingsJSON, _ := json.Marshal(Findings{Summary: "clean"})
+	ag := &mockAgent{
+		name: "test",
+		runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
+			return &agent.Result{Output: findingsJSON}, nil
+		},
+	}
+
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	if _, err := (&ReviewStep{}).Execute(sctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(ag.calls) != 1 {
+		t.Fatalf("expected 1 review call, got %d", len(ag.calls))
+	}
+	prompt := ag.calls[0].Prompt
+
+	for _, want := range []string{
+		"Report a finding only when you can construct a concrete sequence that occurs during the change's intended usage",
+		"including rare but real sequences those callers actually perform",
+		"hypothetical unused execution that intended callers, the public API, or documented usage never take",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("review prompt missing intended-usage evidence threshold %q:\n%s", want, prompt)
+		}
+	}
+
+	// Completeness stays: this is not a license to stop early or emit fewer findings.
+	for _, want := range []string{
+		"Do a full review pass before returning",
+		"Do not stop after the first valid finding",
+		"Continue inspecting the rest of the changed code",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("review prompt dropped completeness obligation %q:\n%s", want, prompt)
+		}
+	}
+
+	for _, overreach := range []string{
+		"be less noisy",
+		"prefer fewer findings",
+		"reduce the number of findings",
+		"lock on every status write",
+		"parent-channel",
+		"parent channel",
+	} {
+		if strings.Contains(strings.ToLower(prompt), overreach) {
+			t.Errorf("review prompt broadened past the intended-usage criterion with %q:\n%s", overreach, prompt)
+		}
+	}
+}
+
 // Counterexample construction is a general review principle for any new or
 // changed logic, not a bug-fix-only reconstruction. Silently wrong values,
 // labels, and sets are named as risks. The principle stays short and general:
@@ -520,6 +622,54 @@ func TestReviewStep_CounterexampleConstructionIsUnconditional(t *testing.T) {
 	} {
 		if strings.Contains(prompt, overfit) {
 			t.Errorf("review prompt overfit an incident-specific probe %q:\n%s", overfit, prompt)
+		}
+	}
+}
+
+// Authorization and privacy are one conditional obligation in the existing
+// review pass. The emitted prompt must require concrete cross-boundary evidence,
+// preserve repository ownership of access policy, accept equivalent controls
+// and intentionally public data, and route material policy ambiguity through the
+// existing ask-user action rather than inventing a rule.
+func TestReviewStep_AuthorizationPrivacyTracingContract(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+
+	findingsJSON, _ := json.Marshal(Findings{Summary: "clean"})
+	ag := &mockAgent{
+		name: "test",
+		runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
+			return &agent.Result{Output: findingsJSON}, nil
+		},
+	}
+
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	if _, err := (&ReviewStep{}).Execute(sctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(ag.calls) != 1 {
+		t.Fatalf("expected the existing single review call, got %d", len(ag.calls))
+	}
+	prompt := ag.calls[0].Prompt
+
+	for _, want := range []string{
+		"potentially protected resources or user data",
+		"where identity is established and whether unauthenticated execution remains reachable",
+		"earliest shared boundary used by every caller",
+		"ownership, role, tenant, organization, and administrative scope",
+		"public responses and serialization",
+		"search projections, caches, logs, telemetry, error details, exports, and generated artifacts",
+		"fail-open defaults, missing-context behavior, preview or bypass paths, and stale authorization assumptions",
+		"source-backed evidence of a concrete reachable operation or disclosure path",
+		"protected resource or field, the bypass or missing control, and the resulting unauthorized action or exposure",
+		"do not invent access policy",
+		`you MUST emit an "ask-user" finding that names the missing policy decision`,
+		"Do not report immaterial or pre-existing ambiguity",
+		"equivalent controls and intentionally public data",
+		"middleware, an authorization call, or an auth-related test is absent by name",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("review prompt missing authorization/privacy contract %q:\n%s", want, prompt)
 		}
 	}
 }
@@ -1258,4 +1408,202 @@ func TestReviewStep_RereviewOffersRevertExitFromPriorRoundMachinery(t *testing.T
 			t.Errorf("a review with no prior-round code must not carry the revert exit ramp:\n%s", ag.calls[0].Prompt)
 		}
 	})
+}
+
+// The Simplification section is a dedicated pass that asks whether the intent
+// requires each component the change introduced, distinct from the defect pass
+// and from the refactor-only "simplification opportunities" meaning that stays
+// in place. An unrequired component is a warning whose remedy is removal and
+// whose action stays ask-user: whether extra surface is wanted is the author's
+// call. This pins the emitted contract, not model interpretation.
+func TestReviewStep_SimplificationSectionContract(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+
+	findingsJSON, _ := json.Marshal(Findings{Summary: "clean"})
+	ag := &mockAgent{
+		name: "test",
+		runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
+			return &agent.Result{Output: findingsJSON}, nil
+		},
+	}
+
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	if _, err := (&ReviewStep{}).Execute(sctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(ag.calls) != 1 {
+		t.Fatalf("expected 1 review call, got %d", len(ag.calls))
+	}
+	prompt := ag.calls[0].Prompt
+
+	sectionIdx := strings.Index(prompt, "\nSimplification (a dedicated pass over what the change introduced")
+	if sectionIdx < 0 {
+		t.Fatalf("review prompt missing the dedicated Simplification section:\n%s", prompt)
+	}
+	// It is its own section between the finding rules and the risk assessment,
+	// not a bullet folded into either.
+	if rulesIdx := strings.Index(prompt, "\nRules:"); rulesIdx < 0 || rulesIdx > sectionIdx {
+		t.Errorf("Simplification section must follow the Rules section:\n%s", prompt)
+	}
+	if riskIdx := strings.Index(prompt, "\nRisk assessment"); riskIdx < 0 || riskIdx < sectionIdx {
+		t.Errorf("Simplification section must precede the Risk assessment section:\n%s", prompt)
+	}
+	section := prompt[sectionIdx:]
+	if riskIdx := strings.Index(section, "\nRisk assessment"); riskIdx >= 0 {
+		section = section[:riskIdx]
+	}
+
+	for _, want := range []string{
+		"Enumerate every component the change introduced",
+		"a second definition of a concept the code already defines once",
+		"Judge each one against the User intent when one is stated, otherwise against the change's own stated purpose",
+		`not strictly required to satisfy that intent, report a finding with severity "warning" and action "ask-user"`,
+		"recommend removing it as the remedy",
+		"Do not recommend hardening, validating, or documenting a component the intent does not require",
+		"name removal of the component as the smallest honest remedy",
+		"name the narrower form",
+	} {
+		if !strings.Contains(section, want) {
+			t.Errorf("Simplification section missing %q:\n%s", want, section)
+		}
+	}
+
+	// The refactor-only meaning of a simplification opportunity is kept and
+	// now points at the section instead of contradicting it: an unrequired
+	// component is never an auto-fix refactor.
+	for _, want := range []string{
+		"Analyze for bugs, risks, and code simplification opportunities.",
+		"non-functional refactoring (e.g. deduplication, clearer control flow)",
+		"do NOT mean removing features, changing product behavior, or stripping intentional user-facing output",
+		`reported through the dedicated Simplification section below, never as an "auto-fix" refactor`,
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("review prompt lost the refactor-only simplification meaning %q:\n%s", want, prompt)
+		}
+	}
+
+	// The section adds no schema field, second reviewer, or general rewrite of
+	// the defect pass. Existing evidence and completeness obligations stay.
+	for _, want := range []string{
+		"Report a finding only when you can construct a concrete sequence that occurs during the change's intended usage",
+		"Do a full review pass before returning",
+		"Classify by the remedy, not only by the topic.",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("review prompt dropped an existing obligation %q:\n%s", want, prompt)
+		}
+	}
+	for _, overreach := range []string{
+		"simplification_findings",
+		"second reviewer",
+		"rewrite the change",
+		"delete the feature",
+	} {
+		if strings.Contains(strings.ToLower(prompt), overreach) {
+			t.Errorf("review prompt broadened past the Simplification section with %q:\n%s", overreach, prompt)
+		}
+	}
+}
+
+// The qualitative corpus is an executable unified-diff contract, so each
+// fixture must remain consumable by the documented git-based evaluation flow.
+func TestReviewStep_SimplificationFixturesApply(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name     string
+		file     string
+		baseline string
+	}{
+		{name: "permissive target resolver", file: "target/resolve.go", baseline: "package target\n"},
+		{name: "exact match resolver", file: "target/resolve.go", baseline: "package target\n"},
+		{name: "second budget semantics", file: "proposal/budget.go", baseline: "package proposal\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			path := filepath.Join(dir, tc.file)
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte(tc.baseline), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			gitCmd(t, dir, "init", "-q")
+			gitCmd(t, dir, "config", "core.autocrlf", "false")
+			fixture, err := os.ReadFile(filepath.Join("testdata", "simplification_review", strings.ReplaceAll(tc.name, " ", "-")+".diff"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			fixturePath := filepath.Join(dir, "fixture.diff")
+			fixture = []byte(strings.ReplaceAll(string(fixture), "\r\n", "\n"))
+			if err := os.WriteFile(fixturePath, fixture, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			gitCmd(t, dir, "apply", "--check", fixturePath)
+		})
+	}
+}
+
+// TestReviewStep_FixPromptPrefersRemovalOfUnrequiredPaths pins the fixer's
+// removal rule: a finding resolvable by removing a code path the intent does
+// not strictly require is fixed by removing that path, not by hardening it.
+// The anti-revert guard stays, but it now protects only code the intent
+// requires, so "the author wrote it on purpose" no longer turns every
+// unrequired branch into a fix-forward candidate. Genuine doubt still leaves
+// the code alone and reports the finding unresolved.
+func TestReviewStep_FixPromptPrefersRemovalOfUnrequiredPaths(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	gitCmd(t, dir, "checkout", "--detach", headSHA)
+
+	callCount := 0
+	ag := &mockAgent{
+		name: "test",
+		runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
+			callCount++
+			if callCount == 1 {
+				return &agent.Result{Output: json.RawMessage(`{"summary":"address findings"}`)}, nil
+			}
+			j, _ := json.Marshal(Findings{Summary: "clean"})
+			return &agent.Result{Output: j}, nil
+		},
+	}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Fixing = true
+	sctx.PreviousFindings = `{"findings":[{"id":"review-1","severity":"warning","file":"main.go","description":"any existing file is accepted as a target","action":"auto-fix"}],"summary":"1 issue"}`
+
+	if _, err := (&ReviewStep{}).Execute(sctx); err != nil {
+		t.Fatal(err)
+	}
+	fixPrompt := ag.calls[0].Prompt
+	for _, want := range []string{
+		"When a problem can be solved by removing a code path that is not strictly required to satisfy the intent",
+		"fix it by removing that path, not by validating, hardening, or documenting it",
+		"Judge what the intent strictly requires against the User intent section when present, otherwise against the change's own stated purpose",
+		// The anti-revert guard is kept, scoped to intent-required code.
+		"Avoid resolving a finding by removing or reverting the author's intentional code in their original 1st commit when the intent requires that code",
+		"If the original change introduced something the intent requires, fix it forward",
+		"do not restore or re-add the removed code unless the finding is a legitimate correctness, reliability, or security issue",
+		"When in doubt about whether the intent requires the code, leave it and report the finding as unresolved",
+		// The narrow-fix and diagnosis rules are complementary and stay.
+		"Fix the reported instance narrowly.",
+		"smallest correct root-cause fix",
+	} {
+		if !strings.Contains(fixPrompt, want) {
+			t.Errorf("review fix prompt missing removal-rule contract %q:\n%s", want, fixPrompt)
+		}
+	}
+	// The superseded guard protected any code written "on purpose", which is
+	// true of every unrequired branch and is what turned removal into hardening.
+	for _, stale := range []string{
+		"If the original change introduced something on purpose, fix it forward",
+		"When in doubt about whether code is intentional",
+	} {
+		if strings.Contains(fixPrompt, stale) {
+			t.Errorf("review fix prompt still protects unrequired code as intentional via %q:\n%s", stale, fixPrompt)
+		}
+	}
 }

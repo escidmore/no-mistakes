@@ -67,12 +67,13 @@ func (e *RPCError) Error() string { return e.Message }
 // intent from local transcripts.
 type PushReceivedParams struct {
 	// Gate is the absolute path to the gate bare repo.
-	Gate      string           `json:"gate"`
-	Ref       string           `json:"ref"`
-	Old       string           `json:"old"`
-	New       string           `json:"new"`
-	SkipSteps []types.StepName `json:"skip_steps,omitempty"`
-	Intent    string           `json:"intent,omitempty"`
+	Gate         string           `json:"gate"`
+	Ref          string           `json:"ref"`
+	Old          string           `json:"old"`
+	New          string           `json:"new"`
+	SkipSteps    []types.StepName `json:"skip_steps,omitempty"`
+	Intent       string           `json:"intent,omitempty"`
+	PRBaseBranch string           `json:"pr_base_branch,omitempty"`
 }
 
 // GetRunParams requests a single run by ID.
@@ -130,6 +131,7 @@ type RerunParams struct {
 	PreviousRunID string           `json:"previous_run_id,omitempty"`
 	SkipSteps     []types.StepName `json:"skip_steps,omitempty"`
 	Intent        string           `json:"intent,omitempty"`
+	PRBaseBranch  string           `json:"pr_base_branch,omitempty"`
 }
 
 // SubscribeParams starts an event stream for a run.
@@ -255,6 +257,9 @@ type RunInfo struct {
 	Error            *string         `json:"error,omitempty"`
 	CIReady          bool            `json:"ci_ready,omitempty"`
 	CIReadyNoCI      bool            `json:"ci_ready_no_ci,omitempty"`
+	// PRBaseBranch is the per-run PR target override, if the operator set
+	// --base-branch when starting this run.
+	PRBaseBranch *string `json:"pr_base_branch,omitempty"`
 	// AwaitingAgent is true while the run is parked at a gate awaiting the
 	// driving agent's response. AwaitingAgentSince is the unix-seconds time it
 	// parked, so a supervisor can read "parked for N seconds" in one call. Both
@@ -262,6 +267,14 @@ type RunInfo struct {
 	AwaitingAgent      bool             `json:"awaiting_agent,omitempty"`
 	AwaitingAgentSince *int64           `json:"awaiting_agent_since,omitempty"`
 	Steps              []StepResultInfo `json:"steps,omitempty"`
+	// CIOverrideReason is non-empty when at least one step in Steps carries an
+	// OverrideReason (see StepResultInfo.OverrideReason). It is derived from
+	// Steps rather than a separate DB column, so a run-level consumer such as
+	// axi's outcome wording does not need to inspect every step itself. Named
+	// for the one implementer today (the CI step) rather than generically,
+	// because that is the only override an operator-facing outcome word needs
+	// to distinguish; see pipeline.ApprovalOverrideVerifier.
+	CIOverrideReason string `json:"ci_override_reason,omitempty"`
 	// StateRev is the monotonic run-state revision this snapshot is at least
 	// as new as. It is sampled before the database read, so every event at or
 	// below it is already reflected here and every event above it still
@@ -271,18 +284,26 @@ type RunInfo struct {
 	UpdatedAt int64 `json:"updated_at"`
 }
 
+// WorkScopeDocumentLintHousekeeping identifies the one agent invocation that
+// performs both duties while its wall time is stored on the document step.
+const WorkScopeDocumentLintHousekeeping = "document+lint housekeeping"
+
 // StepResultInfo is the IPC representation of a step result.
 type StepResultInfo struct {
-	ID               string           `json:"id"`
-	RunID            string           `json:"run_id"`
-	StepName         types.StepName   `json:"step_name"`
-	StepOrder        int              `json:"step_order"`
-	Status           types.StepStatus `json:"status"`
-	ExitCode         *int             `json:"exit_code,omitempty"`
-	DurationMS       *int64           `json:"duration_ms,omitempty"`
-	FindingsJSON     *string          `json:"findings_json,omitempty"`
-	ReportedFindings int              `json:"reported_findings,omitempty"`
-	FixedFindings    int              `json:"fixed_findings,omitempty"`
+	ID         string           `json:"id"`
+	RunID      string           `json:"run_id"`
+	StepName   types.StepName   `json:"step_name"`
+	StepOrder  int              `json:"step_order"`
+	Status     types.StepStatus `json:"status"`
+	ExitCode   *int             `json:"exit_code,omitempty"`
+	DurationMS *int64           `json:"duration_ms,omitempty"`
+	// WorkScope names shared work whose wall time is recorded on this logical
+	// step. For example, the document step can own one combined document+lint
+	// housekeeping invocation while lint only records the cached handoff.
+	WorkScope        string  `json:"work_scope,omitempty"`
+	FindingsJSON     *string `json:"findings_json,omitempty"`
+	ReportedFindings int     `json:"reported_findings,omitempty"`
+	FixedFindings    int     `json:"fixed_findings,omitempty"`
 	// FixSummaries holds one entry per fix round the pipeline ran for this
 	// step, in round order: the agent's one-line fix summary, or "" when the
 	// round recorded none. Agent surfaces use it to report applied fixes.
@@ -297,6 +318,11 @@ type StepResultInfo struct {
 	LastActivityAt   *int64   `json:"last_activity_at,omitempty"`
 	LastActivity     *string  `json:"last_activity,omitempty"`
 	AgentPID         *int     `json:"agent_pid,omitempty"`
+	// OverrideReason is non-empty when a human answered ActionApprove on this
+	// step's gate despite an unresolved external condition (currently: the CI
+	// step's live checks were still failing). See
+	// pipeline.ApprovalOverrideVerifier and db.StepResult.OverrideReason.
+	OverrideReason string `json:"override_reason,omitempty"`
 }
 
 // --- Events (for subscribe stream) ---
@@ -334,6 +360,7 @@ type Event struct {
 	ReportedFindings *int            `json:"reported_findings,omitempty"`
 	FixedFindings    *int            `json:"fixed_findings,omitempty"`
 	DurationMS       *int64          `json:"duration_ms,omitempty"` // execution-only duration for step events
+	WorkScope        string          `json:"work_scope,omitempty"`  // shared work attributed to this step
 	PRURL            *string         `json:"pr_url,omitempty"`      // PR URL for run_updated/run_completed events
 	// StateRev is the daemon-assigned monotonic revision of the run state
 	// this event reflects, or zero for activity. A consumer applies a state
@@ -343,6 +370,11 @@ type Event struct {
 	StateRev    int64 `json:"state_rev,omitempty"`
 	CIReady     *bool `json:"ci_ready,omitempty"`
 	CIReadyNoCI *bool `json:"ci_ready_no_ci,omitempty"`
+	// CIOverrideReason rides run_completed so the live TUI banner can show a
+	// passed-with-override run without a snapshot read. It is derived from the
+	// run's step OverrideReason the same way RunInfo.CIOverrideReason is, and
+	// is set only on completion (the only event whose banner reads it).
+	CIOverrideReason *string `json:"ci_override_reason,omitempty"`
 }
 
 // --- Helpers ---
