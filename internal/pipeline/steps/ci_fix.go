@@ -158,6 +158,14 @@ CI logs:
 		sctx.Log(fmt.Sprintf("warning: could not parse CI repair conclusion: %v", conclusionErr))
 	}
 	repair, err := s.commitRepair(sctx, conclusion.Summary)
+	var refusal *pipeline.ProtectedPathError
+	if errors.As(err, &refusal) {
+		head, recordErr := stepGitHeadSHA(sctx)
+		if recordErr == nil && head != sctx.Run.HeadSHA {
+			_, recordErr = s.recordLocalRepair(sctx, head)
+		}
+		return repair, errors.Join(err, recordErr)
+	}
 	if err != nil || repair.HeadAdvanced {
 		return repair, err
 	}
@@ -284,6 +292,23 @@ func (s *CIStep) commitAndPush(sctx *pipeline.StepContext) (ciRepairResult, erro
 	return s.commitRepair(sctx, "")
 }
 
+func (s *CIStep) retryProtectedPathRepair(sctx *pipeline.StepContext) (ciRepairResult, error) {
+	if err := sctx.DB.SetRunPushActive(sctx.Run.ID, true); err != nil {
+		return ciRepairResult{}, err
+	}
+	defer func() { _ = sctx.DB.SetRunPushActive(sctx.Run.ID, false) }()
+	sctx.Log("retrying retained CI repair after protected-path refusal")
+	repair, err := s.commitRepair(sctx, "")
+	if err != nil || repair.HeadAdvanced {
+		return repair, err
+	}
+	head, err := stepGitHeadSHA(sctx)
+	if err != nil {
+		return ciRepairResult{}, err
+	}
+	return s.recordRepair(sctx, head)
+}
+
 func (s *CIStep) commitRepair(sctx *pipeline.StepContext, summary string) (ciRepairResult, error) {
 	status, err := stepGitRun(sctx, "status", "--porcelain")
 	if err != nil {
@@ -305,7 +330,7 @@ func (s *CIStep) commitRepair(sctx *pipeline.StepContext, summary string) (ciRep
 	if err != nil {
 		return ciRepairResult{}, fmt.Errorf("render CI repair commit message: %w", err)
 	}
-	if _, err := stepGitRun(sctx, "add", "-A"); err != nil {
+	if err := stagePipelineChanges(sctx); err != nil {
 		return ciRepairResult{}, fmt.Errorf("stage CI changes: %w", err)
 	}
 	if _, err := stepGitRun(sctx, "commit", "-m", message); err != nil {
