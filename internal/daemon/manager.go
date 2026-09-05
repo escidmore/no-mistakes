@@ -554,8 +554,8 @@ func (m *RunManager) cleanupRunEvidence(cfg *config.Config, runID string) {
 	reapEvidence(m.db, root, policy, time.Now())
 }
 
-// removeRunWorktree tears one run's worktree down: it sweeps whatever is still
-// standing in the directory and only then removes it.
+// removeRunWorktree sweeps processes before deciding whether to remove the
+// directory, so refusal retention cannot keep escaped workers alive.
 //
 // Every removal of a run worktree this package performs goes through here, and
 // none calls git.WorktreeRemove directly, because the ordering is easy to forget
@@ -564,6 +564,15 @@ func (m *RunManager) cleanupRunEvidence(cfg *config.Config, runID string) {
 // different routes. reason distinguishes the routes in the log.
 func (m *RunManager) removeRunWorktree(repoID, runID, gateDir, wtDir, reason string) {
 	m.sweepRunWorktreeProcesses(repoID, runID, wtDir)
+	run, err := m.db.GetRun(runID)
+	if err != nil {
+		slog.Warn("preserving run worktree: cannot read run", "run_id", runID, "error", err)
+		return
+	}
+	if refusal := protectedPathCleanupReason(m.db, run); refusal != "" {
+		slog.Warn("preserving run worktree", "run_id", runID, "path", wtDir, "reason", refusal)
+		return
+	}
 	if err := git.WorktreeRemove(context.Background(), gateDir, wtDir); err != nil {
 		slog.Warn("failed to remove run worktree", "reason", reason, "run_id", runID, "path", wtDir, "error", err)
 	}
@@ -720,7 +729,9 @@ func (m *RunManager) HandlePushReceived(ctx context.Context, params *ipc.PushRec
 // runs without one infer intent afresh. The selected run's PR URL is inherited
 // when that PR is not already merged or closed, so a later --base-branch
 // retarget can prove it is moving the same still-open review object.
-func (m *RunManager) HandleRerun(ctx context.Context, repoID, branch, previousRunID string, skipSteps []types.StepName, intent, prBaseBranch string) (string, error) {
+// A supplied clean caller head must match the selected head before any run
+// starts or is superseded. It never changes head selection.
+func (m *RunManager) HandleRerun(ctx context.Context, repoID, branch, previousRunID string, skipSteps []types.StepName, intent, prBaseBranch, callerHeadSHA string) (string, error) {
 	repo, err := m.db.GetRepo(repoID)
 	if err != nil {
 		return "", fmt.Errorf("get repo: %w", err)
@@ -760,6 +771,9 @@ func (m *RunManager) HandleRerun(ctx context.Context, repoID, branch, previousRu
 	headSHA, err := resolveRerunHead(ctx, gateDir, branch, latestForBranch)
 	if err != nil {
 		return "", err
+	}
+	if callerHeadSHA != "" && callerHeadSHA != headSHA {
+		return "", fmt.Errorf("refusing rerun: selected head %s differs from clean local head %s; inspect `no-mistakes axi status` and reconcile custody before using `no-mistakes axi run` to submit the local head", headSHA, callerHeadSHA)
 	}
 	selectedRun := latestForBranch
 	if previousRunID != "" {

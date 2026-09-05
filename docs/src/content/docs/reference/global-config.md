@@ -98,6 +98,16 @@ test:
     branch: no-mistakes/evidence
     retention: 336h
     max_runs: 200
+
+providers:
+  github:
+    draft_pull_requests: false
+  gitlab:
+    draft_pull_requests: false
+  bitbucket:
+    draft_pull_requests: false
+  azuredevops:
+    draft_pull_requests: false
 ```
 
 ## Fields
@@ -745,6 +755,54 @@ Local review-evaluation corpus settings for [`no-mistakes eval`](/no-mistakes/re
 `diversified_size` caps the official gold-only eval set used by `eval run --cases diversified`. Selection is stratified and pinned; unlabeled cases never fill it. `0` keeps one gold case per stratum with no Hamilton bound. Corpus retention (`max_cases`) and this official-set cap are different knobs.
 
 These are operator settings for this machine's local disk, so they are global-only: an `eval` block in a repository's `.no-mistakes.yaml` is ignored. Corpus storage stays under `<NM_HOME>/eval` and no-mistakes never uploads it; replay still sends code to the selected agent's configured model provider as described in the [Evaluation toolkit](/no-mistakes/reference/eval/).
+
+### providers.github.draft_pull_requests
+
+Open pull requests created on GitHub as drafts (`gh pr create --draft`).
+
+| | |
+|---|---|
+| Type | `bool` |
+| Default | `false` |
+
+Only affects PR creation; existing PRs are not toggled between draft and ready. GitHub only — ignored for other providers.
+This is a global default. Per-repo config can override it via `providers.github.draft_pull_requests`.
+
+### providers.gitlab.draft_pull_requests
+
+Open merge requests created on GitLab as drafts (`glab mr create --draft`).
+
+| | |
+|---|---|
+| Type | `bool` |
+| Default | `false` |
+
+Only affects MR creation; existing MRs are not toggled between draft and ready. GitLab only — ignored for other providers.
+This is a global default. Per-repo config can override it via `providers.gitlab.draft_pull_requests`.
+
+### providers.bitbucket.draft_pull_requests
+
+Open pull requests created on Bitbucket Cloud as drafts (`"draft": true` in the create-PR API request).
+
+| | |
+|---|---|
+| Type | `bool` |
+| Default | `false` |
+
+Only affects PR creation; existing PRs are not toggled between draft and ready. Bitbucket only — ignored for other providers.
+This is a global default. Per-repo config can override it via `providers.bitbucket.draft_pull_requests`.
+
+### providers.azuredevops.draft_pull_requests
+
+Open pull requests created on Azure DevOps as drafts (`az repos pr create --draft true`).
+
+| | |
+|---|---|
+| Type | `bool` |
+| Default | `false` |
+
+Only affects PR creation; existing PRs are not toggled between draft and ready. Azure DevOps only — ignored for other providers.
+This is a global default. Per-repo config can override it via `providers.azuredevops.draft_pull_requests`.
 
 ## Environment variables
 

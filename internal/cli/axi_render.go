@@ -10,6 +10,7 @@ import (
 
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/ipc"
+	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 	"github.com/spf13/cobra"
 )
@@ -33,6 +34,11 @@ type stepRow struct {
 	Status     string `toon:"status"`
 	Findings   int    `toon:"findings"`
 	DurationMS int64  `toon:"duration_ms"`
+}
+
+type automaticSkipRow struct {
+	Step   string `toon:"step"`
+	Reason string `toon:"reason"`
 }
 
 type sharedWorkRow struct {
@@ -98,6 +104,7 @@ type stepView struct {
 	AutoFixLimit     int
 	PendingFixSource string
 	QuietWarning     time.Duration
+	SkipReason       string
 }
 
 // runView is a render-ready view of a pipeline run.
@@ -149,6 +156,7 @@ func runViewFromIPC(r *ipc.RunInfo) runView {
 			AutoFixLimit:     s.AutoFixLimit,
 			PendingFixSource: s.PendingFixSource,
 			WorkScope:        s.WorkScope,
+			SkipReason:       s.SkipReason,
 		}
 		if s.LastActivity != nil {
 			sv.LastActivity = *s.LastActivity
@@ -186,6 +194,9 @@ func runViewFromDB(r *db.Run, steps []*db.StepResult, database *db.DB) runView {
 		}
 		if s.AutoFixLimit != nil {
 			sv.AutoFixLimit = *s.AutoFixLimit
+		}
+		if s.SkipReason != nil {
+			sv.SkipReason = *s.SkipReason
 		}
 		if s.LastActivity != nil {
 			sv.LastActivity = *s.LastActivity
@@ -447,6 +458,7 @@ func runObjectFieldWithKey(key string, rv runView) toon.Field {
 		fields = append(fields, toon.Field{Key: "awaiting_agent", Value: formatParkedFor(*rv.AwaitingAgentSince)})
 	}
 	fields = append(fields, toon.Field{Key: "head", Value: shortSHA(rv.HeadSHA)})
+	fields = append(fields, toon.Field{Key: "head_sha", Value: rv.HeadSHA})
 	if rv.PRURL != "" {
 		fields = append(fields, toon.Field{Key: "pr", Value: rv.PRURL})
 	}
@@ -461,6 +473,9 @@ func runObjectFieldWithKey(key string, rv runView) toon.Field {
 		}
 	}
 	fields = append(fields, toon.Field{Key: "steps", Value: rows})
+	if skips := rv.automaticSkips(); len(skips) > 0 {
+		fields = append(fields, toon.Field{Key: "automatic_skips", Value: skips})
+	}
 	if len(sharedRows) > 0 {
 		fields = append(fields, toon.Field{Key: "shared_work", Value: sharedRows})
 	}
@@ -470,17 +485,36 @@ func runObjectFieldWithKey(key string, rv runView) toon.Field {
 	return toon.Field{Key: key, Value: toon.NewObject(fields...)}
 }
 
+func (rv runView) automaticSkips() []automaticSkipRow {
+	var rows []automaticSkipRow
+	for _, s := range rv.Steps {
+		if s.Status == string(types.StepStatusSkipped) && s.SkipReason != "" &&
+			(s.Name == string(types.StepPR) || s.Name == string(types.StepCI)) {
+			rows = append(rows, automaticSkipRow{Step: s.Name, Reason: s.SkipReason})
+		}
+	}
+	return rows
+}
+
 // gateFields renders the active approval gate: the awaiting step, its findings
 // table, and the next-step commands an agent can run to clear it.
 func gateFields(gate stepView) []toon.Field {
-	return gateFieldsWithHelp(gate, []string{
+	help := []string{
 		"Run `no-mistakes axi respond --action approve` to accept this step and continue",
 		"Run `no-mistakes axi respond --action fix --findings <ids>` to have the pipeline fix the selected findings (do not edit files yourself)",
+	}
+	if pipeline.HasProtectedPathRefusal(gate.FindingsJSON) {
+		help = []string{
+			"Protected-path refusals require an explicit operator response; Approve is rejected.",
+			"Have the operator inspect and resolve the reported protected-path edit through the repository's authorized workflow, then run `no-mistakes axi respond --action fix` to retry the refused step, including its commit and publication.",
+		}
+	}
+	return gateFieldsWithHelp(gate, append(help,
 		"Run `no-mistakes axi respond --action skip` to skip this step",
 		fmt.Sprintf("Run `%s` to read the full step log", axiLogsFullCommand(gate.Name, "")),
 		"A long-running call is working, not stalled - background it if your harness needs to, but the run never advances past a gate on its own. Read every return; on a `gate:`, respond; loop until an `outcome:`.",
 		preserveGateFixCommitsGuidance,
-	})
+	))
 }
 
 func inspectionOnlyGateFields(gate stepView, runID string) []toon.Field {

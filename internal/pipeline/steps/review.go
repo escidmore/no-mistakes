@@ -357,13 +357,46 @@ Risk assessment (after listing all findings):
 		return nil, reviewAgentError(ctx, timeout, "agent review", err)
 	}
 
-	// Parse structured findings
+	// Parse structured findings. A review that produced no structured output,
+	// or one whose risk assessment is absent, cannot certify the head: an
+	// unrun or unreadable analyzer must not read as an approving review
+	// (issue #703), so fail closed instead of approving on empty findings.
 	var findings Findings
-	if result.Output != nil {
-		if err := json.Unmarshal(result.Output, &findings); err != nil {
-			sctx.Log("could not parse structured output, using text response")
-			findings = Findings{Summary: result.Text}
+	if result.Output == nil {
+		return nil, errors.New("review analyzer returned no structured findings")
+	}
+	var payload struct {
+		Findings *[]json.RawMessage `json:"findings"`
+	}
+	if err := json.Unmarshal(result.Output, &payload); err != nil {
+		return nil, fmt.Errorf("validate review analyzer findings: %w", err)
+	}
+	if payload.Findings == nil {
+		return nil, errors.New("review analyzer findings missing findings array")
+	}
+	if err := json.Unmarshal(result.Output, &findings); err != nil {
+		return nil, fmt.Errorf("validate review analyzer findings: %w", err)
+	}
+	findings.RiskLevel = strings.TrimSpace(findings.RiskLevel)
+	findings.RiskScope = strings.TrimSpace(findings.RiskScope)
+	if findings.RiskLevel == "" || strings.TrimSpace(findings.RiskRationale) == "" || findings.RiskScope == "" {
+		return nil, errors.New("review analyzer findings missing risk assessment")
+	}
+	switch findings.RiskLevel {
+	case "low", "medium", "high":
+	default:
+		return nil, errors.New("review analyzer findings invalid risk level")
+	}
+	switch findings.RiskScope {
+	case types.FindingsRiskScopeSourceOrExternal, types.FindingsRiskScopePipelineOwnedDelivery:
+	default:
+		return nil, errors.New("review analyzer findings invalid risk scope")
+	}
+	for i := range findings.Items {
+		if !types.IsKnownFindingSeverity(findings.Items[i].Severity) {
+			return nil, fmt.Errorf("review analyzer finding %d missing severity", i)
 		}
+		findings.Items[i].Severity = types.NormalizeFindingSeverity(findings.Items[i].Severity)
 	}
 
 	// Phase ownership boundary: drop findings that only claim later pipeline-

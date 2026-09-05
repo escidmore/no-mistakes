@@ -145,39 +145,69 @@ func TestLintStep_NoConfiguredLint_CommitsAgentFixesWithoutApproval(t *testing.T
 	}
 }
 
-func TestLintStep_NoConfiguredLint_RejectsOversizedSummaryWithoutStaging(t *testing.T) {
+func TestLintStep_MalformedStructuredOutputFails(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)
-	gitCmd(t, dir, "checkout", "--detach", headSHA)
-
-	output, err := json.Marshal(map[string]any{
-		"findings": []any{},
-		"summary":  strings.Repeat("x", 4097),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	ag := &mockAgent{
 		name: "test",
-		runFn: func(_ context.Context, _ agent.RunOpts) (*agent.Result, error) {
-			if err := os.WriteFile(filepath.Join(dir, "lint-fix.txt"), []byte("fixed"), 0o644); err != nil {
-				return nil, err
-			}
-			return &agent.Result{Output: output}, nil
+		runFn: func(context.Context, agent.RunOpts) (*agent.Result, error) {
+			return &agent.Result{Output: json.RawMessage(`{not json`)}, nil
 		},
 	}
 	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
 
-	if _, err := (&LintStep{}).Execute(sctx); err == nil {
-		t.Fatal("LintStep.Execute() accepted an oversized summary")
-	} else if !strings.Contains(err.Error(), "rejected commit summary") {
-		t.Fatalf("LintStep.Execute() error = %v, want rejected commit summary", err)
+	outcome, err := (&LintStep{}).Execute(sctx)
+	if err == nil || !strings.Contains(err.Error(), "lint analyzer") {
+		t.Fatalf("Execute() error = %v, want malformed lint analyzer output", err)
 	}
-	if got := gitCmd(t, dir, "diff", "--cached", "--name-only"); got != "" {
-		t.Fatalf("staged files after summary error = %q, want none", got)
+	if outcome != nil {
+		t.Fatalf("Execute() outcome = %+v, want no outcome", outcome)
 	}
-	if got := gitCmd(t, dir, "rev-parse", "HEAD"); got != headSHA {
-		t.Fatalf("HEAD after summary error = %q, want %q", got, headSHA)
+}
+
+func TestLintStep_NoConfiguredLint_RejectsInvalidSummaryWithoutStaging(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name    string
+		summary string
+	}{
+		{name: "oversized", summary: strings.Repeat("x", 4097)},
+		{name: "blank", summary: " \t\n "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir, baseSHA, headSHA := setupGitRepo(t)
+			gitCmd(t, dir, "checkout", "--detach", headSHA)
+
+			output, err := json.Marshal(map[string]any{
+				"findings": []any{},
+				"summary":  tc.summary,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ag := &mockAgent{
+				name: "test",
+				runFn: func(_ context.Context, _ agent.RunOpts) (*agent.Result, error) {
+					if err := os.WriteFile(filepath.Join(dir, "lint-fix.txt"), []byte("fixed"), 0o644); err != nil {
+						return nil, err
+					}
+					return &agent.Result{Output: output}, nil
+				},
+			}
+			sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+
+			if _, err := (&LintStep{}).Execute(sctx); err == nil {
+				t.Fatal("LintStep.Execute() accepted an invalid summary")
+			} else if !strings.Contains(err.Error(), "missing summary") && !strings.Contains(err.Error(), "rejected commit summary") {
+				t.Fatalf("LintStep.Execute() error = %v, want rejected summary", err)
+			}
+			if got := gitCmd(t, dir, "diff", "--cached", "--name-only"); got != "" {
+				t.Fatalf("staged files after summary error = %q, want none", got)
+			}
+			if got := gitCmd(t, dir, "rev-parse", "HEAD"); got != headSHA {
+				t.Fatalf("HEAD after summary error = %q, want %q", got, headSHA)
+			}
+		})
 	}
 }
 
