@@ -137,14 +137,14 @@ See [Provider Integration](/no-mistakes/guides/provider-integration/#azure-devop
 
 ## `GITHUB_TOKEN`
 
-GitHub token used to authenticate updater release requests.
+GitHub token used to authenticate updater release asset downloads.
 
 |         |          |
 | ------- | -------- |
 | Type    | `string` |
 | Default | (none)   |
 
-When set, the updater sends the token as a Bearer authorization header for release metadata requests, including background update checks, and release asset downloads. `GITHUB_TOKEN` takes precedence over `GH_TOKEN`; when neither variable is set, these requests remain anonymous. The token is not printed, logged, or persisted.
+When set, the updater sends the token as a Bearer authorization header for release asset downloads. Version metadata is fetched anonymously from a GitHub release-asset manifest that is not subject to the unauthenticated REST rate limit. `GITHUB_TOKEN` takes precedence over `GH_TOKEN`; when neither variable is set, asset downloads remain anonymous. The token is not printed, logged, or persisted.
 
 ## `GH_TOKEN`
 
@@ -166,7 +166,7 @@ Disable background update checks.
 | Type    | `1` to disable, anything else to leave enabled |
 | Default | unset (checks enabled)                         |
 
-Update checks run on every CLI invocation except `update` itself and version queries (`--version` / `-v`, which stay side-effect-free), hit GitHub releases, cache the result in `$NM_HOME/update-check.json`, and print a one-line notification to stderr when a newer version is available. Dev builds (non-semver versions) suppress the check automatically.
+Update checks run on every CLI invocation except `update` itself and version queries (`--version` / `-v`, which stay side-effect-free), fetch the GitHub release-asset channel manifest, cache the result in `$NM_HOME/update-check.json`, and print a one-line notification to stderr when a newer version is available. Dev builds (non-semver versions) suppress the check automatically.
 
 ## `XDG_DATA_HOME`
 
@@ -248,8 +248,9 @@ It never sends a SHA, run ID, path, branch name, URL, remote name, or command ar
 
 ### What stays local and what leaves the machine
 
-Everything sent remotely is low-cardinality: command names, statuses, durations, counts, flag booleans, agent and step names, and - on the single terminal `run finished` event - the bounded performance rollup `agent_invocations`, `resumed_invocations`, and `fallback_invocations` (small counts only).
+Everything sent remotely is low-cardinality: command names, statuses, durations, counts, flag booleans, agent names, fixed step categories, and - on the single terminal `run finished` event - the bounded performance rollup `agent_invocations`, `resumed_invocations`, and `fallback_invocations` (small counts only).
 Run IDs, repository paths, branch names, session identities, prompts, model outputs, diffs, and per-invocation performance records are never sent.
+Repository-declared [gate](/no-mistakes/reference/repo-config/#gates) labels stay local. Remote step, approval, fix, and failed-step fields record them as the fixed token `gate`.
 
 Detailed performance evidence stays on the machine in the local state database (`<NM_HOME>/state.sqlite`): one `agent_invocations` row per agent invocation, plus each run's accumulated parked-at-gate time.
 Each row records run and step identity, purpose (such as review/review-fix/housekeeping), the reported model and its provider, the cold/started/resumed/fallback session mode, a truncated session-identity hash, timestamps, duration, exit status, and failure category, alongside the session-fidelity metrics below.

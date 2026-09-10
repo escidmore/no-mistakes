@@ -47,6 +47,11 @@ type commitSummary struct {
 
 var errRejectedCommitSummary = errors.New("rejected commit summary")
 
+const (
+	noChangesAppliedSummary = "no changes applied"
+	changesAppliedSummary   = "changes applied"
+)
+
 const fixerRemovalRule = `
 
 Removal-first rule:
@@ -76,15 +81,16 @@ func hasBlockingFindings(items []Finding) bool {
 
 // assertPipelineHeadContinuity fails closed when the worktree HEAD is no longer
 // equal to or a descendant of the head the pipeline itself last recorded
-// (sctx.Run.HeadSHA). Every post-review step calls this guard at entry, and
-// commitAgentFixes calls it around commits that advance the recorded head.
+// (sctx.Run.HeadSHA). Every repository gate and every post-review core step
+// calls this guard at entry, and commitAgentFixes calls it around commits that
+// advance the recorded head.
 //
 // The pipeline advances HEAD only through its own commits, each of which updates
 // sctx.Run.HeadSHA in lockstep. If HEAD has diverged from that recorded head -
 // e.g. a concurrent process reset the shared worktree to a different commit -
-// then the reviewed change the pipeline approved is no longer in HEAD's history,
-// and continuing would ship an unreviewed tree. The whole job of this tool is
-// to not lose people's code, so we refuse rather than proceed.
+// then the pipeline's recorded history is no longer in HEAD, and continuing
+// could validate or ship a substituted tree. The whole job of this tool is to
+// not lose people's code, so we refuse rather than proceed.
 //
 // Anchor integrity: sctx.Run.HeadSHA is the correct, un-clobberable anchor. It
 // is the *recorded* head the pipeline itself produced at its last commit - held
@@ -95,11 +101,12 @@ func hasBlockingFindings(items []Finding) bool {
 // point the anchor still holds the reviewed head even after a clobber. The guard
 // deliberately compares the *recorded* head against the *live* worktree HEAD
 // (git.HeadSHA); it never derives the anchor from the mutable worktree, which
-// would be circular and defeatable. Because the guard runs at every post-review
-// step entry and at the very top of commitAgentFixes - before any commit that
-// would advance sctx.Run.HeadSHA - the next pipeline boundary after a clobber is
-// caught while the anchor is still the pre-clobber reviewed head; the anchor can
-// never be advanced into a clobbered lineage without first passing this check.
+// would be circular and defeatable. Because the guard runs at every repository
+// gate and post-review core-step entry, and at the very top of commitAgentFixes
+// before any commit that would advance sctx.Run.HeadSHA, the next pipeline
+// boundary after a clobber is caught while the anchor is still the pre-clobber
+// pipeline head. The anchor can never advance into a clobbered lineage without
+// first passing this check.
 //
 // This is what happened in run 01KXC3SD5NZYMERGDS68Z1C8ER: the review step
 // committed a correct fix, a sibling worktree sharing the bare repo reset HEAD
@@ -157,12 +164,12 @@ func assertPipelineHeadContinuity(sctx *pipeline.StepContext, stepName types.Ste
 // repository, the user's configuration, or the daemon's environment.
 //
 // Reach is deliberately narrow. Only commitAgentFixes (Review, Test, Document,
-// Lint) and the Push step's leftover-worktree commit route here, because those
-// are the two commits the pipeline authors from its own agents' and formatter's
-// output.
+// Lint, and an operator-authorized repository gate repair) and the Push step's
+// leftover-worktree commit route here. These are the two routes that commit the
+// pipeline's own agent and formatter output.
 // CI repair commits, the generic git runner, and every user-authored commit keep
-// hook verification; the Review, Test, Document, Lint, Push, PR, and CI gates
-// remain the authoritative quality checks for what these commits contain.
+// hook verification; the core pipeline and repository gates remain the
+// authoritative quality checks for what these commits contain.
 func commitPipelineCorrection(ctx context.Context, workDir, message string, logf func(string)) error {
 	return commitPipelineCorrectionWithCleanup(ctx, workDir, message, logf, os.RemoveAll)
 }
@@ -189,17 +196,22 @@ func commitPipelineCorrectionWithCleanup(
 }
 
 func commitAgentFixes(sctx *pipeline.StepContext, stepName types.StepName, summary, fallbackSummary string) error {
+	_, err := commitAgentFixesWithResult(sctx, stepName, summary, fallbackSummary)
+	return err
+}
+
+func commitAgentFixesWithResult(sctx *pipeline.StepContext, stepName types.StepName, summary, fallbackSummary string) (bool, error) {
 	ctx := sctx.Ctx
 	if err := assertPipelineHeadContinuity(sctx, stepName); err != nil {
-		return err
+		return false, err
 	}
 	status, err := git.Run(ctx, sctx.WorkDir, "status", "--porcelain")
 	if err != nil {
-		return fmt.Errorf("check %s changes: %w", stepName, err)
+		return false, fmt.Errorf("check %s changes: %w", stepName, err)
 	}
 	if strings.TrimSpace(status) == "" {
 		sctx.Log("no agent changes to commit")
-		return nil
+		return false, nil
 	}
 	if summary == "" {
 		summary = fallbackSummary
@@ -209,24 +221,24 @@ func commitAgentFixes(sctx *pipeline.StepContext, stepName types.StepName, summa
 	}
 	commitMessage, err := sctx.Config.Commit.RenderFixMessage(stepName, summary)
 	if err != nil {
-		return fmt.Errorf("render %s fix commit message: %w", stepName, err)
+		return false, fmt.Errorf("render %s fix commit message: %w", stepName, err)
 	}
 	if err := stagePipelineChanges(sctx); err != nil {
-		return fmt.Errorf("stage %s changes: %w", stepName, err)
+		return false, fmt.Errorf("stage %s changes: %w", stepName, err)
 	}
 	if err := commitPipelineCorrection(ctx, sctx.WorkDir, commitMessage, sctx.Log); err != nil {
-		return fmt.Errorf("commit %s changes: %w", stepName, err)
+		return false, fmt.Errorf("commit %s changes: %w", stepName, err)
 	}
 	headSHA, err := git.HeadSHA(ctx, sctx.WorkDir)
 	if err != nil {
-		return fmt.Errorf("resolve head after %s commit: %w", stepName, err)
+		return false, fmt.Errorf("resolve head after %s commit: %w", stepName, err)
 	}
 	if err := assertPipelineHeadContinuity(sctx, stepName); err != nil {
-		return err
+		return false, err
 	}
 	ref := normalizedBranchRef(sctx.Run.Branch)
 	if _, err := git.Run(ctx, sctx.WorkDir, "update-ref", ref, headSHA); err != nil {
-		return fmt.Errorf("update local branch ref: %w", err)
+		return false, fmt.Errorf("update local branch ref: %w", err)
 	}
 	startingHead := strings.TrimSpace(sctx.ReviewStartingHeadSHA)
 	if startingHead == "" {
@@ -234,13 +246,20 @@ func commitAgentFixes(sctx *pipeline.StepContext, stepName types.StepName, summa
 	}
 	sctx.Run.HeadSHA = headSHA
 	if err := sctx.DB.UpdateRunHeadSHA(sctx.Run.ID, headSHA); err != nil {
-		return err
+		return false, err
 	}
 	if stepName == types.StepReview {
 		pipeline.PersistUncertifiedPipelineRange(sctx, startingHead, headSHA)
 	}
 	sctx.Log(fmt.Sprintf("committed agent fixes: %s", commitMessage))
-	return nil
+	return true, nil
+}
+
+func fixResultSummary(committed bool) string {
+	if committed {
+		return changesAppliedSummary
+	}
+	return noChangesAppliedSummary
 }
 
 func extractCommitSummary(result *agent.Result) (string, error) {
@@ -262,10 +281,6 @@ func extractCommitSummary(result *agent.Result) (string, error) {
 	return cleaned, nil
 }
 
-// executeFixMode runs the fix agent and commits any resulting changes. It
-// returns the agent's one-line fix summary (empty when the agent returned
-// nothing parseable), which the caller should place on StepOutcome.FixSummary
-// so the executor can persist it on the round record.
 func executeFixMode(sctx *pipeline.StepContext, stepName types.StepName, opts fixExecutionOptions) (string, error) {
 	if !sctx.Fixing {
 		return "", nil
@@ -317,8 +332,9 @@ func executeFixMode(sctx *pipeline.StepContext, stepName types.StepName, opts fi
 		}
 		sctx.Log(fmt.Sprintf("warning: could not parse fix summary: %v", err))
 	}
-	if err := commitAgentFixes(sctx, stepName, summary, opts.FallbackSummary); err != nil {
+	committed, err := commitAgentFixesWithResult(sctx, stepName, summary, opts.FallbackSummary)
+	if err != nil {
 		return "", err
 	}
-	return summary, nil
+	return fixResultSummary(committed), nil
 }

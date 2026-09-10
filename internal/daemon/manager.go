@@ -161,12 +161,12 @@ func (m *RunManager) prepareRecoveredRun(ctx context.Context, run *db.Run) (*rec
 		return nil, fmt.Errorf("worktree does not belong to its gate repository")
 	}
 
-	execSteps := m.steps()
-	if err := pipeline.ValidateRecoveredRun(m.db, run, execSteps); err != nil {
-		return nil, err
-	}
 	cfg, err := m.loadRecoveredConfig(ctx, run, repo, workDir)
 	if err != nil {
+		return nil, err
+	}
+	execSteps := steps.WithCustomGates(m.steps(), cfg.Gates)
+	if err := pipeline.ValidateRecoveredRun(m.db, run, execSteps); err != nil {
 		return nil, err
 	}
 	forgeCtx, err := forgecontext.Resolve(ctx, cfg.ForgeProfiles, repo.UpstreamURL, repo.ForkURL)
@@ -244,6 +244,17 @@ func (m *RunManager) loadRecoveredConfig(ctx context.Context, run *db.Run, repo 
 	allowRepoCommands := trustedRepoCfg != nil && trustedRepoCfg.AllowRepoCommands
 	effectiveRepoCfg := config.EffectiveRepoConfig(repoCfg, trustedRepoCfg, allowRepoCommands)
 	cfg := config.Merge(globalCfg, effectiveRepoCfg)
+	// Gates are read back from the run, never re-resolved. Everything else here
+	// is deliberately re-read from the live default branch, but a gate decides
+	// which steps the run HAS: the default branch may have gained or lost one
+	// since this run parked, and rebuilding the sequence from the current list
+	// would leave recovery matching the run's recorded steps against a sequence
+	// it never executed - failing a healthy parked run as a crash.
+	gates, err := m.pinnedRunGates(run.ID)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Gates = gates
 	if err := m.paths.ValidateEvidenceRoot(cfg.Test.Evidence.LocalRoot); err != nil {
 		return nil, err
 	}
@@ -256,10 +267,51 @@ func (m *RunManager) loadRecoveredConfig(ctx context.Context, run *db.Run, repo 
 	return cfg, nil
 }
 
+// pinnedRunGates reads back the gate list a run resolved at creation. An absent
+// pin means the bare core pipeline - the only sequence a run created before
+// gates were pinned can have had - while an unusable one fails its caller
+// closed with a reason, because silently dropping it would resume the run
+// against a shorter pipeline than the one it recorded.
+func (m *RunManager) pinnedRunGates(runID string) ([]config.Gate, error) {
+	payload, err := m.db.GetRunGates(runID)
+	if err != nil {
+		return nil, fmt.Errorf("read pinned gates: %w", err)
+	}
+	gates, err := config.ParseGates(payload)
+	if err != nil {
+		return nil, fmt.Errorf("pinned gates are unusable: %w", err)
+	}
+	return gates, nil
+}
+
 func newPipelineAgent(ctx context.Context, cfg *config.Config, evidenceRoot string, lookPath func(string) (string, error), environment runenv.Overlay) (agent.Agent, error) {
 	if steps.IsDemoMode() {
 		return agent.NewNoop(), nil
 	}
+	primary, err := newConfiguredAgent(ctx, cfg, evidenceRoot, lookPath, environment)
+	if err != nil {
+		return nil, err
+	}
+	roles := make(map[string]agent.Agent, len(cfg.ReviewAgents))
+	for _, role := range []string{"reviewer", "fixer"} {
+		entry, ok := cfg.ReviewAgents[role]
+		if !ok {
+			continue
+		}
+		next, err := newConfiguredAgent(ctx, cfg.ForReviewAgent(entry), evidenceRoot, lookPath, environment)
+		if err != nil {
+			_ = primary.Close()
+			for _, existing := range roles {
+				_ = existing.Close()
+			}
+			return nil, fmt.Errorf("create review_agents.%s: %w", role, err)
+		}
+		roles[role] = next
+	}
+	return agent.WithReviewAgents(primary, roles["reviewer"], roles["fixer"]), nil
+}
+
+func newConfiguredAgent(ctx context.Context, cfg *config.Config, evidenceRoot string, lookPath func(string) (string, error), environment runenv.Overlay) (agent.Agent, error) {
 	if err := cfg.ResolveAgent(ctx, lookPath); err != nil {
 		return nil, err
 	}
@@ -407,6 +459,7 @@ func (m *RunManager) resumeRecoveredRun(plan recoveredRunPlan) {
 		}
 		addRunPerformanceSummary(m.db, plan.run.ID, fields)
 		telemetry.Track("run", fields)
+		m.autoIngestCIFalseNegatives(runCtx, plan.cfg, plan.run.ID)
 	}()
 }
 
@@ -1326,54 +1379,35 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 		return "", fmt.Errorf("resolve forge profile: %w", err)
 	}
 
-	// Create agent. In demo mode, skip resolution and use a no-op agent.
-	var ag agent.Agent
-	if steps.IsDemoMode() {
-		ag = agent.NewNoop()
-	} else {
-		if err := cfg.ResolveAgent(ctx, exec.LookPath); err != nil {
-			m.db.UpdateRunError(run.ID, err.Error())
-			trackStartFailure("resolve_agent")
-			return "", err
-		}
-		agents := cfg.Agents
-		if len(agents) == 0 {
-			agents = []types.AgentName{cfg.Agent}
-		}
-		created := make([]agent.Agent, 0, len(agents))
-		for _, name := range agents {
-			next, agErr := agent.NewWithOptions(name, cfg.AgentPathFor(name), cfg.AgentArgsFor(name), agent.Options{
-				ACPRegistryOverrides:   cfg.ACPRegistryOverrides,
-				DisableProjectSettings: cfg.DisableProjectSettings,
-				Profile:                cfg.AgentProfileFor(name),
-				Environment:            forgeEnvironment(forgeCtx),
-			})
-			if agErr != nil {
-				m.db.UpdateRunError(run.ID, fmt.Sprintf("create agent %s: %s", name, agErr))
-				trackStartFailure("create_agent")
-				return "", fmt.Errorf("create agent %s: %w", name, agErr)
-			}
-			// Steer every pipeline agent to keep writes inside the worktree and
-			// avoid mutating system state (e.g. brew/Homebrew touching
-			// /Applications), which triggers macOS App Management prompts.
-			created = append(created, agent.WithSteering(next, m.paths.EvidenceRoot(cfg.Test.Evidence.LocalRoot)))
-		}
-		ag = agent.NewFallback(created)
-		// Fail closed ONLY under the trusted opt-out: when the repo asked to
-		// disable project settings, refuse any resolved harness that lacks a
-		// verified suppression knob rather than launch it with the target repo's
-		// project instructions loaded. When the repo did not opt out, every
-		// adapter runs exactly as before (backward-compat).
-		if cfg.DisableProjectSettings {
-			if err := agent.EnsureGateNeutralized(ag); err != nil {
-				m.db.UpdateRunError(run.ID, err.Error())
-				trackStartFailure("gate_not_neutralized")
-				return "", err
-			}
-		}
+	// Create agent. In demo mode, newPipelineAgent returns a no-op agent, and it
+	// wires review-role routing plus the trusted-opt-out gate-neutralization
+	// fail-closed check.
+	ag, err := newPipelineAgent(ctx, cfg, m.paths.EvidenceRoot(cfg.Test.Evidence.LocalRoot), exec.LookPath, forgeEnvironment(forgeCtx))
+	if err != nil {
+		m.db.UpdateRunError(run.ID, err.Error())
+		trackStartFailure("create_agent")
+		return "", err
 	}
 
-	execSteps := m.steps()
+	// Configuration decides this run's gates exactly once, here, and the
+	// resolved list is recorded before the executor can write a single step
+	// row. Every later consumer - above all crash recovery - reads that record
+	// back through pinnedRunGates, so a gate merged onto (or removed from) the
+	// default branch from here on is inert for this run instead of retargeting
+	// its resume at a step sequence it never executed.
+	pinnedGates, err := config.MarshalGates(cfg.Gates)
+	if err != nil {
+		m.db.UpdateRunError(run.ID, fmt.Sprintf("record gates: %s", err))
+		trackStartFailure("record_gates")
+		return "", fmt.Errorf("record gates: %w", err)
+	}
+	if err := m.db.SetRunGates(run.ID, pinnedGates); err != nil {
+		m.db.UpdateRunError(run.ID, fmt.Sprintf("record gates: %s", err))
+		trackStartFailure("record_gates")
+		return "", fmt.Errorf("record gates: %w", err)
+	}
+
+	execSteps := steps.WithCustomGates(m.steps(), cfg.Gates)
 	telemetry.Track("run", telemetry.Fields{
 		"action":      "started",
 		"trigger":     trigger,
@@ -1497,6 +1531,7 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 		// pipeline's own outcome is already decided and reported above, so
 		// nothing below can change it.
 		m.autoCaptureEvalCase(runCtx, cfg, run.ID)
+		m.autoIngestCIFalseNegatives(runCtx, cfg, run.ID)
 	}()
 
 	return run.ID, nil
@@ -1554,6 +1589,48 @@ func (m *RunManager) autoCaptureEvalCase(ctx context.Context, cfg *config.Config
 		slog.Debug("run has no eval case to collect", "run_id", runID, "reason", result.Reason)
 	default:
 		slog.Info("collected eval case", "run_id", runID, "cases", result.Captured, "pruned", result.Pruned)
+	}
+}
+
+// autoIngestCIFalseNegatives writes false-negative gold for a finished run's
+// fixed CI findings onto its green review case. Any real code defect CI
+// surfaces (a failing ci-check or a review-bot comment), confirmed and fixed in
+// the run, is by definition a Review false negative: Review passed green and
+// missed it.
+//
+// Like autoCaptureEvalCase it is subordinate to the run: it swallows its own
+// panic, bounds its own time, shares the eval mutex so it never races capture,
+// and reports failure only to the log. It reads the CI findings the pipeline
+// already persisted per round, so it never fabricates a case.
+func (m *RunManager) autoIngestCIFalseNegatives(ctx context.Context, cfg *config.Config, runID string) {
+	if cfg == nil || !cfg.Eval.AutoCapture || !cfg.Eval.CaptureProvenance {
+		return
+	}
+	if ctx.Err() != nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("panic while ingesting CI false negatives", "run_id", runID, "panic", r)
+		}
+	}()
+	m.evalCaptureMu.Lock()
+	defer m.evalCaptureMu.Unlock()
+
+	if ctx.Err() != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, evalAutoCaptureTimeout)
+	defer cancel()
+
+	result, skipped, err := eval.AutoIngestCIFalseNegatives(ctx, m.paths, m.db, runID)
+	switch {
+	case err != nil:
+		slog.Warn("failed to ingest CI false negatives", "run_id", runID, "error", err)
+	case skipped:
+		slog.Debug("run has no CI false negative to ingest", "run_id", runID)
+	default:
+		slog.Info("ingested CI false negatives", "run_id", runID, "case", result.CaseID, "added", result.Added, "total", result.Total)
 	}
 }
 
@@ -1623,7 +1700,7 @@ func telemetryFailedStepName(database *db.DB, runID string) string {
 	}
 	for _, step := range steps {
 		if step.Status == types.StepStatusFailed {
-			return string(step.StepName)
+			return telemetry.StepName(step.StepName)
 		}
 	}
 	return ""

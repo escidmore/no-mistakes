@@ -1,7 +1,6 @@
 package bitbucket
 
 import (
-	"slices"
 	"testing"
 
 	"github.com/kunchenguid/no-mistakes/internal/scm"
@@ -73,6 +72,46 @@ func TestStatusName(t *testing.T) {
 	}
 }
 
+func TestStatusProviderID(t *testing.T) {
+	t.Parallel()
+
+	if got := statusProviderID(CommitStatus{Key: "build-1", URL: "https://bitbucket.org/ws/repo/addon/pipelines/home#!/results/pipeline-1"}); got != "bitbucket-status:build-1" {
+		t.Fatalf("statusProviderID() = %q, want status key identity", got)
+	}
+	if got := statusProviderID(CommitStatus{URL: "https://bitbucket.org/ws/repo/addon/pipelines/home#!/results/42"}); got != "bitbucket-pipeline-build:42" {
+		t.Fatalf("statusProviderID() = %q, want pipeline identity fallback", got)
+	}
+}
+
+func TestFailedPipelineBuildNumberTargetsPreservesExactSameNamedSelection(t *testing.T) {
+	t.Parallel()
+
+	statuses := []CommitStatus{
+		{Name: "test", Key: "test-linux", State: "FAILED", URL: "https://bitbucket.org/ws/repo/addon/pipelines/home#!/results/41"},
+		{Name: "test", Key: "test-macos", State: "FAILED", URL: "https://bitbucket.org/ws/repo/addon/pipelines/home#!/results/42"},
+	}
+	got, err := failedPipelineBuildNumberTargets(statuses, []scm.CheckTarget{{Name: "test", ProviderID: "bitbucket-status:test-macos"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("targets = %v, want one exact pipeline", got)
+	}
+	if _, ok := got["42"]; !ok {
+		t.Fatalf("targets = %v, want build 42", got)
+	}
+}
+
+func TestFailedPipelineBuildNumberTargetsFailsClosedWhenSelectionCannotResolve(t *testing.T) {
+	t.Parallel()
+
+	statuses := []CommitStatus{{Name: "test", Key: "test-linux", State: "FAILED", URL: "https://bitbucket.org/ws/repo/addon/pipelines/home#!/results/41"}}
+	got, err := failedPipelineBuildNumberTargets(statuses, []scm.CheckTarget{{Name: "test", ProviderID: "bitbucket-status:missing"}})
+	if err == nil || got != nil {
+		t.Fatalf("failedPipelineBuildNumberTargets() = (%v, %v), want no targets and an error", got, err)
+	}
+}
+
 func TestStatusBucket(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -113,278 +152,21 @@ func TestStatusBucket(t *testing.T) {
 	}
 }
 
-func TestNormalizePipelineUUID(t *testing.T) {
+func TestPipelineBuildNumberFromStatusURL(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
-		name string
 		raw  string
 		want string
 	}{
-		{"already lowercase", "abc-def-123", "abc-def-123"},
-		{"uppercase lowered", "ABC-DEF-123", "abc-def-123"},
-		{"mixed case lowered", "AbC-dEf", "abc-def"},
-		{"with braces stripped", "{abc-def-123}", "abc-def-123"},
-		{"with braces uppercase", "{ABC-DEF}", "abc-def"},
-		{"with surrounding spaces trimmed", "  abc-def  ", "abc-def"},
-		{"spaces and braces combined", "  {abc-def}  ", "abc-def"},
-
-		// strings.Trim with cutset "{}" strips all leading/trailing { and } chars,
-		// not just one matched pair.
-		{"nested braces collapse", "{{abc-def}}", "abc-def"},
-		{"only leading brace stripped", "{abc-def", "abc-def"},
-		{"only trailing brace stripped", "abc-def}", "abc-def"},
-		{"triple trailing braces", "abc-def}}}", "abc-def"},
-		{"interior braces preserved", "a{b}c", "a{b}c"},
-
-		{"empty returns empty", "", ""},
-		{"whitespace-only returns empty", "   ", ""},
-		{"empty braces return empty", "{}", ""},
-		{"braces with whitespace return empty", "  {}  ", ""},
+		{"https://bitbucket.org/ws/repo/pipelines/results/123", "123"},
+		{"https://bitbucket.org/ws/repo/addon/pipelines/home#!/results/456", "456"},
+		{"https://bitbucket.org/ws/repo/pipelines/results/not-a-number", ""},
+		{"https://bitbucket.org/ws/repo/pipelines", ""},
 	}
-
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := normalizePipelineUUID(tt.raw)
-			if got != tt.want {
-				t.Fatalf("normalizePipelineUUID(%q) = %q, want %q", tt.raw, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestPipelineUUIDFromStatusURL(t *testing.T) {
-	tests := []struct {
-		name string
-		raw  string
-		want string
-	}{
-		{
-			name: "valid results URL with braces",
-			raw:  "https://bitbucket.org/ws/repo/pipelines/results/{abc-def-123}",
-			want: "abc-def-123",
-		},
-		{
-			name: "UUID without braces",
-			raw:  "https://bitbucket.org/ws/repo/pipelines/results/abc-def",
-			want: "abc-def",
-		},
-		{
-			name: "uppercase UUID normalized to lowercase",
-			raw:  "https://bitbucket.org/ws/repo/pipelines/results/{ABC-DEF}",
-			want: "abc-def",
-		},
-		{
-			name: "URL with query string strips query",
-			raw:  "https://bitbucket.org/ws/repo/pipelines/results/{abc-def}?tab=logs",
-			want: "abc-def",
-		},
-		{
-			name: "URL with trailing path segment stops at first slash",
-			raw:  "https://bitbucket.org/ws/repo/pipelines/results/{abc-def}/steps",
-			want: "abc-def",
-		},
-		{
-			name: "fragment consulted before path",
-			raw:  "https://bitbucket.org/ws/pipelines/results/path-uuid#/pipelines/results/frag-uuid",
-			want: "frag-uuid",
-		},
-		{
-			name: "last results segment wins when duplicated",
-			raw:  "https://bitbucket.org/results/early/results/late",
-			want: "late",
-		},
-		{
-			name: "URL without results segment returns empty",
-			raw:  "https://bitbucket.org/ws/repo/pipelines",
-			want: "",
-		},
-		{
-			name: "URL whose path lacks results but fragment has it extracts fragment UUID",
-			raw:  "https://bitbucket.org/ws/repo#/pipelines/results/{frag-only}",
-			want: "frag-only",
-		},
-		{
-			name: "empty string returns empty",
-			raw:  "",
-			want: "",
-		},
-		{
-			name: "whitespace-only returns empty",
-			raw:  "   ",
-			want: "",
-		},
-		{
-			name: "plain string with no URL structure returns empty",
-			raw:  "not-a-url",
-			want: "",
-		},
-		{
-			// An invalid percent-escape makes url.Parse fail outright; the helper
-			// must return empty rather than panic or surface the parse error.
-			name: "malformed URL with invalid percent escape returns empty",
-			raw:  "https://bitbucket.org/x/results/{abc}%xx",
-			want: "",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := pipelineUUIDFromStatusURL(tt.raw)
-			if got != tt.want {
-				t.Fatalf("pipelineUUIDFromStatusURL(%q) = %q, want %q", tt.raw, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestFailedPipelineUUIDs(t *testing.T) {
-	resultsURL := func(uuid string) string {
-		return "https://bitbucket.org/ws/repo/pipelines/results/{" + uuid + "}"
-	}
-
-	tests := []struct {
-		name         string
-		statuses     []CommitStatus
-		failingNames []string
-		wantNil      bool
-		want         []string // pre-sorted UUIDs expected in the returned map
-	}{
-		{
-			name:         "no failing names returns nil",
-			failingNames: nil,
-			wantNil:      true,
-		},
-		{
-			name:         "empty failing names slice returns nil",
-			failingNames: []string{},
-			wantNil:      true,
-		},
-		{
-			name:         "failing names all whitespace returns nil",
-			failingNames: []string{"  ", ""},
-			wantNil:      true,
-		},
-		{
-			name:         "no statuses returns nil",
-			statuses:     nil,
-			failingNames: []string{"build"},
-			wantNil:      true,
-		},
-		{
-			name: "no status name matches a failing name returns nil",
-			statuses: []CommitStatus{
-				{Name: "lint", URL: resultsURL("lint-uuid")},
-			},
-			failingNames: []string{"build"},
-			wantNil:      true,
-		},
-		{
-			name: "matching status with no results URL returns nil",
-			statuses: []CommitStatus{
-				{Name: "build", URL: "https://bitbucket.org/ws/repo/build"},
-			},
-			failingNames: []string{"build"},
-			wantNil:      true,
-		},
-		{
-			name: "matching status with empty URL returns nil",
-			statuses: []CommitStatus{
-				{Name: "build", URL: ""},
-			},
-			failingNames: []string{"build"},
-			wantNil:      true,
-		},
-		{
-			name: "single match extracts UUID",
-			statuses: []CommitStatus{
-				{Name: "build", URL: resultsURL("abc")},
-			},
-			failingNames: []string{"build"},
-			want:         []string{"abc"},
-		},
-		{
-			name: "multiple distinct failing names map to distinct UUIDs",
-			statuses: []CommitStatus{
-				{Name: "build", URL: resultsURL("abc")},
-				{Name: "tests", URL: resultsURL("def")},
-			},
-			failingNames: []string{"build", "tests"},
-			want:         []string{"abc", "def"},
-		},
-		{
-			name: "duplicate UUIDs collapse into a single target",
-			statuses: []CommitStatus{
-				{Name: "build", URL: resultsURL("abc")},
-				{Name: "tests", URL: resultsURL("abc")},
-			},
-			failingNames: []string{"build", "tests"},
-			want:         []string{"abc"},
-		},
-		{
-			name: "only the requested failing names contribute UUIDs",
-			statuses: []CommitStatus{
-				{Name: "build", URL: resultsURL("abc")},
-				{Name: "lint", URL: resultsURL("def")},
-			},
-			failingNames: []string{"build", "nonexistent"},
-			want:         []string{"abc"},
-		},
-		{
-			name: "failing name with surrounding whitespace matches trimmed status name",
-			statuses: []CommitStatus{
-				{Name: "build", URL: resultsURL("abc")},
-			},
-			failingNames: []string{"  build  "},
-			want:         []string{"abc"},
-		},
-		{
-			name: "status matched by key when name is empty",
-			statuses: []CommitStatus{
-				{Key: "build", URL: resultsURL("abc")},
-			},
-			failingNames: []string{"build"},
-			want:         []string{"abc"},
-		},
-		{
-			name: "uppercase UUIDs in URLs are normalized",
-			statuses: []CommitStatus{
-				{Name: "build", URL: resultsURL("ABC-DEF")},
-			},
-			failingNames: []string{"build"},
-			want:         []string{"abc-def"},
-		},
-		{
-			name: "LatestStatuses dedup happens before UUID collection",
-			statuses: []CommitStatus{
-				{Name: "build", Key: "build", URL: resultsURL("first")},
-				{Name: "build", Key: "build", URL: resultsURL("second")},
-			},
-			failingNames: []string{"build"},
-			want:         []string{"first"},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := failedPipelineUUIDs(tt.statuses, tt.failingNames)
-			if tt.wantNil {
-				if got != nil {
-					t.Fatalf("failedPipelineUUIDs = %v, want nil", got)
-				}
-				return
-			}
-			if got == nil {
-				t.Fatalf("failedPipelineUUIDs = nil, want %v", tt.want)
-			}
-			keys := make([]string, 0, len(got))
-			for k := range got {
-				keys = append(keys, k)
-			}
-			slices.Sort(keys)
-			want := slices.Clone(tt.want)
-			slices.Sort(want)
-			if !slices.Equal(keys, want) {
-				t.Fatalf("failedPipelineUUIDs keys = %v, want %v", keys, want)
-			}
-		})
+		if got := pipelineBuildNumberFromStatusURL(tt.raw); got != tt.want {
+			t.Fatalf("pipelineBuildNumberFromStatusURL(%q) = %q, want %q", tt.raw, got, tt.want)
+		}
 	}
 }

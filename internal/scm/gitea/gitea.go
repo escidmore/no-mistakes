@@ -447,8 +447,13 @@ func anyJobMatchesHeadSHA(jobs []giteaJob, sha string) bool {
 func jobsToChecks(jobs []giteaJob) []scm.Check {
 	checks := make([]scm.Check, 0, len(jobs))
 	for _, job := range jobs {
+		providerID := ""
+		if job.ID != 0 {
+			providerID = fmt.Sprintf("gitea-job:%d", job.ID)
+		}
 		checks = append(checks, scm.Check{
 			Name:        job.Name,
+			ProviderID:  providerID,
 			Bucket:      giteaStatusBucket(job.Status, job.Conclusion),
 			CompletedAt: job.completedAt(),
 			Link:        job.HTMLURL,
@@ -457,56 +462,102 @@ func jobsToChecks(jobs []giteaJob) []scm.Check {
 	return checks
 }
 
-func (h *Host) FetchFailedCheckLogs(ctx context.Context, pr *scm.PR, _ string, headSHA string, failingNames []string) (string, error) {
-	if len(failingNames) == 0 {
-		return "", nil
+func (h *Host) FetchFailedCheckLogs(ctx context.Context, pr *scm.PR, branch, headSHA string, failingNames []string) (string, error) {
+	targets := make([]scm.CheckTarget, 0, len(failingNames))
+	for _, name := range failingNames {
+		targets = append(targets, scm.CheckTarget{Name: name})
+	}
+	logs, err := h.FetchFailedCheckTargetLogs(ctx, pr, branch, headSHA, targets)
+	if err != nil {
+		return "", err
+	}
+	return scm.CombineFailedCheckLogs(logs)
+}
+
+func (h *Host) FetchFailedCheckTargetLogs(ctx context.Context, pr *scm.PR, _ string, headSHA string, targets []scm.CheckTarget) ([]scm.FailedCheckLog, error) {
+	if len(targets) == 0 {
+		return nil, nil
 	}
 	view, err := h.viewPR(ctx, pr.Number)
-	if err != nil || strings.TrimSpace(view.Head) == "" {
-		return "", nil
+	if err != nil {
+		return nil, fmt.Errorf("resolve Gitea pull request for selected logs: %w", err)
+	}
+	if strings.TrimSpace(view.Head) == "" {
+		return nil, errors.New("resolve Gitea pull request for selected logs: head branch is empty")
 	}
 	runs, err := h.listRuns(ctx, view.Head)
-	if err != nil || len(runs) == 0 {
-		return "", nil
+	if err != nil {
+		return nil, fmt.Errorf("list Gitea runs for selected logs: %w", err)
+	}
+	if len(runs) == 0 {
+		return nil, errors.New("no Gitea runs found for selected logs")
 	}
 	matchSHA := strings.TrimSpace(headSHA)
 	if matchSHA == "" {
 		matchSHA = view.HeadSHA
 	}
 	run, jobs, err := h.runJobsMatchingHeadSHA(ctx, runs, matchSHA)
-	if err != nil || run.ID == "" {
-		return "", nil
+	if err != nil {
+		return nil, fmt.Errorf("find Gitea run for selected logs: %w", err)
 	}
-	jobID := findFailedGiteaJobID(jobs, failingNames)
-	if jobID == 0 {
-		return "", nil
+	if run.ID == "" {
+		return nil, errors.New("no Gitea run matched the selected log target head")
 	}
-	logsCmd := h.cmd(ctx, "tea", "actions", "runs", "logs", run.ID,
-		"--job", strconv.Itoa(jobID),
-		"--repo", h.repoSlug,
-		"--login", h.login,
-	)
-	out, _ := logsCmd.Output()
-	return stripGiteaLogsHeader(string(out)), nil
+	results := make([]scm.FailedCheckLog, 0, len(targets))
+	for _, target := range targets {
+		result := scm.FailedCheckLog{Target: target}
+		jobIDs := findFailedGiteaJobTargetIDs(jobs, []scm.CheckTarget{target})
+		if len(jobIDs) == 0 {
+			result.Err = fmt.Errorf("selected Gitea check %q was not found", target.Identity())
+			results = append(results, result)
+			continue
+		}
+		var outputs []string
+		var errs []error
+		for _, jobID := range jobIDs {
+			logsCmd := h.cmd(ctx, "tea", "actions", "runs", "logs", run.ID,
+				"--job", strconv.Itoa(jobID),
+				"--repo", h.repoSlug,
+				"--login", h.login,
+			)
+			out, err := logsCmd.Output()
+			if err != nil {
+				errs = append(errs, fmt.Errorf("fetch Gitea job %d log: %w", jobID, err))
+				continue
+			}
+			if log := stripGiteaLogsHeader(string(out)); log != "" {
+				outputs = append(outputs, log)
+			}
+		}
+		result.Output = strings.Join(outputs, "\n\n")
+		result.Err = errors.Join(errs...)
+		results = append(results, result)
+	}
+	return results, nil
 }
 
-func findFailedGiteaJobID(jobs []giteaJob, failingNames []string) int {
-	targets := map[string]struct{}{}
-	for _, name := range failingNames {
-		name = strings.TrimSpace(name)
-		if name != "" {
-			targets[name] = struct{}{}
+func findFailedGiteaJobTargetIDs(jobs []giteaJob, checkTargets []scm.CheckTarget) []int {
+	names := map[string]struct{}{}
+	ids := map[string]struct{}{}
+	for _, target := range checkTargets {
+		if id := strings.TrimSpace(target.ProviderID); id != "" {
+			ids[id] = struct{}{}
+		} else if name := strings.TrimSpace(target.Name); name != "" {
+			names[name] = struct{}{}
 		}
 	}
+	var matched []int
 	for _, job := range jobs {
 		if giteaStatusBucket(job.Status, job.Conclusion) != scm.CheckBucketFail {
 			continue
 		}
-		if _, ok := targets[job.Name]; ok || len(targets) == 0 {
-			return job.ID
+		_, nameMatch := names[job.Name]
+		_, idMatch := ids[fmt.Sprintf("gitea-job:%d", job.ID)]
+		if nameMatch || idMatch || len(names)+len(ids) == 0 {
+			matched = append(matched, job.ID)
 		}
 	}
-	return 0
+	return matched
 }
 
 // stripGiteaLogsHeader removes the "Logs for job N:\n---\n" banner that `tea

@@ -180,13 +180,16 @@ func TestClassifyCheckFailure(t *testing.T) {
 func TestCIUnresolvedCancelledOutcomePreservesPreRunFailureCause(t *testing.T) {
 	t.Parallel()
 
-	outcome := ciUnresolvedCancelledOutcome(
-		[]string{"build"},
-		[]scm.Check{{Name: "build", Bucket: scm.CheckBucketCancel, State: "FAILURE", PreRunFailure: true}},
-		func(string) int { return 1 },
-	)
+	outcome := ciObservationOutcome(ciObservationFindings(ciIssues{
+		checks:              []scm.Check{{Name: "build", Bucket: scm.CheckBucketCancel, State: "FAILURE", PreRunFailure: true}},
+		unresolvedCancelled: []string{"build"},
+		reruns:              func(string) int { return 1 },
+	}))
 	if !outcome.NeedsApproval {
 		t.Fatal("pre-run failure after its rerun must require approval")
+	}
+	if outcome.AutoFixable {
+		t.Fatal("a transient check no rerun will replace must never be auto-fixable")
 	}
 
 	var findings Findings
@@ -209,6 +212,9 @@ func TestCIUnresolvedCancelledOutcomePreservesPreRunFailureCause(t *testing.T) {
 	if findings.Items[0].Action != types.ActionAskUser {
 		t.Fatalf("action = %q, want ask-user parking", findings.Items[0].Action)
 	}
+	if findings.Items[0].Category != types.FindingCategoryCITransient || findings.Items[0].Check != "build" {
+		t.Fatalf("finding = %+v, want a ci-transient finding naming its check", findings.Items[0])
+	}
 }
 
 // Names identify shared rerun budgets, not unique checks. If two workflows use
@@ -217,14 +223,14 @@ func TestCIUnresolvedCancelledOutcomePreservesPreRunFailureCause(t *testing.T) {
 func TestCIUnresolvedCancelledOutcomeKeepsSameNamedCausesPositional(t *testing.T) {
 	t.Parallel()
 
-	outcome := ciUnresolvedCancelledOutcome(
-		[]string{"build"},
-		[]scm.Check{
-			{Name: "build", Bucket: scm.CheckBucketCancel, State: "FAILURE", PreRunFailure: true},
-			{Name: "build", Bucket: scm.CheckBucketCancel, State: "CANCELLED"},
+	outcome := ciObservationOutcome(ciObservationFindings(ciIssues{
+		checks: []scm.Check{
+			{Name: "build", ProviderID: "github-check-run:41", Bucket: scm.CheckBucketCancel, State: "FAILURE", PreRunFailure: true},
+			{Name: "build", ProviderID: "github-check-run:42", Bucket: scm.CheckBucketCancel, State: "CANCELLED"},
 		},
-		func(string) int { return 1 },
-	)
+		unresolvedCancelled: []string{"build"},
+		reruns:              func(string) int { return 1 },
+	}))
 
 	var findings Findings
 	if err := json.Unmarshal([]byte(outcome.Findings), &findings); err != nil {
@@ -241,6 +247,13 @@ func TestCIUnresolvedCancelledOutcomeKeepsSameNamedCausesPositional(t *testing.T
 	}
 	if !strings.Contains(findings.Items[1].Description, "provider cancelled") {
 		t.Fatalf("second description = %q, want cancellation diagnosis", findings.Items[1].Description)
+	}
+	if findings.Items[0].CheckID != "github-check-run:41" || findings.Items[1].CheckID != "github-check-run:42" {
+		t.Fatalf("findings = %+v, want each transient check's provider identity", findings.Items)
+	}
+	targets, err := parseCIFixTargets(outcome.Findings)
+	if err != nil || len(targets.Checks) != 2 || targets.Checks[0].ProviderID == targets.Checks[1].ProviderID {
+		t.Fatalf("targets = %+v, %v, want two exact repair targets", targets.Checks, err)
 	}
 }
 

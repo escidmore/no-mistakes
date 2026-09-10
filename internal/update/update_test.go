@@ -44,10 +44,13 @@ func TestUpdaterCheckLatestAndRefreshCache(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Path != "/repos/kunchenguid/no-mistakes/releases/latest" {
+				if strings.Contains(r.URL.Path, "/repos/") {
+					t.Fatalf("stable update must not call the GitHub REST API, got %q", r.URL.Path)
+				}
+				if r.URL.Path != "/releases/download/channels/channels.json" {
 					t.Fatalf("unexpected path %q", r.URL.Path)
 				}
-				fmt.Fprintf(w, `{"tag_name":"v1.2.3","assets":[{"name":%q,"browser_download_url":"http://example.com/archive"},{"name":"checksums.txt","browser_download_url":"http://example.com/checksums"}]}`,
+				fmt.Fprintf(w, `{"schema_version":1,"stable":{"tag_name":"v1.2.3","assets":[{"name":%q,"browser_download_url":"http://example.com/archive"},{"name":"checksums.txt","browser_download_url":"http://example.com/checksums"}]}}`,
 					tt.archiveName,
 				)
 			}))
@@ -56,10 +59,9 @@ func TestUpdaterCheckLatestAndRefreshCache(t *testing.T) {
 			cachePath := filepath.Join(t.TempDir(), "update-check.json")
 			u := &updater{
 				appName:        "no-mistakes",
-				repo:           "kunchenguid/no-mistakes",
 				currentVersion: "v1.2.2",
 				platform:       tt.platform,
-				apiBaseURL:     server.URL,
+				manifestURL:    server.URL + "/releases/download/channels/channels.json",
 				httpClient:     server.Client(),
 				cachePath:      cachePath,
 				now:            func() time.Time { return time.Date(2026, 4, 9, 12, 0, 0, 0, time.UTC) },
@@ -107,8 +109,8 @@ func TestUpdaterRunReplacesExecutable(t *testing.T) {
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/repos/kunchenguid/no-mistakes/releases/latest":
-			fmt.Fprintf(w, `{"tag_name":"v1.2.3","assets":[{"name":%q,"browser_download_url":%q},{"name":"checksums.txt","browser_download_url":%q}]}`,
+		case "/releases/download/channels/channels.json":
+			fmt.Fprintf(w, `{"schema_version":1,"stable":{"tag_name":"v1.2.3","assets":[{"name":%q,"browser_download_url":%q},{"name":"checksums.txt","browser_download_url":%q}]}}`,
 				archiveName,
 				server.URL+"/archive",
 				server.URL+"/checksums",
@@ -118,6 +120,9 @@ func TestUpdaterRunReplacesExecutable(t *testing.T) {
 		case "/checksums":
 			fmt.Fprint(w, checksums)
 		default:
+			if strings.Contains(r.URL.Path, "/repos/") {
+				t.Fatalf("update download path must not call the GitHub REST API, got %q", r.URL.Path)
+			}
 			t.Fatalf("unexpected path %q", r.URL.Path)
 		}
 	}))
@@ -131,10 +136,9 @@ func TestUpdaterRunReplacesExecutable(t *testing.T) {
 	stdout := new(bytes.Buffer)
 	u := &updater{
 		appName:        "no-mistakes",
-		repo:           "kunchenguid/no-mistakes",
 		currentVersion: "v1.2.2",
 		platform:       platformSpec{GOOS: "darwin", GOARCH: "arm64"},
-		apiBaseURL:     server.URL,
+		manifestURL:    server.URL + "/releases/download/channels/channels.json",
 		httpClient:     server.Client(),
 		executablePath: execPath,
 		stdout:         stdout,
@@ -170,8 +174,8 @@ func TestUpdaterRunResetsDaemonAfterUpdate(t *testing.T) {
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/repos/kunchenguid/no-mistakes/releases/latest":
-			fmt.Fprintf(w, `{"tag_name":"v1.2.3","assets":[{"name":%q,"browser_download_url":%q},{"name":"checksums.txt","browser_download_url":%q}]}`,
+		case "/channels.json":
+			fmt.Fprintf(w, `{"schema_version":1,"stable":{"tag_name":"v1.2.3","assets":[{"name":%q,"browser_download_url":%q},{"name":"checksums.txt","browser_download_url":%q}]}}`,
 				archiveName,
 				server.URL+"/archive",
 				server.URL+"/checksums",
@@ -194,10 +198,9 @@ func TestUpdaterRunResetsDaemonAfterUpdate(t *testing.T) {
 	resetCalled := false
 	u := &updater{
 		appName:        "no-mistakes",
-		repo:           "kunchenguid/no-mistakes",
 		currentVersion: "v1.2.2",
 		platform:       platformSpec{GOOS: "darwin", GOARCH: "arm64"},
-		apiBaseURL:     server.URL,
+		manifestURL:    server.URL + "/channels.json",
 		httpClient:     server.Client(),
 		executablePath: execPath,
 		now:            func() time.Time { return time.Date(2026, 4, 9, 12, 0, 0, 0, time.UTC) },
@@ -229,8 +232,8 @@ func TestUpdaterRunRefusesWithActiveRunsAndListsThem(t *testing.T) {
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/repos/kunchenguid/no-mistakes/releases/latest":
-			fmt.Fprintf(w, `{"tag_name":"v1.2.3","assets":[{"name":%q,"browser_download_url":%q},{"name":"checksums.txt","browser_download_url":%q}]}`,
+		case "/channels.json":
+			fmt.Fprintf(w, `{"schema_version":1,"stable":{"tag_name":"v1.2.3","assets":[{"name":%q,"browser_download_url":%q},{"name":"checksums.txt","browser_download_url":%q}]}}`,
 				archiveName,
 				server.URL+"/archive",
 				server.URL+"/checksums",
@@ -282,10 +285,9 @@ func TestUpdaterRunRefusesWithActiveRunsAndListsThem(t *testing.T) {
 	resetCalled := false
 	u := &updater{
 		appName:        "no-mistakes",
-		repo:           "kunchenguid/no-mistakes",
 		currentVersion: "v1.2.2",
 		platform:       platformSpec{GOOS: "darwin", GOARCH: "arm64"},
-		apiBaseURL:     server.URL,
+		manifestURL:    server.URL + "/channels.json",
 		httpClient:     server.Client(),
 		executablePath: execPath,
 		stdout:         stdout,
@@ -385,8 +387,8 @@ func TestUpdaterRunFailsWhenDaemonResetFails(t *testing.T) {
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/repos/kunchenguid/no-mistakes/releases/latest":
-			fmt.Fprintf(w, `{"tag_name":"v1.2.3","assets":[{"name":%q,"browser_download_url":%q},{"name":"checksums.txt","browser_download_url":%q}]}`,
+		case "/channels.json":
+			fmt.Fprintf(w, `{"schema_version":1,"stable":{"tag_name":"v1.2.3","assets":[{"name":%q,"browser_download_url":%q},{"name":"checksums.txt","browser_download_url":%q}]}}`,
 				archiveName,
 				server.URL+"/archive",
 				server.URL+"/checksums",
@@ -410,10 +412,9 @@ func TestUpdaterRunFailsWhenDaemonResetFails(t *testing.T) {
 	stderr := new(bytes.Buffer)
 	u := &updater{
 		appName:        "no-mistakes",
-		repo:           "kunchenguid/no-mistakes",
 		currentVersion: "v1.2.2",
 		platform:       platformSpec{GOOS: "darwin", GOARCH: "arm64"},
-		apiBaseURL:     server.URL,
+		manifestURL:    server.URL + "/channels.json",
 		httpClient:     server.Client(),
 		executablePath: execPath,
 		stdout:         stdout,
@@ -460,8 +461,8 @@ func TestUpdaterRunFailsWhenDaemonResetLeavesDaemonOffline(t *testing.T) {
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/repos/kunchenguid/no-mistakes/releases/latest":
-			fmt.Fprintf(w, `{"tag_name":"v1.2.3","assets":[{"name":%q,"browser_download_url":%q},{"name":"checksums.txt","browser_download_url":%q}]}`,
+		case "/channels.json":
+			fmt.Fprintf(w, `{"schema_version":1,"stable":{"tag_name":"v1.2.3","assets":[{"name":%q,"browser_download_url":%q},{"name":"checksums.txt","browser_download_url":%q}]}}`,
 				archiveName,
 				server.URL+"/archive",
 				server.URL+"/checksums",
@@ -484,10 +485,9 @@ func TestUpdaterRunFailsWhenDaemonResetLeavesDaemonOffline(t *testing.T) {
 	stdout := new(bytes.Buffer)
 	u := &updater{
 		appName:        "no-mistakes",
-		repo:           "kunchenguid/no-mistakes",
 		currentVersion: "v1.2.2",
 		platform:       platformSpec{GOOS: "darwin", GOARCH: "arm64"},
-		apiBaseURL:     server.URL,
+		manifestURL:    server.URL + "/channels.json",
 		httpClient:     server.Client(),
 		executablePath: execPath,
 		stdout:         stdout,
@@ -530,8 +530,8 @@ func TestUpdaterRunFailsWhenDaemonUsesDifferentExecutable(t *testing.T) {
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/repos/kunchenguid/no-mistakes/releases/latest":
-			fmt.Fprintf(w, `{"tag_name":"v1.2.3","assets":[{"name":%q,"browser_download_url":%q},{"name":"checksums.txt","browser_download_url":%q}]}`,
+		case "/channels.json":
+			fmt.Fprintf(w, `{"schema_version":1,"stable":{"tag_name":"v1.2.3","assets":[{"name":%q,"browser_download_url":%q},{"name":"checksums.txt","browser_download_url":%q}]}}`,
 				archiveName,
 				server.URL+"/archive",
 				server.URL+"/checksums",
@@ -575,10 +575,9 @@ func TestUpdaterRunFailsWhenDaemonUsesDifferentExecutable(t *testing.T) {
 	resetCalled := false
 	u := &updater{
 		appName:        "no-mistakes",
-		repo:           "kunchenguid/no-mistakes",
 		currentVersion: "v1.2.2",
 		platform:       platformSpec{GOOS: "darwin", GOARCH: "arm64"},
-		apiBaseURL:     server.URL,
+		manifestURL:    server.URL + "/channels.json",
 		httpClient:     server.Client(),
 		executablePath: execPath,
 		now:            func() time.Time { return time.Date(2026, 4, 9, 12, 0, 0, 0, time.UTC) },
@@ -625,8 +624,8 @@ func TestUpdaterRunReplacesDaemonWhenDifferentExecutableConfirmed(t *testing.T) 
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/repos/kunchenguid/no-mistakes/releases/latest":
-			fmt.Fprintf(w, `{"tag_name":"v1.2.3","assets":[{"name":%q,"browser_download_url":%q},{"name":"checksums.txt","browser_download_url":%q}]}`,
+		case "/channels.json":
+			fmt.Fprintf(w, `{"schema_version":1,"stable":{"tag_name":"v1.2.3","assets":[{"name":%q,"browser_download_url":%q},{"name":"checksums.txt","browser_download_url":%q}]}}`,
 				archiveName,
 				server.URL+"/archive",
 				server.URL+"/checksums",
@@ -682,10 +681,9 @@ func TestUpdaterRunReplacesDaemonWhenDifferentExecutableConfirmed(t *testing.T) 
 			stderr := new(bytes.Buffer)
 			u := &updater{
 				appName:        "no-mistakes",
-				repo:           "kunchenguid/no-mistakes",
 				currentVersion: "v1.2.2",
 				platform:       platformSpec{GOOS: "darwin", GOARCH: "arm64"},
-				apiBaseURL:     server.URL,
+				manifestURL:    server.URL + "/channels.json",
 				httpClient:     server.Client(),
 				executablePath: execPath,
 				stdout:         stdout,
@@ -741,8 +739,8 @@ func TestUpdaterRunFailsWhenDaemonExecutableCannotBeResolved(t *testing.T) {
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/repos/kunchenguid/no-mistakes/releases/latest":
-			fmt.Fprintf(w, `{"tag_name":"v1.2.3","assets":[{"name":%q,"browser_download_url":%q},{"name":"checksums.txt","browser_download_url":%q}]}`,
+		case "/channels.json":
+			fmt.Fprintf(w, `{"schema_version":1,"stable":{"tag_name":"v1.2.3","assets":[{"name":%q,"browser_download_url":%q},{"name":"checksums.txt","browser_download_url":%q}]}}`,
 				archiveName,
 				server.URL+"/archive",
 				server.URL+"/checksums",
@@ -782,10 +780,9 @@ func TestUpdaterRunFailsWhenDaemonExecutableCannotBeResolved(t *testing.T) {
 	resetCalled := false
 	u := &updater{
 		appName:        "no-mistakes",
-		repo:           "kunchenguid/no-mistakes",
 		currentVersion: "v1.2.2",
 		platform:       platformSpec{GOOS: "darwin", GOARCH: "arm64"},
-		apiBaseURL:     server.URL,
+		manifestURL:    server.URL + "/channels.json",
 		httpClient:     server.Client(),
 		executablePath: execPath,
 		now:            func() time.Time { return time.Date(2026, 4, 9, 12, 0, 0, 0, time.UTC) },
@@ -818,8 +815,8 @@ func TestUpdaterRunSkipsDaemonExecutableCheckWhenAlreadyUpToDate(t *testing.T) {
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/repos/kunchenguid/no-mistakes/releases/latest":
-			fmt.Fprint(w, `{"tag_name":"v1.2.2","assets":[]}`)
+		case "/channels.json":
+			fmt.Fprint(w, `{"schema_version":1,"stable":{"tag_name":"v1.2.2","assets":[]}}`)
 		default:
 			t.Fatalf("unexpected path %q", r.URL.Path)
 		}
@@ -850,10 +847,9 @@ func TestUpdaterRunSkipsDaemonExecutableCheckWhenAlreadyUpToDate(t *testing.T) {
 	stdout := new(bytes.Buffer)
 	u := &updater{
 		appName:        "no-mistakes",
-		repo:           "kunchenguid/no-mistakes",
 		currentVersion: "v1.2.2",
 		platform:       platformSpec{GOOS: "darwin", GOARCH: "arm64"},
-		apiBaseURL:     server.URL,
+		manifestURL:    server.URL + "/channels.json",
 		httpClient:     server.Client(),
 		executablePath: execPath,
 		stdout:         stdout,
@@ -934,124 +930,27 @@ func TestUpdaterMaybeNotifyAndCheck(t *testing.T) {
 	}
 }
 
-func TestUpdaterCheckLatestBetaUsesReleasesList(t *testing.T) {
-	allowInsecureDownloads = true
-	t.Cleanup(func() { allowInsecureDownloads = false })
-
-	archiveName := "no-mistakes-v1.3.0-beta.1-darwin-arm64.tar.gz"
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/repos/kunchenguid/no-mistakes/releases":
-			fmt.Fprintf(w, `[
-				{"tag_name":"v1.3.0-beta.1","draft":false,"prerelease":true,"assets":[{"name":%q,"browser_download_url":"http://example.com/archive"},{"name":"checksums.txt","browser_download_url":"http://example.com/checksums"}]},
-				{"tag_name":"v1.2.3","draft":false,"prerelease":false,"assets":[]},
-				{"tag_name":"v1.4.0-draft","draft":true,"prerelease":true,"assets":[]}
-			]`, archiveName)
-		case "/repos/kunchenguid/no-mistakes/tags":
-			fmt.Fprint(w, `[{"name":"v1.3.0-beta.1"},{"name":"v1.2.3"}]`)
-		default:
-			t.Fatalf("unexpected path %q", r.URL.Path)
-		}
-	}))
-	defer server.Close()
-
-	u := &updater{
-		appName:            "no-mistakes",
-		repo:               "kunchenguid/no-mistakes",
-		currentVersion:     "v1.2.3",
-		platform:           platformSpec{GOOS: "darwin", GOARCH: "arm64"},
-		apiBaseURL:         server.URL,
-		httpClient:         server.Client(),
-		cachePath:          filepath.Join(t.TempDir(), "update-check.json"),
-		now:                func() time.Time { return time.Date(2026, 4, 22, 12, 0, 0, 0, time.UTC) },
-		includePrereleases: true,
-	}
-
-	plan, err := u.checkLatest(context.Background())
-	if err != nil {
-		t.Fatalf("checkLatest error = %v", err)
-	}
-	if !plan.UpdateAvailable {
-		t.Fatal("expected update to be available")
-	}
-	if plan.LatestVersion != "v1.3.0-beta.1" {
-		t.Fatalf("LatestVersion = %q", plan.LatestVersion)
-	}
-	if plan.ArchiveName != archiveName {
-		t.Fatalf("ArchiveName = %q", plan.ArchiveName)
-	}
-}
-
-func TestUpdaterCheckLatestBetaPicksHighestSemver(t *testing.T) {
+func TestUpdaterCheckLatestBetaUsesManifest(t *testing.T) {
 	allowInsecureDownloads = true
 	t.Cleanup(func() { allowInsecureDownloads = false })
 
 	archiveName := "no-mistakes-v1.3.0-beta.2-darwin-arm64.tar.gz"
+	var apiHits []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/repos/kunchenguid/no-mistakes/releases":
-			fmt.Fprintf(w, `[
-				{"tag_name":"v1.3.0-beta.1","draft":false,"prerelease":true,"assets":[]},
-				{"tag_name":"v1.3.0-beta.2","draft":false,"prerelease":true,"assets":[{"name":%q,"browser_download_url":"http://example.com/archive"},{"name":"checksums.txt","browser_download_url":"http://example.com/checksums"}]},
-				{"tag_name":"v1.2.3","draft":false,"prerelease":false,"assets":[]}
-			]`, archiveName)
-		case "/repos/kunchenguid/no-mistakes/tags":
-			fmt.Fprint(w, `[{"name":"v1.3.0-beta.2"},{"name":"v1.3.0-beta.1"},{"name":"v1.2.3"}]`)
-		default:
-			t.Fatalf("unexpected path %q", r.URL.Path)
+		if strings.Contains(r.URL.Path, "/repos/") {
+			apiHits = append(apiHits, r.URL.Path)
+			http.Error(w, "rate limited", http.StatusForbidden)
+			return
 		}
+		fmt.Fprintf(w, `{"schema_version":1,"stable":{"tag_name":"v1.2.3","assets":[]},"beta":{"tag_name":"v1.3.0-beta.2","prerelease":true,"assets":[{"name":%q,"browser_download_url":"http://example.com/archive"},{"name":"checksums.txt","browser_download_url":"http://example.com/checksums"}]}}`, archiveName)
 	}))
 	defer server.Close()
 
 	u := &updater{
 		appName:            "no-mistakes",
-		repo:               "kunchenguid/no-mistakes",
 		currentVersion:     "v1.2.3",
 		platform:           platformSpec{GOOS: "darwin", GOARCH: "arm64"},
-		apiBaseURL:         server.URL,
-		httpClient:         server.Client(),
-		cachePath:          filepath.Join(t.TempDir(), "update-check.json"),
-		now:                func() time.Time { return time.Date(2026, 4, 22, 12, 0, 0, 0, time.UTC) },
-		includePrereleases: true,
-	}
-
-	plan, err := u.checkLatest(context.Background())
-	if err != nil {
-		t.Fatalf("checkLatest error = %v", err)
-	}
-	if plan.LatestVersion != "v1.3.0-beta.2" {
-		t.Fatalf("LatestVersion = %q", plan.LatestVersion)
-	}
-}
-
-func TestUpdaterCheckLatestBetaFallsBackToTagsWhenListingStale(t *testing.T) {
-	allowInsecureDownloads = true
-	t.Cleanup(func() { allowInsecureDownloads = false })
-
-	archiveName := "no-mistakes-v1.3.0-beta.1-darwin-arm64.tar.gz"
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/repos/kunchenguid/no-mistakes/releases":
-			fmt.Fprint(w, `[
-				{"tag_name":"v1.2.3","draft":false,"prerelease":false,"assets":[]},
-				{"tag_name":"v1.2.2","draft":false,"prerelease":false,"assets":[]}
-			]`)
-		case "/repos/kunchenguid/no-mistakes/tags":
-			fmt.Fprint(w, `[{"name":"v1.3.0-beta.1"},{"name":"v1.2.3"},{"name":"v1.2.2"}]`)
-		case "/repos/kunchenguid/no-mistakes/releases/tags/v1.3.0-beta.1":
-			fmt.Fprintf(w, `{"tag_name":"v1.3.0-beta.1","draft":false,"prerelease":true,"assets":[{"name":%q,"browser_download_url":"http://example.com/archive"},{"name":"checksums.txt","browser_download_url":"http://example.com/checksums"}]}`, archiveName)
-		default:
-			t.Fatalf("unexpected path %q", r.URL.Path)
-		}
-	}))
-	defer server.Close()
-
-	u := &updater{
-		appName:            "no-mistakes",
-		repo:               "kunchenguid/no-mistakes",
-		currentVersion:     "v1.2.3",
-		platform:           platformSpec{GOOS: "darwin", GOARCH: "arm64"},
-		apiBaseURL:         server.URL,
+		manifestURL:        server.URL + "/releases/download/channels/channels.json",
 		httpClient:         server.Client(),
 		cachePath:          filepath.Join(t.TempDir(), "update-check.json"),
 		now:                func() time.Time { return time.Date(2026, 4, 22, 12, 0, 0, 0, time.UTC) },
@@ -1065,69 +964,14 @@ func TestUpdaterCheckLatestBetaFallsBackToTagsWhenListingStale(t *testing.T) {
 	if !plan.UpdateAvailable {
 		t.Fatal("expected update to be available")
 	}
-	if plan.LatestVersion != "v1.3.0-beta.1" {
+	if plan.LatestVersion != "v1.3.0-beta.2" {
 		t.Fatalf("LatestVersion = %q", plan.LatestVersion)
 	}
 	if plan.ArchiveName != archiveName {
 		t.Fatalf("ArchiveName = %q", plan.ArchiveName)
 	}
-}
-
-func TestUpdaterCheckLatestBetaChecksListedReleaseAfterMissingTags(t *testing.T) {
-	allowInsecureDownloads = true
-	t.Cleanup(func() { allowInsecureDownloads = false })
-
-	archiveName := "no-mistakes-v1.3.0-beta.1-darwin-arm64.tar.gz"
-	tagFetches := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/repos/kunchenguid/no-mistakes/releases":
-			fmt.Fprintf(w, `[
-				{"tag_name":"v1.3.0-beta.1","draft":false,"prerelease":true,"assets":[{"name":%q,"browser_download_url":"http://example.com/archive"},{"name":"checksums.txt","browser_download_url":"http://example.com/checksums"}]},
-				{"tag_name":"v1.2.3","draft":false,"prerelease":false,"assets":[]}
-			]`, archiveName)
-		case "/repos/kunchenguid/no-mistakes/tags":
-			fmt.Fprint(w, `[
-				{"name":"v1.3.0-beta.6"},
-				{"name":"v1.3.0-beta.5"},
-				{"name":"v1.3.0-beta.4"},
-				{"name":"v1.3.0-beta.3"},
-				{"name":"v1.3.0-beta.2"},
-				{"name":"v1.3.0-beta.1"},
-				{"name":"v1.2.3"}
-			]`)
-		default:
-			if strings.HasPrefix(r.URL.Path, "/repos/kunchenguid/no-mistakes/releases/tags/") {
-				tagFetches++
-				http.NotFound(w, r)
-				return
-			}
-			t.Fatalf("unexpected path %q", r.URL.Path)
-		}
-	}))
-	defer server.Close()
-
-	u := &updater{
-		appName:            "no-mistakes",
-		repo:               "kunchenguid/no-mistakes",
-		currentVersion:     "v1.2.3",
-		platform:           platformSpec{GOOS: "darwin", GOARCH: "arm64"},
-		apiBaseURL:         server.URL,
-		httpClient:         server.Client(),
-		cachePath:          filepath.Join(t.TempDir(), "update-check.json"),
-		now:                func() time.Time { return time.Date(2026, 4, 22, 12, 0, 0, 0, time.UTC) },
-		includePrereleases: true,
-	}
-
-	plan, err := u.checkLatest(context.Background())
-	if err != nil {
-		t.Fatalf("checkLatest error = %v", err)
-	}
-	if plan.LatestVersion != "v1.3.0-beta.1" {
-		t.Fatalf("LatestVersion = %q", plan.LatestVersion)
-	}
-	if tagFetches != 5 {
-		t.Fatalf("tagFetches = %d, want 5", tagFetches)
+	if len(apiHits) != 0 {
+		t.Fatalf("REST API paths hit on the beta manifest path: %v", apiHits)
 	}
 }
 

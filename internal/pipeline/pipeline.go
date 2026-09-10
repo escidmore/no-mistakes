@@ -30,7 +30,8 @@ type StepContext struct {
 	Fixing                bool         // true when re-executing after a "fix" action
 	SkipFixExecution      bool         // replay an already-completed fix round's review turn only
 	ReviewStartingHeadSHA string
-	PreviousFindings      string // JSON findings from the previous execution (set during fix loop)
+	PreviousFindings      string // JSON findings selected for the current fix round
+	DeferredFindings      string // JSON findings left unselected when the current fix round began
 	// StepResultID is the DB row ID of the current step's step_results record.
 	// Steps use it to query their own round history for multi-round prompts.
 	StepResultID string
@@ -80,6 +81,14 @@ type StepContext struct {
 	// step in the same run (e.g. the combined document+lint pass).
 	Shared             *RunShared
 	CIReadinessChanged func(ready, declaredNoCI bool)
+	// MarkRunning tells the executor that a step re-executing as a fix round
+	// has finished its repair and is executing normally again, so the step's
+	// status returns from fixing to running before Execute returns. The CI
+	// step needs it: a fix round that publishes a repair keeps monitoring the
+	// pull request afterwards, and both the TUI's active-CI indicator and the
+	// AXI checks-passed outcome read a running status. Nil in embeddings that
+	// never fix.
+	MarkRunning func() error
 	// OnPRMerged is a best-effort hook after a merged PR state is persisted.
 	// Eval uses it to relabel auto-fix/shipped-unfixed gold; nil is a no-op.
 	OnPRMerged func(ctx context.Context, runID string)
@@ -109,11 +118,9 @@ type StepOutcome struct {
 	// CI repairs use it when policy requires revalidation or continuity cannot be
 	// proven, sending the new local head back through review before push.
 	RestartFrom types.StepName
-	// FixSummary, when non-empty, is the agent's one-line commit summary for
-	// the fix attempt performed during this round. Steps populate it in fix
-	// mode so the executor can persist it on the round record and later
-	// rounds can reference what was previously attempted.
-	FixSummary string
+	// FixSummary, when non-empty, records the result of a fix attempt.
+	FixSummary      string
+	RepairPublished bool
 	// ReviewApprovedHeadSHA is set only by a successfully executed full review
 	// round. The executor durably records it only when the review step actually
 	// completes, never while that outcome is parked or after a failed round.
@@ -127,7 +134,7 @@ type StepOutcome struct {
 
 // Step is the interface that each pipeline step implements.
 type Step interface {
-	// Name returns the step's identity in the fixed pipeline sequence.
+	// Name returns the step's identity in the run's pipeline sequence.
 	Name() types.StepName
 
 	// Execute runs the step logic and returns an outcome.

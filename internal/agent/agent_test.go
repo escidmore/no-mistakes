@@ -406,6 +406,9 @@ func TestFinalizeTextResult_WithSchemaPreservesTypeErrorForValidJSON(t *testing.
 			if !strings.Contains(err.Error(), "JSON output must be object") {
 				t.Fatalf("expected object type error, got: %v", err)
 			}
+			if !IsStructuredOutputRejected(err) {
+				t.Fatalf("schema-invalid finalizer output was not classified as correctable: %v", err)
+			}
 		})
 	}
 }

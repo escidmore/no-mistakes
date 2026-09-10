@@ -16,7 +16,7 @@ When `eval sets`, `eval report`, or `eval run` resolves repository fingerprints 
 
 Cases arrive on their own. When an eligible run finishes, its decided Review passes are frozen into the local corpus - one case per pass. Collection happens after the pipeline has already reported its outcome, so it can never change or fail the run; a problem is logged and nothing else.
 
-Two settings in `config.yaml` govern it, both on by default and both documented in [Global configuration](/no-mistakes/reference/global-config/#eval):
+Two settings in `config.yaml` govern review-case collection, both on by default and both documented in [Global configuration](/no-mistakes/reference/global-config/#eval):
 
 - `eval.capture_provenance` records the exact commit and configuration inputs a replay needs. It is written when the review round is written and **cannot be added afterwards**, so a run reviewed with it off is never capturable - not by the automatic path and not by hand.
 - `eval.auto_capture` performs the collection. Turning it off leaves provenance recorded, so runs stay capturable by hand.
@@ -42,6 +42,8 @@ The ingest payload is the source of truth. Eval does not scrape GitHub review co
 
 Automatic collection and `eval capture` do the same freeze, so a case is equally trustworthy either way. Capturing a run that was already collected relabels gold from later merge evidence and otherwise leaves the frozen case in place. `eval miss ingest` can still attach confirmed post-PR-miss gold afterwards.
 
+Automatic collection also runs the false-negative path for a defect CI surfaced. When a finished run's CI step reports a real code finding - a failing check the provider attributes to the job (`ci-check`) or a review bot's comment about the change (`ci-review-bot`) - that auto-fix or the user selected, the following fix round records a published repair, and post-repair checks pass, that finding is by definition a Review false negative: Review passed green and missed it. It is ingested as false-negative gold (`recorded-ci-false-negative`) onto the run's green review case, reading only the structured finding the CI step already persisted per round (its category, check identity, and any file/line the finding recorded). It never enriches from log text, never fabricates a location the finding did not carry, and makes no head/commit or cross-run judgement - a real defect that slipped a green Review is a valid case regardless of which commit introduced it. Excluded are `ci-transient` and other provider/infrastructure failures (no code change clears them), merge conflicts, repairs that produced or published no change, no-CI declarations, terminal PR completion before checks pass, and any finding the human dismissed at the gate rather than fixing. Re-ingesting the same run is a no-op. Like automatic review-case collection, this requires `eval.auto_capture` and `eval.capture_provenance`.
+
 A run is skipped when there is nothing honest to freeze: no Review step, no finished pass, a gate decision the human has not made yet, or rounds recorded before provenance was on. An incomplete later review round (no recorded findings) is skipped so a completed sibling of the same run can still be captured. Capturing a run with nothing capturable reports the reason instead of freezing an incomplete label; for a parked Review, retry after the decision is recorded.
 
 A case includes:
@@ -65,10 +67,11 @@ Capture writes gold from the **recorded gate decision** for a review round - wha
 - A finding the pipeline selected for auto-fix on a run whose PR **merged** is **true-positive** gold (`recorded-auto-fix-merged`): the decision to fix it is the evidence, so a fix a later round re-raised or rewrote is still labeled. Closed-not-merged and still-open runs stay unlabeled until the merge is observed.
 - A finding that was raised (`auto-fix` or `ask-user`, including a missing action that defaults to `ask-user`), **not selected for fix**, and then **shipped in a merged PR** is **false-positive** gold (`recorded-shipped-unfixed`). This is a deliberate operator judgement: a finding you approve and ship without fixing is a false positive in your own corpus. It needs both halves - a recorded gate decision for the round and the merge - and informational `no-op` findings are never labeled this way.
 - A confirmed post-PR miss ingested with `eval miss ingest` is also **false-negative** gold (`recorded-post-pr-miss`): review passed green, and a later vetted finding showed a real defect.
+- A CI finding (`ci-check` or `ci-review-bot`) that a green Review missed, auto-fix or the user selected, the following fix round published, and post-repair checks cleared is **false-negative** gold (`recorded-ci-false-negative`), ingested automatically when the run finishes. `ci-transient`/provider-infra failures, merge conflicts, and dismissed findings are excluded.
 - Skip, approve-with-findings, and abort **without a merge** stay **unlabeled / pending** until later adjudication, and so does any legacy or unresolved round whose gate decision was never recorded, merged or not. Absence of a decision is never read as a judgement.
 - A later replay that raises a new issue absent from the gold set is queued as an unmatched candidate finding. It is never auto-scored as a false positive.
 
-If a PR merges after the first capture, already-captured cases are relabeled. The daemon does this best-effort when it observes the merge; `eval relabel [run-id]` or recapture is the CLI path. Relabel adds merge-derived labels onto previously unlabeled findings and drops obsolete derived merge labels that the current recorded decisions no longer support. Adjudicated, user-fix, and ingested post-PR-miss labels are never overwritten. Relabel and recapture converge in place: repeating either with unchanged source evidence produces the same labels, including for gold findings that lack IDs.
+If a PR merges after the first capture, already-captured cases are relabeled. The daemon does this best-effort when it observes the merge; `eval relabel [run-id]` or recapture is the CLI path. Relabel adds merge-derived labels onto previously unlabeled findings and drops obsolete derived merge labels that the current recorded decisions no longer support. Adjudicated, user-fix, and ingested false-negative labels are never overwritten. Relabel and recapture converge in place: repeating either with unchanged source evidence produces the same labels, including for gold findings that lack IDs.
 
 A case with no finding-level gold is unlabeled / pending, never a pass. True-negative also stays unlabeled because the current capture evidence cannot establish that a finding is invalid without the shipped-unfixed or adjudication paths above.
 
@@ -124,7 +127,7 @@ The replay restores each case into a fresh temporary bare gate and worktree, the
 
 Replay scores each candidate finding against that gold:
 
-- **true-positive**: the candidate raises the same underlying issue as a true-issue gold finding (user Fix, auto-fix-merged, human-added miss, or a confirmed post-PR miss)
+- **true-positive**: the candidate raises the same underlying issue as a true-issue gold finding (user Fix, auto-fix-merged, human-added miss, a confirmed post-PR miss, or an automatically ingested CI miss)
 - **false-negative**: the candidate misses a true-issue gold finding
 - **false-positive**: only when a candidate finding matches explicit false-positive gold (adjudicated invalid, or shipped-unfixed). Unmatched candidate findings are never treated as false positives
 - **pending / unlabeled**: unmatched candidate findings, and cases with no finding-level gold yet
@@ -135,7 +138,7 @@ The report prints recall, precision bounds (adjudicated vs pending-as-FP), and F
 
 `--repeats` defaults to `3` and must be at least `1`. Candidates must use an agent whose model no-mistakes can actually pin. ACP targets such as `cursor` and `acp:<target>` are pinned through `acpx --model`, but they cannot take `effort`; `rovodev` and `antigravity` expose no mechanism at all and are rejected outright. `opencode` needs the `provider/model` form. The per-harness mapping table lives in [`agent_config`](/no-mistakes/reference/global-config/#agent_config).
 
-The replay never inherits this machine's own harness pins: capture strips `agent`, `agent_args_override`, and `agent_config` from the configuration it freezes, so the candidate is the only thing that decides what the harness runs as.
+The replay never inherits this machine's own harness pins: capture strips `agent`, `agent_args_override`, `agent_config`, and `review_agents` from the configuration it freezes, so the candidate is the only thing that decides what the harness runs as.
 
 The earlier `agent+model` candidate spelling was replaced by the key=value form and is no longer accepted; evaluations recorded under it keep their old candidate string and are reported as their own group. Replays are intentionally isolated from the production `NM_HOME` and restore each case into a throwaway worktree; they do not contact the shared no-mistakes daemon. The selected agent uses the operator's normal local harness settings and sign-in (the same HOME-based credential discovery a pipeline run uses) and still communicates with its configured model provider in the normal way. That is not a security sandbox: a candidate may read and write ordinary user-level agent files under HOME, including credential refresh and caches. Review replay stays session-free.
 
@@ -163,4 +166,4 @@ The report is deliberately cautious. It never treats an unadjudicated candidate 
 
 ## Current boundary
 
-Finding-level gold is derived from recorded Fix, add-finding, auto-fix-merged, and shipped-unfixed evidence, plus confirmed post-PR misses ingested through `eval miss ingest`. An adjudication CLI, PR-comment miss scanning, sharing, sync, and full-pipeline replay are not part of this command surface. A live merge, `eval relabel`, or recapture backfills merge-derived labels onto already captured cases.
+Finding-level gold is derived from recorded Fix, add-finding, auto-fix-merged, and shipped-unfixed evidence, confirmed post-PR misses ingested through `eval miss ingest`, and confirmed CI misses ingested automatically after a repaired run finishes green. An adjudication CLI, PR-comment miss scanning, sharing, sync, and full-pipeline replay are not part of this command surface. A live merge, `eval relabel`, or recapture backfills merge-derived labels onto already captured cases.

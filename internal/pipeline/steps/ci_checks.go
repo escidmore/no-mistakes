@@ -11,8 +11,8 @@ import (
 )
 
 type lastFixedIssues struct {
-	Checks        []string `json:"checks,omitempty"`
-	MergeConflict bool     `json:"mergeConflict,omitempty"`
+	Checks        []scm.CheckTarget `json:"checks,omitempty"`
+	MergeConflict bool              `json:"mergeConflict,omitempty"`
 }
 
 // pollInterval returns the polling interval based on elapsed time since CI monitoring started.
@@ -106,36 +106,70 @@ func unresolvedCheckNames(checks []scm.Check) []string {
 // fixTargets). Keying the snapshot on the fail bucket alone would leave a
 // cancelled-only fix round with no completion evidence at all, and the step
 // would then have no way to notice its own re-run.
-func terminalFailureCompletionTimes(checks []scm.Check) map[string]time.Time {
-	completedAt := make(map[string]time.Time)
+type checkFreshness struct {
+	CompletedAt time.Time
+	ExecutionID string
+}
+
+func terminalFailureCompletionTimes(checks []scm.Check) map[string]checkFreshness {
+	freshness := make(map[string]checkFreshness)
 	for _, c := range checks {
 		if !checkFailedTerminally(c) {
 			continue
 		}
-		if c.CompletedAt.IsZero() {
+		executionID := c.ExecutionID
+		if executionID == "" {
+			executionID = c.ProviderID
+		}
+		if c.CompletedAt.IsZero() && executionID == "" {
 			continue
 		}
-		previous := completedAt[c.Name]
-		if previous.IsZero() || c.CompletedAt.After(previous) {
-			completedAt[c.Name] = c.CompletedAt
+		key := checkTrackingKey(c)
+		previous := freshness[key]
+		if previous.CompletedAt.IsZero() || c.CompletedAt.After(previous.CompletedAt) {
+			freshness[key] = checkFreshness{CompletedAt: c.CompletedAt, ExecutionID: executionID}
 		}
 	}
-	if len(completedAt) == 0 {
+	if len(freshness) == 0 {
 		return nil
 	}
-	return completedAt
+	return freshness
 }
 
-func terminalFailureCompletedAfter(checks []scm.Check, after map[string]time.Time) bool {
+func completionTimesForTargets(completedAt map[string]checkFreshness, targets []scm.CheckTarget) map[string]checkFreshness {
+	selected := make(map[string]checkFreshness, len(targets))
+	for _, target := range targets {
+		key := checkTargetTrackingKey(target)
+		if freshness, ok := completedAt[key]; ok {
+			selected[key] = freshness
+		}
+	}
+	if len(selected) == 0 {
+		return nil
+	}
+	return selected
+}
+
+func terminalFailureCompletedAfter(checks []scm.Check, after map[string]checkFreshness) bool {
 	if len(after) == 0 {
 		return false
 	}
 	for _, c := range checks {
-		if !checkFailedTerminally(c) || c.CompletedAt.IsZero() {
+		if !checkFailedTerminally(c) {
 			continue
 		}
-		previous, ok := after[c.Name]
-		if ok && c.CompletedAt.After(previous) {
+		previous, ok := after[checkTrackingKey(c)]
+		if !ok {
+			continue
+		}
+		executionID := c.ExecutionID
+		if executionID == "" {
+			executionID = c.ProviderID
+		}
+		if executionID != "" && previous.ExecutionID != "" && executionID != previous.ExecutionID {
+			return true
+		}
+		if !c.CompletedAt.IsZero() && c.CompletedAt.After(previous.CompletedAt) {
 			return true
 		}
 	}
@@ -148,14 +182,7 @@ func pendingCheckMatchesLastFixed(checks []scm.Check, lastFixedChecks string) bo
 		return false
 	}
 
-	failedNames := map[string]struct{}{}
-	for _, name := range issues.Checks {
-		if name == "" {
-			continue
-		}
-		failedNames[name] = struct{}{}
-	}
-	if len(failedNames) == 0 {
+	if len(issues.Checks) == 0 {
 		return issues.MergeConflict && hasPendingChecks(checks)
 	}
 
@@ -163,19 +190,21 @@ func pendingCheckMatchesLastFixed(checks []scm.Check, lastFixedChecks string) bo
 		if !c.Pending() {
 			continue
 		}
-		if _, ok := failedNames[c.Name]; ok {
-			return true
+		for _, target := range issues.Checks {
+			if checkMatchesTarget(c, target) {
+				return true
+			}
 		}
 	}
 
 	return false
 }
 
-func encodeLastFixedChecks(failing []string, mergeConflict bool) string {
-	if len(failing) == 0 && !mergeConflict {
+func encodeLastFixedChecks(checks []scm.CheckTarget, mergeConflict bool) string {
+	if len(checks) == 0 && !mergeConflict {
 		return ""
 	}
-	encoded, err := json.Marshal(lastFixedIssues{Checks: failing, MergeConflict: mergeConflict})
+	encoded, err := json.Marshal(lastFixedIssues{Checks: checks, MergeConflict: mergeConflict})
 	if err != nil {
 		return ""
 	}
@@ -196,18 +225,79 @@ func decodeLastFixedChecks(raw string) (lastFixedIssues, bool) {
 	return issues, true
 }
 
-func ciFailureOutcome(failing []string, mergeConflict bool, summary string) *pipeline.StepOutcome {
+// lastRepairStillUnverified reports whether every issue the last published
+// repair targeted is still terminally failed, meaning the provider has not
+// yet re-run those checks against the repaired head. The two clears that
+// prove a re-run happened - a newer completion (terminalFailureCompletedAfter)
+// and the fixed check observed pending (pendingCheckMatchesLastFixed) - empty
+// lastFixedChecks before this is asked, so an unverified repair is exactly
+// one whose targets are all still red as they were. A target that cleared, or
+// a conflict that resolved, is the provider acting on the repair and makes
+// the observation fresh.
+func (s *CIStep) lastRepairStillUnverified(checks []scm.Check, mergeConflict bool) bool {
+	issues, ok := decodeLastFixedChecks(s.lastFixedChecks)
+	if !ok {
+		return false
+	}
+	if issues.MergeConflict && !mergeConflict {
+		return false
+	}
+	for _, target := range issues.Checks {
+		if !checkTargetFailedTerminally(checks, target) {
+			return false
+		}
+	}
+	return true
+}
+
+func checkTargetFailedTerminally(checks []scm.Check, target scm.CheckTarget) bool {
+	for _, check := range checks {
+		if checkMatchesTarget(check, target) && checkFailedTerminally(check) {
+			return true
+		}
+	}
+	return false
+}
+
+func checkMatchesTarget(check scm.Check, target scm.CheckTarget) bool {
+	if target.ProviderID != "" {
+		return check.ProviderID == target.ProviderID
+	}
+	return check.Name == target.Name
+}
+
+func checkTrackingKey(check scm.Check) string {
+	return checkTargetTrackingKey(scm.CheckTarget{Name: check.Name, ProviderID: check.ProviderID})
+}
+
+func checkTargetTrackingKey(target scm.CheckTarget) string {
+	if target.ProviderID != "" {
+		return "id:" + target.ProviderID
+	}
+	return target.Name
+}
+
+// ciFailureOutcome parks the step over issues that are still present when
+// the idle timeout ends monitoring. Nothing here is a fresh observation the
+// executor could act on, so every item is ask-user.
+func ciFailureOutcome(failing []scm.CheckTarget, mergeConflict bool, summary string) *pipeline.StepOutcome {
 	findings := Findings{Summary: summary}
-	for _, name := range failing {
+	for _, target := range failing {
 		findings.Items = append(findings.Items, Finding{
 			Severity:    "warning",
-			Description: fmt.Sprintf("CI check failing: %s", name),
+			Description: fmt.Sprintf("CI check failing: %s", target.Name),
+			Action:      types.ActionAskUser,
+			Category:    types.FindingCategoryCICheck,
+			Check:       target.Name,
+			CheckID:     target.ProviderID,
 		})
 	}
 	if mergeConflict {
 		findings.Items = append(findings.Items, Finding{
 			Severity:    "warning",
 			Description: "PR has merge conflicts with the base branch",
+			Action:      types.ActionAskUser,
+			Category:    types.FindingCategoryCIMergeConflict,
 		})
 	}
 	findingsJSON, _ := json.Marshal(findings)
@@ -227,6 +317,20 @@ const consecutiveCheckErrorLimit = 6
 // ConsecutiveCheckErrorLimit is the parked-after-N-failures bound. Tests in
 // other packages share this so they cannot drift from the monitor's gate.
 func ConsecutiveCheckErrorLimit() int { return consecutiveCheckErrorLimit }
+
+func terminalCheckTargetsForNames(checks []scm.Check, names []string) []scm.CheckTarget {
+	wanted := make(map[string]bool, len(names))
+	for _, name := range names {
+		wanted[name] = true
+	}
+	var targets []scm.CheckTarget
+	for _, check := range checks {
+		if wanted[check.Name] && checkFailedTerminally(check) {
+			targets = append(targets, scm.CheckTarget{Name: check.Name, ProviderID: check.ProviderID})
+		}
+	}
+	return targets
+}
 
 func ciCheckReadFailureOutcome(err error) *pipeline.StepOutcome {
 	findings := Findings{
@@ -271,6 +375,7 @@ func ciFixAgentTimeoutOutcome(issueDesc string, dirtyWorktree string, err error)
 	findings := Findings{
 		Summary: "CI auto-fix agent exceeded its invocation budget",
 		Items: []Finding{{
+			ID:          "ci-fix-agent-timeout",
 			Severity:    "warning",
 			Description: description,
 			Action:      types.ActionAskUser,

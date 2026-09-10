@@ -513,7 +513,11 @@ func (h *Host) getPRChecks(ctx context.Context, selector string) ([]scm.Check, e
 	return checks, nil
 }
 
-const commitChecksQuery = `query($owner:String!,$name:String!,$oid:String!,$cursor:String){repository(owner:$owner,name:$name){object(expression:$oid){... on Commit{statusCheckRollup{contexts(first:100,after:$cursor){nodes{__typename ... on CheckRun{name status conclusion completedAt startedAt detailsUrl} ... on StatusContext{context state targetUrl}} pageInfo{hasNextPage endCursor}}}}}}}`
+// commitChecksQuery reads the head commit's check rollup. A CheckRun also
+// carries its check suite's app slug: that is the structural identity the CI
+// step uses to tell a third-party review bot's check (scm.ReviewBots) from the
+// repository's own Actions jobs, without matching check names.
+const commitChecksQuery = `query($owner:String!,$name:String!,$oid:String!,$cursor:String){repository(owner:$owner,name:$name){object(expression:$oid){... on Commit{statusCheckRollup{contexts(first:100,after:$cursor){nodes{__typename ... on CheckRun{databaseId name status conclusion completedAt startedAt detailsUrl checkSuite{app{slug}}} ... on StatusContext{id context state targetUrl}} pageInfo{hasNextPage endCursor}}}}}}}`
 
 const reviewThreadsQuery = `query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$cursor){nodes{isResolved comments(first:100){nodes{databaseId body path line url createdAt author{login}}}} pageInfo{hasNextPage endCursor}}}}}`
 
@@ -547,15 +551,22 @@ func (h *Host) getCommitChecks(ctx context.Context, headSHA string) ([]scm.Check
 							Contexts struct {
 								Nodes []struct {
 									Type        string `json:"__typename"`
+									DatabaseID  int64  `json:"databaseId"`
+									ID          string `json:"id"`
 									Name        string `json:"name"`
 									Status      string `json:"status"`
 									Conclusion  string `json:"conclusion"`
 									CompletedAt string `json:"completedAt"`
 									StartedAt   string `json:"startedAt"`
 									DetailsURL  string `json:"detailsUrl"`
-									Context     string `json:"context"`
-									State       string `json:"state"`
-									TargetURL   string `json:"targetUrl"`
+									CheckSuite  *struct {
+										App *struct {
+											Slug string `json:"slug"`
+										} `json:"app"`
+									} `json:"checkSuite"`
+									Context   string `json:"context"`
+									State     string `json:"state"`
+									TargetURL string `json:"targetUrl"`
 								} `json:"nodes"`
 								PageInfo struct {
 									HasNextPage bool   `json:"hasNextPage"`
@@ -583,6 +594,9 @@ func (h *Host) getCommitChecks(ctx context.Context, headSHA string) ([]scm.Check
 			case "CheckRun":
 				check.Kind = scm.CheckKindRun
 				check.Name = strings.TrimSpace(node.Name)
+				if node.DatabaseID != 0 {
+					check.ProviderID = fmt.Sprintf("github-check-run:%d", node.DatabaseID)
+				}
 				check.State = strings.ToUpper(strings.TrimSpace(node.Conclusion))
 				if check.State == "" {
 					check.State = strings.ToUpper(strings.TrimSpace(node.Status))
@@ -592,6 +606,9 @@ func (h *Host) getCommitChecks(ctx context.Context, headSHA string) ([]scm.Check
 					check.Bucket = normalizeCheckBucket("", node.Status)
 				}
 				check.Link = strings.TrimSpace(node.DetailsURL)
+				if node.CheckSuite != nil && node.CheckSuite.App != nil {
+					check.App = strings.TrimSpace(node.CheckSuite.App.Slug)
+				}
 				if parsed, parseErr := time.Parse(time.RFC3339, node.CompletedAt); parseErr == nil {
 					check.CompletedAt = parsed
 				}
@@ -601,6 +618,9 @@ func (h *Host) getCommitChecks(ctx context.Context, headSHA string) ([]scm.Check
 			case "StatusContext":
 				check.Kind = scm.CheckKindStatus
 				check.Name = strings.TrimSpace(node.Context)
+				if node.ID != "" {
+					check.ProviderID = "github-status:" + node.ID
+				}
 				check.State = strings.ToUpper(strings.TrimSpace(node.State))
 				check.Bucket = normalizeCheckBucket("", node.State)
 				check.Link = strings.TrimSpace(node.TargetURL)
@@ -862,7 +882,7 @@ func (h *Host) getWorkflowRunChecks(ctx context.Context, headSHA string) ([]scm.
 			}
 			link = fmt.Sprintf("https://%s/%s/actions/runs/%d", host, repo, run.ID)
 		}
-		checks = append(checks, scm.Check{Name: name, Bucket: bucket, Kind: scm.CheckKindRun, State: state, CompletedAt: completedAt, StartedAt: startedAt, WorkflowID: run.WorkflowID, Link: link})
+		checks = append(checks, scm.Check{Name: name, ProviderID: fmt.Sprintf("github-workflow-run:%d", run.ID), Bucket: bucket, Kind: scm.CheckKindRun, State: state, CompletedAt: completedAt, StartedAt: startedAt, WorkflowID: run.WorkflowID, Link: link})
 	}
 	return checks, nil
 }
@@ -1080,19 +1100,35 @@ func (h *Host) GetMergeableState(ctx context.Context, pr *scm.PR) (scm.Mergeable
 	return normalizeMergeableState(strings.TrimSpace(string(out))), nil
 }
 
-func (h *Host) FetchFailedCheckLogs(ctx context.Context, _ *scm.PR, branch, headSHA string, failingNames []string) (string, error) {
-	if len(failingNames) == 0 {
-		return "", nil
-	}
-	targets := make(map[string]struct{}, len(failingNames))
+func (h *Host) FetchFailedCheckLogs(ctx context.Context, pr *scm.PR, branch, headSHA string, failingNames []string) (string, error) {
+	targets := make([]scm.CheckTarget, 0, len(failingNames))
 	for _, name := range failingNames {
-		name = normalizeRunName(name)
-		if name != "" {
-			targets[name] = struct{}{}
+		targets = append(targets, scm.CheckTarget{Name: name})
+	}
+	logs, err := h.FetchFailedCheckTargetLogs(ctx, pr, branch, headSHA, targets)
+	if err != nil {
+		return "", err
+	}
+	return scm.CombineFailedCheckLogs(logs)
+}
+
+func (h *Host) FetchFailedCheckTargetLogs(ctx context.Context, _ *scm.PR, branch, headSHA string, checkTargets []scm.CheckTarget) ([]scm.FailedCheckLog, error) {
+	if len(checkTargets) == 0 {
+		return nil, nil
+	}
+	names := make(map[string]struct{}, len(checkTargets))
+	ids := make(map[string]struct{}, len(checkTargets))
+	for _, target := range checkTargets {
+		if id := strings.TrimSpace(target.ProviderID); id != "" {
+			ids[id] = struct{}{}
+			continue
+		}
+		if name := normalizeRunName(target.Name); name != "" {
+			names[name] = struct{}{}
 		}
 	}
-	if len(targets) == 0 {
-		return "", nil
+	if len(names) == 0 && len(ids) == 0 {
+		return nil, nil
 	}
 	args := []string{"run", "list", "--branch", branch}
 	if strings.TrimSpace(headSHA) != "" {
@@ -1107,29 +1143,67 @@ func (h *Host) FetchFailedCheckLogs(ctx context.Context, _ *scm.PR, branch, head
 	listCmd := h.cmd(ctx, "gh", args...)
 	listOut, err := listCmd.Output()
 	if err != nil {
-		return "", nil
+		return nil, fmt.Errorf("list GitHub runs for selected logs: %w", err)
 	}
 	var runs []githubRun
 	if err := json.Unmarshal(listOut, &runs); err != nil {
-		return "", nil
+		return nil, fmt.Errorf("parse GitHub runs for selected logs: %w", err)
 	}
+	results := make([]scm.FailedCheckLog, len(checkTargets))
+	for i, target := range checkTargets {
+		results[i].Target = target
+	}
+	matched := make(map[string]bool, len(ids))
 	for _, run := range runs {
-		if !runMatchesTargets(ctx, h, run, targets) {
-			continue
+		workflowID := fmt.Sprintf("github-workflow-run:%d", run.DatabaseID)
+		_, exactWorkflow := ids[workflowID]
+		nameMatch := runMatchesTargets(ctx, h, run, names)
+		if exactWorkflow || nameMatch {
+			viewArgs := append([]string{"run", "view", fmt.Sprintf("%d", run.DatabaseID)}, h.repoArgs()...)
+			viewArgs = append(viewArgs, "--log-failed")
+			out, fetchErr := h.cmd(ctx, "gh", viewArgs...).Output()
+			for i, target := range checkTargets {
+				matches := target.ProviderID == workflowID
+				if target.ProviderID == "" && nameMatch {
+					matches = true
+				}
+				if !matches {
+					continue
+				}
+				matched[target.Identity()] = true
+				results[i].Output = strings.TrimSpace(string(out))
+				if fetchErr != nil {
+					results[i].Err = fmt.Errorf("fetch GitHub run %d failed logs: %w", run.DatabaseID, fetchErr)
+				}
+			}
 		}
-		viewArgs := append([]string{"run", "view", fmt.Sprintf("%d", run.DatabaseID)}, h.repoArgs()...)
-		viewArgs = append(viewArgs, "--log-failed")
-		viewCmd := h.cmd(ctx, "gh", viewArgs...)
-		out, err := viewCmd.Output()
+		jobIDs, err := selectedRunJobIDs(ctx, h, run, ids)
 		if err != nil {
 			continue
 		}
-		logs := strings.TrimSpace(string(out))
-		if logs != "" {
-			return logs, nil
+		for _, jobID := range jobIDs {
+			jobProviderID := fmt.Sprintf("github-check-run:%d", jobID)
+			viewArgs := append([]string{"run", "view", fmt.Sprintf("%d", run.DatabaseID)}, h.repoArgs()...)
+			viewArgs = append(viewArgs, "--job", strconv.Itoa(jobID), "--log")
+			out, fetchErr := h.cmd(ctx, "gh", viewArgs...).Output()
+			for i, target := range checkTargets {
+				if target.ProviderID != jobProviderID {
+					continue
+				}
+				matched[target.Identity()] = true
+				results[i].Output = strings.TrimSpace(string(out))
+				if fetchErr != nil {
+					results[i].Err = fmt.Errorf("fetch GitHub job %d log: %w", jobID, fetchErr)
+				}
+			}
 		}
 	}
-	return "", nil
+	for i, target := range checkTargets {
+		if !matched[target.Identity()] {
+			results[i].Err = fmt.Errorf("selected GitHub check %q was not found", target.Identity())
+		}
+	}
+	return results, nil
 }
 
 type githubRun struct {
@@ -1159,7 +1233,40 @@ type githubJobStep struct {
 	Conclusion string `json:"conclusion"`
 }
 
+func selectedRunJobIDs(ctx context.Context, h *Host, run githubRun, targets map[string]struct{}) ([]int, error) {
+	hasCheckRunTarget := false
+	for target := range targets {
+		if strings.HasPrefix(target, "github-check-run:") {
+			hasCheckRunTarget = true
+			break
+		}
+	}
+	if !hasCheckRunTarget || run.DatabaseID == 0 {
+		return nil, nil
+	}
+	viewArgs := append([]string{"run", "view", fmt.Sprintf("%d", run.DatabaseID)}, h.repoArgs()...)
+	viewArgs = append(viewArgs, "--json", "jobs")
+	out, err := h.cmd(ctx, "gh", viewArgs...).Output()
+	if err != nil {
+		return nil, fmt.Errorf("list GitHub run %d jobs for selected logs: %w", run.DatabaseID, err)
+	}
+	var view githubRunView
+	if err := json.Unmarshal(out, &view); err != nil {
+		return nil, fmt.Errorf("parse GitHub run %d jobs for selected logs: %w", run.DatabaseID, err)
+	}
+	var ids []int
+	for _, job := range view.Jobs {
+		if _, ok := targets[fmt.Sprintf("github-check-run:%d", job.DatabaseID)]; ok {
+			ids = append(ids, job.DatabaseID)
+		}
+	}
+	return ids, nil
+}
+
 func runMatchesTargets(ctx context.Context, h *Host, run githubRun, targets map[string]struct{}) bool {
+	if len(targets) == 0 {
+		return false
+	}
 	for _, candidate := range []string{run.Name, run.DisplayTitle, run.WorkflowName} {
 		if _, ok := targets[normalizeRunName(candidate)]; ok {
 			return true
@@ -1347,7 +1454,7 @@ func (h *Host) GetReviewComments(ctx context.Context, pr *scm.PR) ([]scm.ReviewC
 				continue
 			}
 			for _, raw := range thread.Comments.Nodes {
-				if raw.Author == nil || !isSupportedReviewBot(raw.Author.Login) {
+				if raw.Author == nil || !scm.IsReviewBotLogin(raw.Author.Login) {
 					continue
 				}
 				line := 0
@@ -1374,13 +1481,4 @@ func (h *Host) GetReviewComments(ctx context.Context, pr *scm.PR) ([]scm.ReviewC
 		cursor = threads.PageInfo.EndCursor
 	}
 	return comments, nil
-}
-
-func isSupportedReviewBot(login string) bool {
-	switch strings.ToLower(strings.TrimSpace(login)) {
-	case "greptile-apps[bot]", "greptile-apps":
-		return true
-	default:
-		return false
-	}
 }

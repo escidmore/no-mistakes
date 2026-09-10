@@ -308,7 +308,7 @@ func runHappyPath(t *testing.T, agentName string) {
 		assertReviewAgentErrorRun(t, h)
 		assertReviewExistingBranchUsesMergeBaseScope(t, h)
 		assertExplicitAttachUsesRepoWideActiveRun(t, h)
-		assertTestMalformedStructuredOutputRun(t, h)
+		assertTestMalformedStructuredOutputCorrectedRun(t, h)
 		assertLintMalformedStructuredOutputRun(t, h)
 		assertDocumentWarningRun(t, h)
 		assertDocumentInfoRun(t, h)
@@ -1691,23 +1691,27 @@ func assertExplicitAttachUsesRepoWideActiveRun(t *testing.T, h *Harness) {
 	}
 }
 
-func assertTestMalformedStructuredOutputRun(t *testing.T, h *Harness) {
+func assertTestMalformedStructuredOutputCorrectedRun(t *testing.T, h *Harness) {
 	t.Helper()
 	h.CommitChange("test-malformed-structured-output", "test-malformed-structured-output.txt", "test malformed structured output\n", "add test malformed structured output")
 	h.PushToGate("test-malformed-structured-output")
 	run := h.WaitForRun("test-malformed-structured-output", 60*time.Second)
-	if run.Status != types.RunFailed {
-		t.Fatalf("test-malformed-structured-output run status=%s error=%v, want failed: malformed analyzer output must not pass the Test step", run.Status, deref(run.Error))
+	if run.Status != types.RunCompleted {
+		t.Fatalf("test-malformed-structured-output run status=%s error=%v, want completed after analyzer correction", run.Status, deref(run.Error))
 	}
 	testStep, ok := findStep(run.Steps, types.StepTest)
 	if !ok {
 		t.Fatal("expected test step in test-malformed-structured-output run")
 	}
-	if testStep.Status != types.StepStatusFailed {
-		t.Fatalf("expected test step to fail on malformed analyzer output, got %s", testStep.Status)
+	if testStep.Status != types.StepStatusCompleted {
+		t.Fatalf("expected test step to complete after malformed analyzer output was corrected, got %s", testStep.Status)
 	}
-	if testStep.Error == nil || !strings.Contains(*testStep.Error, "validate test analyzer findings") {
-		t.Fatalf("expected test step error to name the analyzer output contract, got %q", deref(testStep.Error))
+	if !sawPromptContainingAll(h.AgentInvocations(),
+		"Your previous structured findings were REJECTED",
+		"This is a correction-only turn",
+		`{"summary":123}`,
+	) {
+		t.Fatal("expected malformed analyzer payload to trigger a correction-only agent invocation")
 	}
 }
 

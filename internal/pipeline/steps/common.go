@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
@@ -66,14 +67,8 @@ func unmarshalRequiredTestFindings(raw []byte, findings *Findings) error {
 		Artifacts      *[]struct {
 			Label *string `json:"label"`
 		} `json:"artifacts"`
-		Scenarios *[]struct {
-			Name     *string `json:"name"`
-			Result   *string `json:"result"`
-			Live     *bool   `json:"live"`
-			Evidence *string `json:"evidence"`
-			Reason   *string `json:"reason"`
-		} `json:"scenarios"`
-		Verdict *string `json:"verdict"`
+		Scenarios *[]testScenarioContractFields `json:"scenarios"`
+		Verdict   *string                       `json:"verdict"`
 	}
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return err
@@ -117,54 +112,93 @@ func unmarshalRequiredTestFindings(raw []byte, findings *Findings) error {
 		return fmt.Errorf("missing scenarios array")
 	}
 	if len(*payload.Scenarios) == 0 {
-		return fmt.Errorf("empty scenarios array")
+		return fmt.Errorf("empty scenarios array - report at least one named scenario; if nothing could be driven, return it as untested with a reason")
 	}
+	var issues []string
 	for i, scenario := range *payload.Scenarios {
-		if scenario.Name == nil || strings.TrimSpace(*scenario.Name) == "" {
-			return fmt.Errorf("scenario %d missing name", i)
-		}
-		if scenario.Result == nil {
-			return fmt.Errorf("scenario %d missing result", i)
-		}
-		if !types.IsKnownScenarioResult(*scenario.Result) {
-			return fmt.Errorf("scenario %d result %q is not one of %s", i, *scenario.Result, strings.Join(types.KnownScenarioResults(), ", "))
-		}
-		if scenario.Live == nil {
-			return fmt.Errorf("scenario %d missing live", i)
-		}
-		if scenario.Evidence == nil {
-			return fmt.Errorf("scenario %d missing evidence", i)
-		}
-		if scenario.Reason == nil {
-			return fmt.Errorf("scenario %d missing reason", i)
-		}
-		if *scenario.Result != types.ScenarioResultUntested && strings.TrimSpace(*scenario.Evidence) == "" {
-			return fmt.Errorf("scenario %d result %q missing evidence", i, *scenario.Result)
-		}
-		if *scenario.Result == types.ScenarioResultUntested && *scenario.Live {
-			return fmt.Errorf("scenario %d is untested but marked live", i)
-		}
-		if *scenario.Result != types.ScenarioResultUntested && !*scenario.Live {
-			return fmt.Errorf("scenario %d result %q requires live validation", i, *scenario.Result)
-		}
-		if *scenario.Result == types.ScenarioResultUntested && strings.TrimSpace(*scenario.Reason) == "" {
-			return fmt.Errorf("scenario %d untested without a reason", i)
-		}
+		issues = append(issues, scenarioContractIssues(i, scenario)...)
 	}
 	if payload.Verdict == nil {
-		return fmt.Errorf("missing verdict")
-	}
-	if !types.IsKnownTestVerdict(*payload.Verdict) {
-		return fmt.Errorf("verdict %q is not one of %s", *payload.Verdict, strings.Join(types.KnownTestVerdicts(), ", "))
-	}
-	if *payload.Verdict != types.TestVerdictNoGo {
-		for i, scenario := range *payload.Scenarios {
-			if *scenario.Result == types.ScenarioResultFail {
-				return fmt.Errorf("verdict %q contradicts failed scenario %d", *payload.Verdict, i)
+		issues = append(issues, "missing verdict - set verdict to "+strings.Join(types.KnownTestVerdicts(), ", "))
+	} else if !types.IsKnownTestVerdict(*payload.Verdict) {
+		issues = append(issues, fmt.Sprintf("verdict %q is not one of %s", *payload.Verdict, strings.Join(types.KnownTestVerdicts(), ", ")))
+	} else {
+		if *payload.Verdict != types.TestVerdictNoGo {
+			for i, scenario := range *payload.Scenarios {
+				if scenario.Result != nil && *scenario.Result == types.ScenarioResultFail {
+					issues = append(issues, fmt.Sprintf("verdict %q contradicts failed scenario %d - a fail scenario requires verdict %q", *payload.Verdict, i+1, types.TestVerdictNoGo))
+				}
+			}
+		}
+		// no-surface is the ask-user park for a change with nothing to drive
+		// live. A pass, fail, or live mark means there was a live-exercisable
+		// scenario, so treating that as no-surface would let a skipped or
+		// failed live validation masquerade as "nothing to test".
+		if *payload.Verdict == types.TestVerdictNoSurface && !types.NoLiveExercisableScenarios(findings.Scenarios) {
+			contradicted := false
+			for i, scenario := range findings.Scenarios {
+				if scenario.Live || scenario.Result != types.ScenarioResultUntested {
+					issues = append(issues, fmt.Sprintf("verdict %q contradicts live-exercisable scenario %d - no-surface requires every scenario untested and not live; if you drove or claimed a pass/fail, use go, no-go, or inconclusive instead", *payload.Verdict, i+1))
+					contradicted = true
+				}
+			}
+			if !contradicted {
+				issues = append(issues, fmt.Sprintf("verdict %q contradicts live-exercisable scenario", *payload.Verdict))
 			}
 		}
 	}
+	if len(issues) > 0 {
+		return fmt.Errorf("%s", strings.Join(issues, "\n"))
+	}
 	return nil
+}
+
+type testScenarioContractFields struct {
+	Name     *string `json:"name"`
+	Result   *string `json:"result"`
+	Live     *bool   `json:"live"`
+	Evidence *string `json:"evidence"`
+	Reason   *string `json:"reason"`
+}
+
+func scenarioContractIssues(i int, scenario testScenarioContractFields) []string {
+	n := i + 1
+	var issues []string
+	if scenario.Name == nil || strings.TrimSpace(*scenario.Name) == "" {
+		issues = append(issues, fmt.Sprintf("scenario %d: missing name - every scenario needs a non-empty name describing what an end user does", n))
+	}
+	knownResult := scenario.Result != nil && types.IsKnownScenarioResult(*scenario.Result)
+	if scenario.Result == nil {
+		issues = append(issues, fmt.Sprintf("scenario %d: missing result - set result to %s", n, strings.Join(types.KnownScenarioResults(), ", ")))
+	} else if !knownResult {
+		issues = append(issues, fmt.Sprintf("scenario %d: result %q is not one of %s", n, *scenario.Result, strings.Join(types.KnownScenarioResults(), ", ")))
+	}
+	if scenario.Live == nil {
+		issues = append(issues, fmt.Sprintf("scenario %d: missing live - set live true only when you drove this against the real product in this run", n))
+	}
+	if scenario.Evidence == nil {
+		issues = append(issues, fmt.Sprintf("scenario %d: missing evidence", n))
+	}
+	if scenario.Reason == nil {
+		issues = append(issues, fmt.Sprintf("scenario %d: missing reason", n))
+	}
+	if !knownResult {
+		return issues
+	}
+	result := *scenario.Result
+	if result != types.ScenarioResultUntested && scenario.Evidence != nil && strings.TrimSpace(*scenario.Evidence) == "" {
+		issues = append(issues, fmt.Sprintf("scenario %d: result %q missing evidence - cite the command, artifact, or evidence file that shows this live result", n, result))
+	}
+	if scenario.Live != nil && result == types.ScenarioResultUntested && *scenario.Live {
+		issues = append(issues, fmt.Sprintf("scenario %d: result %q but live=true - untested scenarios must set live=false; live=true is only for scenarios you drove against the real product", n, result))
+	}
+	if scenario.Live != nil && result != types.ScenarioResultUntested && !*scenario.Live {
+		issues = append(issues, fmt.Sprintf("scenario %d: result %q but live=false - if you did not drive this against the live product, mark it result %q with a reason instead of %q", n, result, types.ScenarioResultUntested, result))
+	}
+	if result == types.ScenarioResultUntested && scenario.Reason != nil && strings.TrimSpace(*scenario.Reason) == "" {
+		issues = append(issues, fmt.Sprintf("scenario %d: result %q without a reason - name the specific tool, credential, permission, or authority that stopped you, and how to provide it", n, result))
+	}
+	return issues
 }
 
 // findingsSchema is the JSON schema for structured findings output.
@@ -255,8 +289,8 @@ var testFindingsSchema = json.RawMessage(`{
 		},
 		"verdict": {
 			"type": "string",
-			"enum": ["go", "no-go", "inconclusive"],
-			"description": "go when every scenario that could be driven passed and nothing untested puts the intent in doubt; no-go when a scenario failed or the change is not safe to ship; inconclusive when too little could be driven live to judge"
+			"enum": ["go", "no-go", "inconclusive", "no-surface"],
+			"description": "go when every scenario that could be driven passed and nothing untested puts the intent in doubt; no-go when a scenario failed or the change is not safe to ship; inconclusive when the change has a live-exercisable product surface but too little could be driven live to judge; no-surface when this change has no runtime product surface no-mistakes can drive live"
 		}
 	},
 	"required": ["findings", "summary", "tested", "testing_summary", "artifacts", "scenarios", "verdict"]
@@ -297,7 +331,27 @@ var reviewFindingsSchema = json.RawMessage(`{
 	"required": ["findings", "risk_level", "risk_rationale", "risk_scope"]
 }`)
 
-// AllSteps returns the fixed pipeline step sequence.
+// WithCustomGates returns the run's step sequence: the given core pipeline
+// with each repository-declared gate inserted immediately after its anchor core
+// step. The core sequence is never reordered and never loses a member, so the
+// gates a repository adds can only lengthen what a pass means.
+func WithCustomGates(core []pipeline.Step, gates []config.Gate) []pipeline.Step {
+	if len(gates) == 0 || IsDemoMode() {
+		return core
+	}
+	anchored := make(map[types.StepName][]pipeline.Step, len(gates))
+	for _, gate := range gates {
+		anchored[gate.After] = append(anchored[gate.After], &CustomGateStep{Gate: gate})
+	}
+	sequence := make([]pipeline.Step, 0, len(core)+len(gates))
+	for _, step := range core {
+		sequence = append(sequence, step)
+		sequence = append(sequence, anchored[step.Name()]...)
+	}
+	return sequence
+}
+
+// AllSteps returns the fixed core pipeline step sequence.
 // When NM_DEMO=1, it returns mock steps for demo recordings.
 func AllSteps() []pipeline.Step {
 	if IsDemoMode() {

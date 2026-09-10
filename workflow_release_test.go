@@ -187,6 +187,56 @@ func TestReleaseWorkflowPublishesPrereleaseOnlyAfterAssetsComplete(t *testing.T)
 	}
 }
 
+// TestReleaseWorkflowCallsPublishChannelsAfterFinalize pins that a
+// release-please cut refreshes channels.json from the same run, after the
+// prerelease and every binary asset are live. GitHub does not cascade
+// GITHUB_TOKEN release events, so on: release cannot cover this path.
+func TestReleaseWorkflowCallsPublishChannelsAfterFinalize(t *testing.T) {
+	wf := loadReleaseWorkflowDoc(t)
+	job := wf.Jobs["publish-channels"]
+	if job == nil {
+		t.Fatal("release workflow must call publish-channels as a job so a GITHUB_TOKEN-published release still refreshes the channel manifest")
+	}
+	if job.Uses != "./.github/workflows/publish-channels.yml" {
+		t.Fatalf("publish-channels uses = %q, want the reusable workflow so a failure fails this release run", job.Uses)
+	}
+	if len(job.Steps) != 0 {
+		t.Fatalf("publish-channels must be a reusable-workflow job with no steps, got %d (a gh workflow run fire-and-forget would not fail this run)", len(job.Steps))
+	}
+	if job.Permissions.Contents != "write" {
+		t.Fatalf("publish-channels contents permission = %q, want write to upload the channels asset", job.Permissions.Contents)
+	}
+
+	needed := map[string]bool{}
+	for _, dep := range job.needs() {
+		needed[dep] = true
+	}
+	if !needed["finalize"] {
+		t.Fatalf("publish-channels needs = %v, want finalize so channels.json is not pointed at a still-draft release or a release missing binaries", job.needs())
+	}
+
+	for _, tc := range []struct {
+		name    string
+		context workflowConditionContext
+		wantRun bool
+	}{
+		{name: "finalize succeeded", context: workflowConditionContext{Needs: map[string]string{"finalize": "success"}}, wantRun: true},
+		{name: "finalize failed", context: workflowConditionContext{Needs: map[string]string{"finalize": "failure"}}, wantRun: false},
+		{name: "finalize skipped", context: workflowConditionContext{Needs: map[string]string{"finalize": "skipped"}}, wantRun: false},
+		{name: "run cancelled", context: workflowConditionContext{Cancelled: true, Needs: map[string]string{"finalize": "success"}}, wantRun: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := evaluateWorkflowCondition(job.If, tc.context)
+			if err != nil {
+				t.Fatalf("evaluate publish-channels condition: %v", err)
+			}
+			if got != tc.wantRun {
+				t.Fatalf("publish-channels runs = %t, want %t", got, tc.wantRun)
+			}
+		})
+	}
+}
+
 func TestExtractJobBlockHandlesCRLF(t *testing.T) {
 	lf := "jobs:\n  foo:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo foo\n  bar:\n    runs-on: ubuntu-latest\n"
 	crlf := strings.ReplaceAll(lf, "\n", "\r\n")

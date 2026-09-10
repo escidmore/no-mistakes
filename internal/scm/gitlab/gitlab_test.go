@@ -481,6 +481,57 @@ func TestFetchFailedCheckLogsRequestsJobDetails(t *testing.T) {
 	}
 }
 
+func TestFetchFailedCheckTargetLogsAggregatesEverySelectedJob(t *testing.T) {
+	t.Parallel()
+
+	host := New(gitlabTestCmdFactory(map[string]gitlabTestResponse{
+		"glab mr view 123 --output json": {stdout: `{"head_pipeline":{"id":77}}` + "\n"},
+		"glab ci get --pipeline-id 77 --output json --with-job-details": {
+			stdout: `{"jobs":[{"id":55,"name":"build","status":"failed"},{"id":56,"name":"lint","status":"failed"}]}` + "\n",
+		},
+		"glab ci trace 55": {stdout: "build failed\n"},
+		"glab ci trace 56": {stdout: "lint failed\n"},
+	}), nil, "", "")
+
+	logs, err := host.FetchFailedCheckTargetLogs(context.Background(), &scm.PR{Number: "123"}, "", "", []scm.CheckTarget{{Name: "build", ProviderID: "gitlab-job:55"}, {Name: "lint", ProviderID: "gitlab-job:56"}})
+	if err != nil {
+		t.Fatalf("FetchFailedCheckTargetLogs() error = %v", err)
+	}
+	if len(logs) != 2 || logs[0].Output != "build failed" || logs[1].Output != "lint failed" {
+		t.Fatalf("FetchFailedCheckTargetLogs() = %+v, want target-separated logs", logs)
+	}
+}
+
+func TestFetchFailedCheckTargetLogsReturnsPartialLogsWithRetrievalError(t *testing.T) {
+	t.Parallel()
+
+	host := New(gitlabTestCmdFactory(map[string]gitlabTestResponse{
+		"glab mr view 123 --output json":                                {stdout: `{"head_pipeline":{"id":77}}` + "\n"},
+		"glab ci get --pipeline-id 77 --output json --with-job-details": {stdout: `{"jobs":[{"id":55,"name":"build","status":"failed"},{"id":56,"name":"lint","status":"failed"}]}` + "\n"},
+		"glab ci trace 55":                                              {stdout: "build failed\n"},
+		"glab ci trace 56":                                              {stderr: "expired", code: 1},
+	}), nil, "", "")
+
+	logs, err := host.FetchFailedCheckTargetLogs(context.Background(), &scm.PR{Number: "123"}, "", "", []scm.CheckTarget{{ProviderID: "gitlab-job:55"}, {ProviderID: "gitlab-job:56"}})
+	if err != nil || len(logs) != 2 || logs[0].Output != "build failed" || logs[1].Err == nil || !strings.Contains(logs[1].Err.Error(), "job 56") {
+		t.Fatalf("FetchFailedCheckTargetLogs() = (%+v, %v), want retained partial logs and job 56 error", logs, err)
+	}
+}
+
+func TestFetchFailedCheckTargetLogsReportsMissingSelectedJob(t *testing.T) {
+	t.Parallel()
+
+	host := New(gitlabTestCmdFactory(map[string]gitlabTestResponse{
+		"glab mr view 123 --output json":                                {stdout: `{"head_pipeline":{"id":77}}` + "\n"},
+		"glab ci get --pipeline-id 77 --output json --with-job-details": {stdout: `{"jobs":[{"id":55,"name":"build","status":"failed"}]}` + "\n"},
+	}), nil, "", "")
+
+	logs, err := host.FetchFailedCheckTargetLogs(context.Background(), &scm.PR{Number: "123"}, "", "", []scm.CheckTarget{{ProviderID: "gitlab-job:999"}})
+	if err != nil || len(logs) != 1 || logs[0].Err == nil || !strings.Contains(logs[0].Err.Error(), "gitlab-job:999") {
+		t.Fatalf("FetchFailedCheckTargetLogs() = (%+v, %v), want explicit missing-target error", logs, err)
+	}
+}
+
 func TestFetchFailedCheckLogsParsesMRJSONAfterPreamble(t *testing.T) {
 	t.Parallel()
 
@@ -712,15 +763,14 @@ func TestGetChecksPaginatesJobsAcrossConcatenatedPages(t *testing.T) {
 	}
 }
 
-func TestFindFailedJobIDScansConcatenatedPages(t *testing.T) {
+func TestFindFailedJobTargetIDsScansConcatenatedPages(t *testing.T) {
 	t.Parallel()
 
-	// The failed job lives on the second concatenated page; findFailedJobID must
-	// still locate it across paginated output.
 	out := []byte(`[{"id":1,"name":"build","status":"success"}]` + "\n" +
 		`[{"id":2,"name":"deploy","status":"failed"}]` + "\n")
-	if got := findFailedJobID(out, []string{"deploy"}); got != 2 {
-		t.Fatalf("findFailedJobID() = %d, want 2", got)
+	got := findFailedJobTargetIDs(out, []scm.CheckTarget{{Name: "deploy", ProviderID: "gitlab-job:2"}})
+	if len(got) != 1 || got[0] != 2 {
+		t.Fatalf("findFailedJobTargetIDs() = %v, want [2]", got)
 	}
 }
 

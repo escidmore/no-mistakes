@@ -268,6 +268,37 @@ agent_args_override:
     - o3
 ```
 
+### review_agents
+
+Optional, **global-only** harness and model/effort overrides for the review loop.
+Repository `.no-mistakes.yaml` cannot set these profiles. Omitted roles keep the
+normal `agent` selection and fallback chain; other pipeline steps are unchanged.
+
+```yaml
+review_agents:
+  reviewer:
+    agent: pi
+    model: anthropic-vertex/claude-opus-4-8
+    effort: max
+  fixer:
+    agent: pi
+    model: google-vertex/gemini-3.8-flash
+    effort: max
+```
+
+The only role keys are `reviewer` and `fixer`. Each configured role requires one
+explicit `agent` (the same harness names as `agent_config`; no `auto` or lists).
+Model and effort are optional and inherit `agent_config` for that harness when
+empty. Nonempty role values override that profile, but native
+`agent_args_override` flags still win. Model availability, credentials, and
+supported effort levels remain the harness/provider's responsibility.
+
+Both roles can use the same harness with different models. Reviews and rereviews
+always run fresh; only review fixes reuse the fixer's session when
+`session_reuse` is enabled and the fixer supports it. These settings do not
+select the agents repairing tests, documentation, or CI. Eval capture strips
+these profiles so replay candidates remain authoritative.
+
 ### agent_args_override
 
 Extra CLI flags to pass to each native agent.
@@ -633,7 +664,7 @@ A value in the trusted repository config overrides this global value in both dir
 
 ### commit.fix_message
 
-Template for the subject of commits created by the Review, Test, Document, Lint, and CI repair paths.
+Template for the subject of commits created by the Review, Test, Document, Lint, and CI repair paths, plus operator-authorized repository gate repairs.
 
 | | |
 | --- | --- |
@@ -644,7 +675,7 @@ The template supports literal text and two Go-style placeholders:
 
 | Variable | Value |
 | --- | --- |
-| `{{.Step}}` | Pipeline step name, such as `review`, `test`, `document`, `lint`, or `ci` |
+| `{{.Step}}` | Pipeline step name, such as `review`, `test`, `document`, `lint`, `ci`, or `gate.test.mutation-budget` |
 | `{{.Summary}}` | Sanitized one-line summary returned by the fix agent, or the step's deterministic fallback summary |
 
 The value must be a valid UTF-8 template that renders to a non-empty, single-line commit subject.
@@ -661,7 +692,7 @@ A per-repo [`commit.fix_message`](/no-mistakes/reference/repo-config/#commitfix_
 ### intent
 
 Transcript-based user-intent extraction settings.
-When enabled and no intent was supplied directly for the run, no-mistakes can read recent local agent transcripts, match the session that produced the change, summarize the author's intent, pass that summary to rebase, review, test, document, lint, CI auto-fix, and PR prompts, and include it in generated PR descriptions.
+When enabled and no intent was supplied directly for the run, no-mistakes can read recent local agent transcripts, match the session that produced the change, summarize the author's intent, and pass that summary to rebase, review, test, document, lint, CI auto-fix, repository gate repair, and PR prompts. For publication of the generated Intent section, see [`pr.publish_intent`](/no-mistakes/reference/repo-config/#prpublish_intent).
 
 |      |          |
 | ---- | -------- |
@@ -741,16 +772,16 @@ Local review-evaluation corpus settings for [`no-mistakes eval`](/no-mistakes/re
 | ---- | -------- |
 | Type | `object` |
 
-| Field                      | Type   | Default | Description                                                            |
-| -------------------------- | ------ | ------- | ---------------------------------------------------------------------- |
-| `eval.capture_provenance`  | `bool` | `true`  | Record the exact commit and configuration inputs a replay needs        |
-| `eval.auto_capture`        | `bool` | `true`  | Freeze eligible finished runs' review passes into the local corpus     |
-| `eval.max_cases`           | `int`  | `200`   | Retention target for automatic collection; `0` keeps every case        |
-| `eval.diversified_size`    | `int`  | `32`    | Cap on the official gold-only `diversified` set; `0` is one gold case per stratum |
+| Field                     | Type   | Default | Description                                                            |
+| ------------------------- | ------ | ------- | ---------------------------------------------------------------------- |
+| `eval.capture_provenance` | `bool` | `true`  | Record the exact commit and configuration inputs a replay needs        |
+| `eval.auto_capture`       | `bool` | `true`  | Collect eligible review cases and fixed CI false negatives automatically |
+| `eval.max_cases`          | `int`  | `200`   | Retention target for automatic collection; `0` keeps every case        |
+| `eval.diversified_size`   | `int`  | `32`    | Cap on the official gold-only `diversified` set; `0` is one gold case per stratum |
 
 `capture_provenance` is what makes a review pass replayable at all. It is recorded when the round is written and cannot be added afterwards, because the pinned configuration is a point-in-time snapshot, so a run reviewed with it off can never be captured later.
 
-`auto_capture` collects those passes without any command: when an eligible run finishes, its decided review rounds become cases. It does nothing while `capture_provenance` is off. Collection runs after the pipeline has already reported its outcome and can never change it; a failure is logged and nothing else.
+`auto_capture` collects without any command: when an eligible run finishes, its decided review rounds become cases and fixed `ci-check` and `ci-review-bot` findings become Review false negatives. It does nothing while `capture_provenance` is off. Collection runs after the pipeline has already reported its outcome and can never change it; a failure is logged and nothing else. The [Evaluation toolkit](/no-mistakes/reference/eval/#how-cases-are-collected) owns eligibility and labeling details.
 
 `max_cases` sets the retention target enforced after automatic collection. When it is exceeded the oldest unprotected cases are dropped first. A case with a replay in progress or recorded candidate replays is protected, so the corpus can remain above the target rather than invalidate a comparison you have spent tokens on. Cases from the same repository share one local object pool, so a case costs its own records plus the objects its commits introduced rather than a copy of the repository.
 

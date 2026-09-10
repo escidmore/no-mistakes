@@ -89,14 +89,29 @@ const (
 	FindingCategoryLint          = "lint"
 )
 
+// Finding category constants for the CI step's check findings. The CI step
+// turns each settled issue on the pull request into one finding and the fix
+// half routes by this category: a check finding names its provider check in
+// Finding.Check, a merge-conflict finding asks for a rebase, a transient
+// finding is a provider-attributed outcome no code change can clear, and a
+// review-bot finding carries one unresolved comment from a third-party
+// review bot's check.
+const (
+	FindingCategoryCICheck         = "ci-check"
+	FindingCategoryCIMergeConflict = "ci-merge-conflict"
+	FindingCategoryCITransient     = "ci-transient"
+	FindingCategoryCIReviewBot     = "ci-review-bot"
+)
+
 // Test scenario result constants: the vocabulary the test step's evidence
 // prompt instructs the agent to use for each derived scenario.
 //
 // ScenarioResultUntested is the honest answer for a scenario this machine
-// could not drive against the real product - a missing tool, credential,
-// permission, or authority. It is reported on the pull request and never
-// blocks by itself; only the run's verdict parks the step (see
-// TestVerdictNoGo).
+// could not drive against the real product - either the change has no live
+// product surface, or a required tool, credential, permission, or authority
+// is unavailable. It is reported on the pull request and never blocks by
+// itself; the run's verdict determines whether that scenario coverage parks
+// the step.
 const (
 	ScenarioResultPass     = "pass"
 	ScenarioResultFail     = "fail"
@@ -105,15 +120,25 @@ const (
 
 // Test verdict constants: the test step's own conclusion about whether the
 // change is safe to ship, independent of individual findings.
+//
+// TestVerdictNoSurface is the honest answer when the change itself has no
+// runtime product no-mistakes can drive live - a CI-workflow-only change, a
+// docs-only change, a pure non-runtime refactor, or anything else with no
+// live-exercisable scenario. It is not a silent skip: the Test step parks
+// for a human to decide whether proceeding without live validation is
+// acceptable. A change that has a live surface and was not driven still
+// uses pass/fail/untested plus go/no-go/inconclusive; claiming no-surface
+// while any scenario is live or pass/fail is a contract violation.
 const (
 	TestVerdictGo           = "go"
 	TestVerdictNoGo         = "no-go"
 	TestVerdictInconclusive = "inconclusive"
+	TestVerdictNoSurface    = "no-surface"
 )
 
 var (
 	knownScenarioResults = []string{ScenarioResultPass, ScenarioResultFail, ScenarioResultUntested}
-	knownTestVerdicts    = []string{TestVerdictGo, TestVerdictNoGo, TestVerdictInconclusive}
+	knownTestVerdicts    = []string{TestVerdictGo, TestVerdictNoGo, TestVerdictInconclusive, TestVerdictNoSurface}
 )
 
 // IsKnownScenarioResult reports whether result is part of the scenario result
@@ -147,8 +172,15 @@ type Finding struct {
 	UserInstructions string `json:"user_instructions,omitempty"`
 	ReviewScope      string `json:"review_scope,omitempty"`
 	// Category separates the combined document+lint housekeeping pass's
-	// findings into their owning gates. Empty everywhere else.
+	// findings into their owning gates and the CI step's findings by kind
+	// (see the FindingCategoryCI* constants). Empty everywhere else.
 	Category string `json:"category,omitempty"`
+	// Check is the provider check name a CI finding was derived from. CheckID
+	// is the provider's opaque identity for that exact check, so same-named
+	// checks remain distinct through selection and repair. Both are empty on
+	// every non-CI finding.
+	Check   string `json:"check,omitempty"`
+	CheckID string `json:"check_id,omitempty"`
 }
 
 // TestScenario is one named end-to-end scenario the test step derived from the
@@ -157,8 +189,9 @@ type Finding struct {
 // Live is the whole point of the record: it is true ONLY when the scenario was
 // driven against the real product in this run. A unit test, a stub, a recorded
 // fixture, or reading the code is not live, and a scenario that could not be
-// driven here is reported with Result ScenarioResultUntested plus the Reason
-// that stopped it rather than being guessed at.
+// driven here is reported with Result ScenarioResultUntested plus a Reason
+// explaining the unavailable capability or absence of a live product surface,
+// rather than being guessed at.
 type TestScenario struct {
 	Name     string `json:"name"`
 	Result   string `json:"result"`
@@ -177,6 +210,23 @@ func LiveScenarioCounts(scenarios []TestScenario) (live, total int) {
 		}
 	}
 	return live, total
+}
+
+// NoLiveExercisableScenarios reports whether every scenario is untested and
+// none were driven live. That is the only shape the Test step will accept as
+// "this change has no live-validatable surface": a pass or fail, or any live
+// mark, means there was something to exercise and no-surface must not cover
+// it.
+func NoLiveExercisableScenarios(scenarios []TestScenario) bool {
+	if len(scenarios) == 0 {
+		return false
+	}
+	for _, s := range scenarios {
+		if s.Live || s.Result != ScenarioResultUntested {
+			return false
+		}
+	}
+	return true
 }
 
 // TestArtifact describes evidence produced by the test step for human review.
@@ -199,6 +249,8 @@ type findingWire struct {
 	UserInstructions    string `json:"user_instructions,omitempty"`
 	ReviewScope         string `json:"review_scope,omitempty"`
 	Category            string `json:"category,omitempty"`
+	Check               string `json:"check,omitempty"`
+	CheckID             string `json:"check_id,omitempty"`
 	RequiresHumanReview *bool  `json:"requires_human_review,omitempty"`
 }
 
@@ -492,6 +544,8 @@ func (f *Finding) UnmarshalJSON(data []byte) error {
 	f.UserInstructions = wire.UserInstructions
 	f.ReviewScope = wire.ReviewScope
 	f.Category = wire.Category
+	f.Check = wire.Check
+	f.CheckID = wire.CheckID
 	if f.Action == "" && wire.RequiresHumanReview != nil {
 		if *wire.RequiresHumanReview {
 			f.Action = ActionAskUser

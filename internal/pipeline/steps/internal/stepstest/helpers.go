@@ -25,6 +25,80 @@ import (
 
 var testGitExecutable, _ = exec.LookPath("git")
 
+// ExecuteWithAutoFix drives step the way the executor drives a step whose
+// outcome carries auto-fix findings (see Executor.executeStep): it executes
+// the step, and while the outcome is auto-fixable, the step's auto-fix limit
+// has attempts left, and the findings contain an auto-fix item, it re-executes
+// the step with Fixing set and PreviousFindings holding only the auto-fix
+// findings. priorAttempts seeds the attempt count the executor would restore
+// from the round history. It returns the first outcome the executor would not
+// auto-fix - a park, a completion, a restart - or the step's error.
+func ExecuteWithAutoFix(t *testing.T, step pipeline.Step, sctx *pipeline.StepContext, priorAttempts int) (*pipeline.StepOutcome, error) {
+	t.Helper()
+	limit := 0
+	if sctx.Config != nil {
+		limit = sctx.Config.AutoFixLimit(step.Name())
+	}
+	attempts := priorAttempts
+	for {
+		outcome, err := step.Execute(sctx)
+		if err != nil || outcome == nil {
+			return outcome, err
+		}
+		if !outcome.AutoFixable || limit <= 0 || attempts >= limit {
+			return outcome, nil
+		}
+		parsed, parseErr := types.ParseFindingsJSON(outcome.Findings)
+		if parseErr != nil {
+			return outcome, nil
+		}
+		normalized := types.NormalizeFindings(parsed, string(step.Name()))
+		fixable := types.AutoFixableFindings(normalized)
+		if len(fixable.Items) == 0 {
+			return outcome, nil
+		}
+		encoded, encodeErr := types.MarshalFindingsJSON(fixable)
+		if encodeErr != nil {
+			t.Fatalf("marshal auto-fix findings: %v", encodeErr)
+		}
+		selectedIDs := make([]string, 0, len(fixable.Items))
+		for _, item := range fixable.Items {
+			selectedIDs = append(selectedIDs, item.ID)
+		}
+		deferred := types.ExcludeFindings(normalized, selectedIDs)
+		deferredRaw, encodeErr := types.MarshalFindingsJSON(deferred)
+		if encodeErr != nil {
+			t.Fatalf("marshal deferred findings: %v", encodeErr)
+		}
+		attempts++
+		sctx.Fixing = true
+		sctx.PreviousFindings = encoded
+		sctx.DeferredFindings = deferredRaw
+	}
+}
+
+// CIGateFindingsJSON renders the findings a CI gate raises for the named
+// failing checks, the way a human's `fix` selection hands them back to the
+// step as PreviousFindings.
+func CIGateFindingsJSON(names ...string) string {
+	findings := types.Findings{Summary: fmt.Sprintf("%d CI checks failing", len(names))}
+	for i, name := range names {
+		findings.Items = append(findings.Items, types.Finding{
+			ID:          fmt.Sprintf("ci-%d", i+1),
+			Severity:    types.FindingSeverityError,
+			Action:      types.ActionAutoFix,
+			Category:    types.FindingCategoryCICheck,
+			Check:       name,
+			Description: "CI check failing: " + name,
+		})
+	}
+	encoded, err := types.MarshalFindingsJSON(findings)
+	if err != nil {
+		panic(err)
+	}
+	return encoded
+}
+
 type MockAgent struct {
 	AgentName string
 	RunFn     func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error)
@@ -187,6 +261,8 @@ func NewTestContext(t *testing.T, ag agent.Agent, workDir, baseSHA, headSHA stri
 func FakeCLIEnv(binDir string, vars map[string]string) []string {
 	env := []string{
 		"PATH=" + binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+		"FAKE_CLI_REAL_GIT=" + testGitExecutable,
+		"FAKE_CLI_HEAD_FROM_WORKTREE=1",
 	}
 	for k, v := range vars {
 		env = append(env, k+"="+v)

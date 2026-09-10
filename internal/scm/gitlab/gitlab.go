@@ -470,36 +470,75 @@ func (h *Host) getChecksFallback(ctx context.Context, pr *scm.PR) ([]scm.Check, 
 	return parseGitlabJobs(jobsOut)
 }
 
-func (h *Host) FetchFailedCheckLogs(ctx context.Context, pr *scm.PR, _ string, _ string, failingNames []string) (string, error) {
-	if len(failingNames) == 0 {
-		return "", nil
+func (h *Host) FetchFailedCheckLogs(ctx context.Context, pr *scm.PR, branch, headSHA string, failingNames []string) (string, error) {
+	targets := make([]scm.CheckTarget, 0, len(failingNames))
+	for _, name := range failingNames {
+		targets = append(targets, scm.CheckTarget{Name: name})
 	}
-	// Get the MR's pipeline jobs, find a failed one whose name matches, trace it.
+	logs, err := h.FetchFailedCheckTargetLogs(ctx, pr, branch, headSHA, targets)
+	if err != nil {
+		return "", err
+	}
+	return scm.CombineFailedCheckLogs(logs)
+}
+
+func (h *Host) FetchFailedCheckTargetLogs(ctx context.Context, pr *scm.PR, _ string, _ string, targets []scm.CheckTarget) ([]scm.FailedCheckLog, error) {
+	if len(targets) == 0 {
+		return nil, nil
+	}
+	// Get the MR's pipeline jobs and trace the selected failures.
 	viewCmd := h.cmd(ctx, "glab", "mr", "view", pr.Number, "--output", "json")
 	viewOut, err := viewCmd.CombinedOutput()
 	if err != nil {
-		return "", nil
+		return nil, fmt.Errorf("resolve GitLab merge request for selected logs: %w", err)
 	}
 	var payload struct {
 		HeadPipeline struct {
 			ID int `json:"id"`
 		} `json:"head_pipeline"`
 	}
-	if trimmed := bytesTrimToJSON(viewOut); len(trimmed) == 0 || json.Unmarshal(trimmed, &payload) != nil || payload.HeadPipeline.ID == 0 {
-		return "", nil
+	trimmed := bytesTrimToJSON(viewOut)
+	if len(trimmed) == 0 {
+		return nil, errors.New("resolve GitLab pipeline for selected logs: response contained no JSON")
+	}
+	if err := json.Unmarshal(trimmed, &payload); err != nil {
+		return nil, fmt.Errorf("resolve GitLab pipeline for selected logs: %w", err)
+	}
+	if payload.HeadPipeline.ID == 0 {
+		return nil, errors.New("resolve GitLab pipeline for selected logs: pipeline ID is empty")
 	}
 	jobsCmd := h.cmd(ctx, "glab", h.pipelineJobsArgs(payload.HeadPipeline.ID)...)
 	jobsOut, err := jobsCmd.CombinedOutput()
 	if err != nil {
-		return "", nil
+		return nil, fmt.Errorf("list GitLab jobs for selected logs: %w", err)
 	}
-	jobID := findFailedJobID(jobsOut, failingNames)
-	if jobID == 0 {
-		return "", nil
+	results := make([]scm.FailedCheckLog, 0, len(targets))
+	for _, target := range targets {
+		result := scm.FailedCheckLog{Target: target}
+		jobIDs := findFailedJobTargetIDs(jobsOut, []scm.CheckTarget{target})
+		if len(jobIDs) == 0 {
+			result.Err = fmt.Errorf("selected GitLab check %q was not found", target.Identity())
+			results = append(results, result)
+			continue
+		}
+		var outputs []string
+		var errs []error
+		for _, jobID := range jobIDs {
+			traceCmd := h.cmd(ctx, "glab", "ci", "trace", fmt.Sprintf("%d", jobID))
+			traceOut, err := traceCmd.Output()
+			if err != nil {
+				errs = append(errs, fmt.Errorf("fetch GitLab job %d trace: %w", jobID, err))
+				continue
+			}
+			if log := strings.TrimSpace(string(traceOut)); log != "" {
+				outputs = append(outputs, log)
+			}
+		}
+		result.Output = strings.Join(outputs, "\n\n")
+		result.Err = errors.Join(errs...)
+		results = append(results, result)
 	}
-	traceCmd := h.cmd(ctx, "glab", "ci", "trace", fmt.Sprintf("%d", jobID))
-	traceOut, _ := traceCmd.Output()
-	return strings.TrimSpace(string(traceOut)), nil
+	return results, nil
 }
 
 func parseMRPayload(out []byte) (mrPayload, bool) {
@@ -606,8 +645,13 @@ func parseGitlabJobs(out []byte) ([]scm.Check, error) {
 func jobsToChecks(jobs []gitlabJob) []scm.Check {
 	checks := make([]scm.Check, 0, len(jobs))
 	for _, job := range jobs {
+		providerID := ""
+		if job.ID != 0 {
+			providerID = fmt.Sprintf("gitlab-job:%d", job.ID)
+		}
 		checks = append(checks, scm.Check{
 			Name:        job.Name,
+			ProviderID:  providerID,
 			Bucket:      gitlabStatusBucket(job.Status),
 			CompletedAt: job.completedAt(),
 		})
@@ -615,26 +659,31 @@ func jobsToChecks(jobs []gitlabJob) []scm.Check {
 	return checks
 }
 
-func findFailedJobID(out []byte, failingNames []string) int {
-	targets := map[string]struct{}{}
-	for _, name := range failingNames {
-		name = strings.TrimSpace(name)
-		if name != "" {
-			targets[name] = struct{}{}
+func findFailedJobTargetIDs(out []byte, checkTargets []scm.CheckTarget) []int {
+	names := map[string]struct{}{}
+	ids := map[string]struct{}{}
+	for _, target := range checkTargets {
+		if id := strings.TrimSpace(target.ProviderID); id != "" {
+			ids[id] = struct{}{}
+		} else if name := strings.TrimSpace(target.Name); name != "" {
+			names[name] = struct{}{}
 		}
 	}
 	// Best effort: scan whatever jobs parsed; a corrupt later page does not
 	// prevent locating a failed job that already decoded.
 	jobs, _ := decodeGitlabJobs(out)
+	var matched []int
 	for _, job := range jobs {
 		if !strings.EqualFold(job.Status, "failed") {
 			continue
 		}
-		if _, ok := targets[job.Name]; ok || len(targets) == 0 {
-			return job.ID
+		_, nameMatch := names[job.Name]
+		_, idMatch := ids[fmt.Sprintf("gitlab-job:%d", job.ID)]
+		if nameMatch || idMatch || len(names)+len(ids) == 0 {
+			matched = append(matched, job.ID)
 		}
 	}
-	return 0
+	return matched
 }
 
 func gitlabStatusBucket(state string) scm.CheckBucket {

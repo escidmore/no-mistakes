@@ -1,5 +1,58 @@
 # Changelog
 
+## [1.73.0](https://github.com/kunchenguid/no-mistakes/compare/v1.72.0...v1.73.0) (2026-09-09)
+
+
+### Features
+
+* **pipeline:** add opt-out for generated PR intent publication ([#1018](https://github.com/kunchenguid/no-mistakes/issues/1018)) ([2696771](https://github.com/kunchenguid/no-mistakes/commit/2696771d8fcb772708164b5e2e381b18b69b321b))
+
+
+### Bug Fixes
+
+* publish update channels after automated releases ([#1024](https://github.com/kunchenguid/no-mistakes/issues/1024)) ([53ceb81](https://github.com/kunchenguid/no-mistakes/commit/53ceb81ea6920e449684c2d0c275006e7ed99e8c))
+
+## [1.72.0](https://github.com/kunchenguid/no-mistakes/compare/v1.71.0...v1.72.0) (2026-09-08)
+
+
+### Features
+
+* **agent:** configure independent reviewer and fixer harness profiles ([#1016](https://github.com/kunchenguid/no-mistakes/issues/1016)) ([94afe33](https://github.com/kunchenguid/no-mistakes/commit/94afe335fa0060bccc562cd0512c2c940741d95b))
+
+
+### Bug Fixes
+
+* **pipeline:** retry invalid test analyzer findings ([#1014](https://github.com/kunchenguid/no-mistakes/issues/1014)) ([42497f8](https://github.com/kunchenguid/no-mistakes/commit/42497f8412214d8f37ed3d0ce807a6ea3692e8e0))
+
+## [1.71.0](https://github.com/kunchenguid/no-mistakes/compare/v1.70.1...v1.71.0) (2026-09-08)
+
+
+### Features
+
+* **eval:** auto-ingest fixed CI misses ([#1012](https://github.com/kunchenguid/no-mistakes/issues/1012)) ([bace158](https://github.com/kunchenguid/no-mistakes/commit/bace15861522b7613944f68dcf6574d6a202e544))
+* **pipeline:** unify CI failures with findings loop ([#1009](https://github.com/kunchenguid/no-mistakes/issues/1009)) ([9a464c2](https://github.com/kunchenguid/no-mistakes/commit/9a464c26fca7962fdd318502358cfa6cb0e1de1c))
+
+## [1.70.1](https://github.com/kunchenguid/no-mistakes/compare/v1.70.0...v1.70.1) (2026-09-07)
+
+
+### Bug Fixes
+
+* **update:** fetch version metadata from release CDN ([#1007](https://github.com/kunchenguid/no-mistakes/issues/1007)) ([2db4b7f](https://github.com/kunchenguid/no-mistakes/commit/2db4b7f19224bde17018ebfcd38bbe56bd9486f4))
+
+## [1.70.0](https://github.com/kunchenguid/no-mistakes/compare/v1.69.0...v1.70.0) (2026-09-07)
+
+
+### Features
+
+* **pipeline:** prepare dependencies once per run ([#937](https://github.com/kunchenguid/no-mistakes/issues/937)) ([4603016](https://github.com/kunchenguid/no-mistakes/commit/4603016d04f78f360235704d73b01e2a6eaf6cac))
+
+
+### Bug Fixes
+
+* **cli:** show elapsed time for the active review round ([#1001](https://github.com/kunchenguid/no-mistakes/issues/1001)) ([2b98e45](https://github.com/kunchenguid/no-mistakes/commit/2b98e458251207404b413ec65cbf205a1cb7ff57))
+* **pipeline:** ask before proceeding without a live-testable surface ([#1005](https://github.com/kunchenguid/no-mistakes/issues/1005)) ([8c274f3](https://github.com/kunchenguid/no-mistakes/commit/8c274f37ed2257bb76dea341354a3cc22081ca83))
+* **pipeline:** distinguish intended local-main deliveries ([#1003](https://github.com/kunchenguid/no-mistakes/issues/1003)) ([33327b7](https://github.com/kunchenguid/no-mistakes/commit/33327b794639a230c829a0a9ac5398dc22c3e958))
+
 ## [1.69.0](https://github.com/kunchenguid/no-mistakes/compare/v1.68.0...v1.69.0) (2026-09-07)
 
 

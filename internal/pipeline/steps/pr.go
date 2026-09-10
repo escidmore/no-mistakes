@@ -520,7 +520,7 @@ func buildPRBody(body, riskLine, testingMD, pipelineMD string, sctx *pipeline.St
 	sections := appendGeneratedSectionsToCleanBody(body, riskLine, testingMD, pipelineMD)
 	// Neutralized for the same reason as in prependIntentSection: intent is
 	// agent-extracted text placed ahead of the pipeline section.
-	cleaned := neutralizeAttestationMarkers(cleanedUserIntent(sctx))
+	cleaned := neutralizeAttestationMarkers(publicPRIntent(sctx))
 	if cleaned == "" {
 		return sections
 	}
@@ -1273,12 +1273,12 @@ func isGeneratedSectionHeading(line string) bool {
 // already-extracted user intent. The intent text is reused verbatim (after
 // the same secret/adversarial scrubbing the agent prompt path applies)
 // rather than being paraphrased by the agent. Returns body unchanged when
-// no intent is available.
+// no intent is available or publication is disabled.
 func prependIntentSection(body string, sctx *pipeline.StepContext) string {
 	// Intent is agent-extracted text that lands ahead of the pipeline section,
 	// so it can shadow the real attestation the same way the Testing section
 	// can. See appendGeneratedSectionsToCleanBodyWithinLimit.
-	cleaned := neutralizeAttestationMarkers(cleanedUserIntent(sctx))
+	cleaned := neutralizeAttestationMarkers(publicPRIntent(sctx))
 	if cleaned == "" {
 		return body
 	}

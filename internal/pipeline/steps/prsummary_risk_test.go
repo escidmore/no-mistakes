@@ -72,8 +72,11 @@ func TestBuildPipelineSummary_ReviewUsesFinalCleanState(t *testing.T) {
 	if !strings.Contains(md, "🔧 **Review**") {
 		t.Errorf("expected fixed review status, got:\n%s", md)
 	}
-	if !strings.Contains(md, "auto-fixed") {
-		t.Errorf("expected auto-fixed in review line, got:\n%s", md)
+	if !strings.Contains(md, "🔧 **Review** - 1 issue found → fix attempted; result not reported ✅") {
+		t.Errorf("expected unreported fix result in review line, got:\n%s", md)
+	}
+	if strings.Contains(md, "auto-fixed") {
+		t.Errorf("did not expect unreported fix result to be called auto-fixed, got:\n%s", md)
 	}
 	if strings.Contains(md, "user-fixed") {
 		t.Errorf("did not expect user-fixed in review line, got:\n%s", md)
@@ -90,7 +93,7 @@ func TestBuildPipelineSummary_ReviewUsesFinalCleanState(t *testing.T) {
 	if !strings.Contains(risk, "✅") {
 		t.Errorf("expected checkmark for low risk, got: %q", risk)
 	}
-	if !strings.Contains(md, "🔧 Fix applied.") || !strings.Contains(md, "✅ Re-checked - no issues remain.") {
+	if !strings.Contains(md, "🔧 Fix attempted; result not reported.") || !strings.Contains(md, "✅ Re-checked - no issues remain.") {
 		t.Errorf("expected the fix and verification to remain visible for multi-round review, got:\n%s", md)
 	}
 }

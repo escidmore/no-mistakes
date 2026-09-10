@@ -11,7 +11,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/scm"
 )
 
-func TestCIFixTreatsForgejoLogsAsOptionalEvidence(t *testing.T) {
+func TestCIFixSurfacesForgejoLogRetrievalFailures(t *testing.T) {
 	tests := []struct {
 		name       string
 		logs       string
@@ -20,7 +20,7 @@ func TestCIFixTreatsForgejoLogsAsOptionalEvidence(t *testing.T) {
 		wantMarker string
 	}{
 		{name: "available", logs: "Forgejo Actions run 91, job test:\nassertion failed", wantLogs: true, wantMarker: "assertion failed"},
-		{name: "unavailable", fetchErr: errors.New("job log expired"), wantLogs: false},
+		{name: "unavailable", fetchErr: errors.New("job log expired"), wantLogs: true, wantMarker: "log retrieval incomplete: job log expired"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -36,7 +36,7 @@ func TestCIFixTreatsForgejoLogsAsOptionalEvidence(t *testing.T) {
 			sctx := newTestContext(t, ag, dir, baseSHA, headSHA, config.Commands{})
 			host := &forgejoLogTestHost{logs: tt.logs, err: tt.fetchErr}
 
-			repair, err := (&CIStep{}).autoFixCI(sctx, host, &scm.PR{Number: "42", URL: "https://forge.example/octo/widgets/pulls/42"}, []string{"CI / test (pull_request)"}, false)
+			repair, err := (&CIStep{}).autoFixCI(sctx, host, &scm.PR{Number: "42", URL: "https://forge.example/octo/widgets/pulls/42"}, ciTargetsFor([]string{"CI / test (pull_request)"}, false))
 			if err != nil {
 				t.Fatalf("autoFixCI() error = %v", err)
 			}
@@ -58,6 +58,52 @@ func TestCIFixTreatsForgejoLogsAsOptionalEvidence(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestFetchCILogOutputBudgetsEachSelectedTargetAndSurfacesErrors(t *testing.T) {
+	t.Parallel()
+
+	host := &targetedLogTestHost{
+		logs: map[string]string{
+			"check-a": strings.Repeat("a", 32*1024) + " A_TAIL",
+			"check-b": strings.Repeat("b", 32*1024) + " B_TAIL",
+		},
+		errs: map[string]error{"check-b": errors.New("job log expired")},
+	}
+	output := fetchCILogOutput(context.Background(), host, &scm.PR{Number: "42"}, "feature", "abc123", []scm.CheckTarget{
+		{Name: "test", ProviderID: "check-a"},
+		{Name: "test", ProviderID: "check-b"},
+	}, 32*1024)
+	if len(output) > 32*1024 {
+		t.Fatalf("log output length = %d, want at most 32768", len(output))
+	}
+	for _, want := range []string{"Check \"test\" (check-a):", "Check \"test\" (check-b):", "A_TAIL", "B_TAIL", "[earlier log output omitted]", "[log retrieval incomplete: job log expired]"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("bounded targeted log output omitted %q:\n%s", want, output)
+		}
+	}
+	if host.calls != 1 || len(host.targets) != 2 || host.targets[0] != "check-a" || host.targets[1] != "check-b" {
+		t.Fatalf("targeted fetch calls = %d, targets = %v, want one batched call", host.calls, host.targets)
+	}
+}
+
+type targetedLogTestHost struct {
+	scm.Host
+	logs    map[string]string
+	errs    map[string]error
+	targets []string
+	calls   int
+}
+
+func (h *targetedLogTestHost) FetchFailedCheckTargetLogs(_ context.Context, _ *scm.PR, _, _ string, targets []scm.CheckTarget) ([]scm.FailedCheckLog, error) {
+	h.calls++
+	results := make([]scm.FailedCheckLog, 0, len(targets))
+	for _, target := range targets {
+		id := target.ProviderID
+		h.targets = append(h.targets, id)
+		results = append(results, scm.FailedCheckLog{Target: target, Output: h.logs[id], Err: h.errs[id]})
+	}
+	return results, nil
 }
 
 type forgejoLogTestHost struct {

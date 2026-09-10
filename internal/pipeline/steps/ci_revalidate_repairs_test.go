@@ -66,6 +66,7 @@ func newCIRepairFixture(t *testing.T, revalidate bool, agentAction func(workDir 
 	prURL := "https://github.com/test/repo/pull/42"
 	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
 	sctx.Env = append(fakeCIGH(t, "OPEN", `[{"name":"test","state":"FAILURE","bucket":"fail"}]`),
+		"FAKE_CLI_PR_HEAD_SHA="+headSHA,
 		// attestHeadBeforePush discovers the PR via FindPR before every publish
 		// (Push and a CI repair alike), so the fixture's fake gh must be able to
 		// resolve the same PR the fixture's own persisted PRURL names.
@@ -115,7 +116,7 @@ func (f *ciRepairFixture) run(t *testing.T) (*pipeline.StepOutcome, error) {
 		}
 		return ctx.Err()
 	}}
-	return step.Execute(f.sctx)
+	return driveCI(t, step, f.sctx)
 }
 
 func (f *ciRepairFixture) localHead(t *testing.T) string {
@@ -499,9 +500,11 @@ func TestCIStep_ManualRepairFollowsTheSamePolicy(t *testing.T) {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			f := newCIRepairFixture(t, tc.revalidate, writeCIFix)
-			// Automatic auto-fix off; the user answered the gate with "fix".
+			// Automatic auto-fix off; the user answered the gate with "fix",
+			// selecting the failing check's finding.
 			f.sctx.Config.AutoFix = config.AutoFix{CI: 0}
 			f.sctx.Fixing = true
+			f.sctx.PreviousFindings = ciGateFindingsJSON("test")
 
 			outcome, err := f.run(t)
 			// Under the publish policy the monitor deliberately does NOT
@@ -517,8 +520,8 @@ func TestCIStep_ManualRepairFollowsTheSamePolicy(t *testing.T) {
 			if !tc.wantRestart && !errors.Is(err, context.Canceled) {
 				t.Fatalf("the publish policy must keep monitoring after a repair, got outcome %#v err %v", outcome, err)
 			}
-			if !strings.Contains(f.log(), "manual fix requested") {
-				t.Fatalf("expected the manual repair path; log:\n%s", f.log())
+			if !strings.Contains(f.log(), "repairing: test") {
+				t.Fatalf("expected the selected finding to be repaired; log:\n%s", f.log())
 			}
 			if f.localHead(t) == f.headSHA {
 				t.Fatal("the manual repair commit was never created")
